@@ -10,7 +10,8 @@ struct SettingsTabView: View {
             // 1. Menu Bar & Anti-Risk-Control Polling
             VStack(alignment: .leading, spacing: 8) {
                 Text("菜单栏与合规节流")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
 
                 Picker("显示模式", selection: $store.settings.menuBarMode) {
                     ForEach(MenuBarDisplayMode.allCases) { mode in
@@ -20,23 +21,26 @@ struct SettingsTabView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .controlSize(.small)
+                .frame(maxWidth: .infinity)
 
                 HStack {
                     Text("后台自动同步间隔")
-                        .font(.system(size: 11))
+                        .font(.system(size: 11.5))
                     Spacer()
                     Stepper(value: $store.settings.backgroundRefreshSeconds, in: 60...900, step: 60) {
                         Text("\(store.settings.backgroundRefreshSeconds / 60) 分钟")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .monospacedDigit()
                     }
                     .controlSize(.small)
                 }
 
-                Text("多账号查询采用错峰串行与最低冷却保护，严格遵守官方 CLI 规范不触发风控。")
-                    .font(.system(size: 10))
+                Text("多账号查询采用错峰串行与最低冷却保护，遵循官方 CLI 规范不触发风控。")
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
             .hudCard()
 
@@ -45,37 +49,35 @@ struct SettingsTabView: View {
                 VStack(alignment: .leading, spacing: 9) {
                     HStack {
                         Text("当前账号配置 · \(acc.displayName)")
-                            .font(.system(size: 11.5, weight: .semibold))
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
                         Spacer()
-                        Text(acc.authMode == .systemDefaultOAuth2 ? "默认 OAuth2" : "独立钥匙串 ADC")
-                            .font(.system(size: 9.5))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.primary.opacity(0.06), in: Capsule())
+                        CardBadge(text: acc.authMode == .systemDefaultOAuth2 ? "默认 OAuth2" : "独立钥匙串 ADC")
                     }
 
                     HStack {
                         Text("账号备注")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .frame(width: 68, alignment: .leading)
                         TextField("账号名称", text: binding(for: acc, \.displayName))
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.small)
+                            .frame(maxWidth: .infinity)
                     }
 
                     HStack {
                         Text("默认会话名")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .frame(width: 68, alignment: .leading)
                         TextField("llm-coder", text: binding(for: acc, \.sessionName))
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.small)
+                            .frame(maxWidth: .infinity)
                     }
 
                     HStack {
                         Text("空闲超时")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .frame(width: 68, alignment: .leading)
                         TextField("", value: binding(for: acc, \.idleTimeoutMinutes), format: .number)
                             .textFieldStyle(.roundedBorder)
@@ -90,11 +92,11 @@ struct SettingsTabView: View {
 
                     HStack {
                         Text("关机前提醒")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .frame(width: 68, alignment: .leading)
                         Stepper(value: binding(for: acc, \.warnBeforeMinutes), in: 0...15) {
                             Text("\(acc.warnBeforeMinutes) 分钟")
-                                .font(.system(size: 11))
+                                .font(.system(size: 11.5))
                                 .monospacedDigit()
                         }
                         .controlSize(.small)
@@ -103,20 +105,30 @@ struct SettingsTabView: View {
 
                     Divider().opacity(0.35)
 
-                    Toggle("开机自动同步公网地址到 CC Switch（不改动官方订阅）", isOn: binding(for: acc, \.autoSyncCCSwitch))
-                        .font(.system(size: 11))
-                        .controlSize(.mini)
+                    Toggle(isOn: binding(for: acc, \.autoSyncCCSwitch)) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("开机自动同步公网地址到 CC Switch")
+                                .font(.system(size: 11.5))
+                            Text("仅写入独立待机渠道，不改动官方订阅")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                     HStack {
                         Text("渠道显示名")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .frame(width: 68, alignment: .leading)
                         TextField("Colab Tools", text: binding(for: acc, \.ccSwitchProviderName))
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.small)
+                            .frame(maxWidth: .infinity)
                     }
 
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text("Drive 远端 LLM 启动脚本路径")
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
@@ -124,8 +136,10 @@ struct SettingsTabView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 10.5, design: .monospaced))
                             .controlSize(.small)
+                            .frame(maxWidth: .infinity)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
                 .hudCard()
             }
@@ -134,7 +148,7 @@ struct SettingsTabView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("已绑定账号 (\(store.settings.accounts.count))")
-                        .font(.system(size: 11.5, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                     Spacer()
                     Button {
                         store.openAddAccountFlow()
@@ -153,7 +167,8 @@ struct SettingsTabView: View {
                             .frame(width: 7, height: 7)
                         VStack(alignment: .leading, spacing: 1) {
                             Text("\(acc.displayName) · \(acc.tier.shortBadge)")
-                                .font(.system(size: 11, weight: .medium))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .lineLimit(1)
                             Text(acc.email.isEmpty ? "默认官方 CLI 账号" : acc.email)
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
@@ -175,9 +190,11 @@ struct SettingsTabView: View {
                     .padding(.vertical, 2)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
             .hudCard()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func binding<Value>(for account: AccountProfile, _ keyPath: WritableKeyPath<AccountProfile, Value>) -> Binding<Value> {
@@ -215,7 +232,7 @@ struct AboutTabView: View {
 
                 Text("Colab Tools")
                     .font(.system(size: 16, weight: .semibold))
-                Text("v0.3.0 · MIT Open Source")
+                Text("v0.3.1 · MIT Open Source")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Text("面向全体 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣。100% 基于官方 google-colab-cli，支持多订阅并行隔离管理、点数监控、自定义空闲自动关机与 Claude Code / CC Switch 无感联动。")

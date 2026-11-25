@@ -47,7 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pop.behavior = .transient
         pop.animates = true
         pop.delegate = self
-        pop.contentViewController = NSHostingController(rootView: RootPopoverView(store: s))
+        let hosting = NSHostingController(rootView: RootPopoverView(store: s))
+        hosting.sizingOptions = .preferredContentSize
+        pop.contentViewController = hosting
+        pop.contentSize = NSSize(width: RootPopoverView.panelWidth, height: 760)
         popover = pop
 
         updateStatusItem()

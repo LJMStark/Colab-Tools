@@ -26,8 +26,35 @@ enum PreviewExporter {
         multiStore.selectedViewMode = .overview
         renderPanel(
             RootPopoverView(store: multiStore, isPreviewMode: true),
-            to: dirURL.appendingPathComponent("preview-multi-account.png")
+            to: dirURL.appendingPathComponent("preview-multi-account.png"),
+            dark: true
         )
+
+        // 3. Optional extra visual QA checks (Light/Dark Settings with iconOnly selected)
+        if let qaDir = ProcessInfo.processInfo.environment["COLABTOOLS_RENDER_QA"], !qaDir.isEmpty {
+            let qaURL = URL(fileURLWithPath: qaDir, isDirectory: true)
+            try? FileManager.default.createDirectory(at: qaURL, withIntermediateDirectories: true)
+
+            let settingsStore = makeDemoStore(multiAccount: false)
+            settingsStore.selectedTab = .settings
+            settingsStore.settings.menuBarMode = .iconOnly
+            renderPanel(
+                RootPopoverView(store: settingsStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-settings-light-icononly.png"),
+                dark: false
+            )
+            renderPanel(
+                RootPopoverView(store: settingsStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-settings-dark-icononly.png"),
+                dark: true
+            )
+            let liveDashStore = makeDemoStore(multiAccount: false)
+            renderPanel(
+                RootPopoverView(store: liveDashStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-dashboard-live-light.png"),
+                dark: false
+            )
+        }
         return true
     }
 
@@ -137,23 +164,34 @@ enum PreviewExporter {
         return store
     }
 
-    private static func renderPanel<V: View>(_ content: V, to url: URL) {
+    private static func renderPanel<V: View>(_ content: V, to url: URL, dark: Bool = true) {
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let framed = ZStack {
             LinearGradient(
-                colors: [
-                    Color(red: 0.105, green: 0.095, blue: 0.075),
-                    Color(red: 0.078, green: 0.082, blue: 0.096)
-                ],
+                colors: dark
+                    ? [
+                        Color(red: 0.105, green: 0.095, blue: 0.075),
+                        Color(red: 0.078, green: 0.082, blue: 0.096)
+                    ]
+                    : [
+                        Color(red: 0.86, green: 0.87, blue: 0.89),
+                        Color(red: 0.80, green: 0.82, blue: 0.85)
+                    ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             content
                 .background(
                     LinearGradient(
-                        colors: [
-                            Color(red: 0.145, green: 0.135, blue: 0.112),
-                            Color(red: 0.118, green: 0.115, blue: 0.106)
-                        ],
+                        colors: dark
+                            ? [
+                                Color(red: 0.145, green: 0.135, blue: 0.112),
+                                Color(red: 0.118, green: 0.115, blue: 0.106)
+                            ]
+                            : [
+                                Color(red: 0.965, green: 0.965, blue: 0.972),
+                                Color(red: 0.935, green: 0.940, blue: 0.950)
+                            ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -161,16 +199,16 @@ enum PreviewExporter {
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.11), lineWidth: 0.8)
+                        .strokeBorder(dark ? Color.white.opacity(0.11) : Color.black.opacity(0.10), lineWidth: 0.8)
                 )
-                .shadow(color: .black.opacity(0.55), radius: 22, y: 10)
+                .shadow(color: .black.opacity(dark ? 0.55 : 0.20), radius: 22, y: 10)
                 .padding(26)
         }
-        .environment(\.colorScheme, .dark)
+        .environment(\.colorScheme, dark ? .dark : .light)
         .fixedSize()
 
         let hosting = NSHostingView(rootView: framed)
-        hosting.appearance = NSAppearance(named: .darkAqua)
+        hosting.appearance = appearance
         let size = hosting.fittingSize
         guard size.width > 0, size.height > 0 else { return }
 
@@ -180,7 +218,7 @@ enum PreviewExporter {
             backing: .buffered,
             defer: false
         )
-        window.appearance = NSAppearance(named: .darkAqua)
+        window.appearance = appearance
         window.isOpaque = false
         window.backgroundColor = .clear
         window.contentView = hosting
@@ -189,12 +227,20 @@ enum PreviewExporter {
 
         hosting.layoutSubtreeIfNeeded()
         hosting.displayIfNeeded()
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.15))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.18))
         hosting.layoutSubtreeIfNeeded()
+        let finalSize = hosting.fittingSize
+        if abs(finalSize.height - size.height) > 2 || abs(finalSize.width - size.width) > 2 {
+            window.setContentSize(finalSize)
+            hosting.frame = NSRect(origin: .zero, size: finalSize)
+            hosting.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        let renderSize = hosting.bounds.size
 
         let scale: CGFloat = 2.0
-        let pixelW = Int((size.width * scale).rounded())
-        let pixelH = Int((size.height * scale).rounded())
+        let pixelW = Int((renderSize.width * scale).rounded())
+        let pixelH = Int((renderSize.height * scale).rounded())
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: pixelW,
@@ -210,7 +256,7 @@ enum PreviewExporter {
             window.close()
             return
         }
-        rep.size = size
+        rep.size = renderSize
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
         window.close()
 

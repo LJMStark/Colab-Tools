@@ -14,7 +14,7 @@ struct AccountDetailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 11) {
+        VStack(spacing: 9) {
             heroHeaderSection
 
             if !orphanSessions.isEmpty {
@@ -26,6 +26,7 @@ struct AccountDetailView: View {
             sessionsAndConfigTableCard
             bottomDockCard
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - 1. Hero Header (Big Headline Metric + System Spec Pills)
@@ -644,9 +645,25 @@ struct AccountDetailView: View {
                     .disabled(rt.publicURL.isEmpty)
                     .help("复制公网地址")
                 }
+
+                HStack(spacing: 6) {
+                    Text("CC 渠道")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .leading)
+                    Text(account.ccSwitchProviderName)
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer()
+                    CardBadge(
+                        text: rt.ccSwitchSynced ? "已就绪 · 官方安全" : "待机未同步",
+                        tint: rt.ccSwitchSynced ? ColabTheme.emerald : nil
+                    )
+                }
             }
         }
-        .padding(12)
+        .padding(11)
         .hudCard()
     }
 

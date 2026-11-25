@@ -2,13 +2,31 @@ import AppKit
 import ColabToolsCore
 import SwiftUI
 
+private struct PanelContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 { value = next }
+    }
+}
+
 struct RootPopoverView: View {
+    static let panelWidth: CGFloat = 396
+
     @ObservedObject var store: WorkspaceStore
     var isPreviewMode: Bool = false
 
+    @State private var measuredContentHeight: CGFloat = 710
+
+    private var maxScrollHeight: CGFloat {
+        let visibleH = NSScreen.main?.visibleFrame.height ?? 920
+        let chromeH: CGFloat = (store.selectedTab == .dashboard && !store.showingAddAccount && store.isMultiAccount) ? 148 : 112
+        return min(860, max(540, visibleH - chromeH))
+    }
+
     @ViewBuilder
     private var mainContent: some View {
-        VStack(spacing: 11) {
+        VStack(alignment: .leading, spacing: 9) {
             if !store.cliInstalled {
                 missingCLICard
             } else if store.showingAddAccount {
@@ -34,7 +52,14 @@ struct RootPopoverView: View {
                 }
             }
         }
-        .padding(14)
+        .frame(width: Self.panelWidth - 24, alignment: .topLeading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .background {
+            GeometryReader { geo in
+                Color.clear.preference(key: PanelContentHeightKey.self, value: geo.size.height)
+            }
+        }
     }
 
     var body: some View {
@@ -50,10 +75,17 @@ struct RootPopoverView: View {
             if isPreviewMode {
                 mainContent
             } else {
-                ScrollView(.vertical, showsIndicators: false) {
+                let fittedHeight = min(max(measuredContentHeight, 260), maxScrollHeight)
+                ScrollView(.vertical, showsIndicators: measuredContentHeight > maxScrollHeight + 2) {
                     mainContent
                 }
-                .frame(maxHeight: 620)
+                .frame(width: Self.panelWidth, height: fittedHeight)
+                .onPreferenceChange(PanelContentHeightKey.self) { h in
+                    let rounded = ceil(h)
+                    if rounded > 0 && abs(rounded - measuredContentHeight) > 0.5 {
+                        measuredContentHeight = rounded
+                    }
+                }
             }
 
             if let toast = store.toastMessage {
@@ -76,7 +108,8 @@ struct RootPopoverView: View {
             Divider().opacity(0.4)
             footerBar
         }
-        .frame(width: 396)
+        .frame(width: Self.panelWidth)
+        .clipped()
         .background {
             if isPreviewMode {
                 Color.clear
