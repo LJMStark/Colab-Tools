@@ -25,6 +25,7 @@ let package = Package(
             path: "Sources/ColabTools",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("ServiceManagement"),
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("UserNotifications")
             ]

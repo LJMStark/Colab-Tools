@@ -21,6 +21,24 @@ struct AccountDetailView: View {
         rt.detectedServicePort ?? account.remoteServicePort
     }
 
+    private var enabledIntegrationsSummary: String {
+        var list: [String] = []
+        if account.autoSyncCCSwitch && store.clientDetection.ccSwitchInstalled { list.append("CC Switch") }
+        if account.autoSyncOpenCode { list.append("OpenCode") }
+        if account.autoSyncCodex { list.append("Codex") }
+        if list.isEmpty { return "双协议一键复制" }
+        return list.joined(separator: " · ")
+    }
+
+    private var integrationSyncStatus: (hasTargets: Bool, allSynced: Bool, anySynced: Bool) {
+        var flags: [Bool] = []
+        if account.autoSyncCCSwitch && store.clientDetection.ccSwitchInstalled { flags.append(rt.ccSwitchSynced) }
+        if account.autoSyncOpenCode { flags.append(rt.openCodeSynced) }
+        if account.autoSyncCodex { flags.append(rt.codexSynced) }
+        guard !flags.isEmpty else { return (false, false, false) }
+        return (true, flags.allSatisfy { $0 }, flags.contains(true))
+    }
+
     var body: some View {
         let _ = store.queueTickVersion
         VStack(spacing: 9) {
@@ -738,43 +756,50 @@ struct AccountDetailView: View {
                 Spacer(minLength: 0)
             }
 
-            if account.enablePoliteQueue {
+            if account.enablePoliteQueue || account.scheduledStartEnabled {
                 Divider().opacity(0.32)
-                VStack(alignment: .leading, spacing: 6) {
-                    let allowed = account.tier.queueableAccelerators
-                    let selectedSet = Set(PoliteQueuePolicy.sanitizedTargets(selected: account.queueTargets, for: account.tier))
-                    HStack(spacing: 5) {
-                        ForEach(allowed) { opt in
-                            let isOn = selectedSet.contains(opt)
-                            Button {
-                                store.toggleQueueTarget(opt, for: account.id)
-                            } label: {
-                                Text(opt.shortChipLabel)
-                                    .font(.system(size: 10.5, weight: isOn ? .semibold : .medium))
-                                    .monospacedDigit()
-                                    .lineLimit(1)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 3.5)
-                                    .background(
-                                        isOn ? ColabTheme.amber.opacity(0.20) : Color.primary.opacity(0.055),
-                                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                            .strokeBorder(isOn ? ColabTheme.amber.opacity(0.50) : Color.primary.opacity(0.08), lineWidth: 0.6)
-                                    )
-                                    .foregroundStyle(isOn ? .primary : .secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
-                        }
-                        Spacer(minLength: 0)
+                let cleanTargets = PoliteQueuePolicy.sanitizedTargets(selected: account.queueTargets, for: account.tier)
+                HStack(spacing: 6) {
+                    if account.enablePoliteQueue {
+                        let fallbackSuffix = account.queueFallbackEnabled
+                            ? " · \(account.queueFallbackAfterRounds)轮保底 \(account.queueFallbackTarget.shortChipLabel)"
+                            : ""
+                        Text("顺位 \(PoliteQueuePolicy.targetsSummary(cleanTargets))\(fallbackSuffix)")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
-
-                    Text("可单选死磕或多选按高到低顺位等待 · 最多 5 轮/40m · 遇 412/429 自动熔断")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
+                    if account.scheduledStartEnabled {
+                        HStack(spacing: 3) {
+                            Image(systemName: "alarm")
+                                .font(.system(size: 9.5))
+                            Text(String(format: "%02d:%02d", account.scheduledStartHour, account.scheduledStartMinute))
+                                .font(.system(size: 10, weight: .medium))
+                                .monospacedDigit()
+                        }
+                        .foregroundStyle(ColabTheme.emerald)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(ColabTheme.emerald.opacity(0.13), in: Capsule())
+                    }
+                    Spacer(minLength: 4)
+                    Button {
+                        store.openSettings(section: .compute)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text("配置")
+                                .font(.system(size: 10.5, weight: .medium))
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8.5, weight: .semibold))
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("打开「算力与抢卡」工作台配置顺位、降级与错峰预约")
                 }
             }
         }
@@ -897,19 +922,24 @@ struct AccountDetailView: View {
                 }
 
                 HStack(spacing: 6) {
-                    Text("CC 渠道")
+                    Text("接入")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
-                    Text(account.ccSwitchProviderName)
+                    Text(enabledIntegrationsSummary)
                         .font(.system(size: 11))
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer()
-                    CardBadge(
-                        text: rt.ccSwitchSynced ? "已就绪 · 官方安全" : "待机未同步",
-                        tint: rt.ccSwitchSynced ? ColabTheme.emerald : nil
-                    )
+                    let syncSt = integrationSyncStatus
+                    let badgeText = syncSt.allSynced ? "已就绪 · 官方安全" : (syncSt.anySynced ? "部分同步" : "配置工具…")
+                    let badgeTint: Color? = syncSt.allSynced ? ColabTheme.emerald : (syncSt.anySynced ? ColabTheme.amber : nil)
+                    Button {
+                        store.openSettings(section: .integrations)
+                    } label: {
+                        CardBadge(text: badgeText, tint: badgeTint)
+                    }
+                    .buttonStyle(.plain)
                 }
             } else {
                 Divider().opacity(0.35)
@@ -932,17 +962,18 @@ struct AccountDetailView: View {
 
             let freeRestricted = rt.isFreeRuntimeRestricted(for: account)
             let endpointDisplayURL = !rt.displayUIURL.isEmpty ? rt.displayUIURL : rt.publicURL
+            let activeTunnelPort = rt.sshTunnelActive ? rt.activeSSHTunnelPort : nil
             let endpointText: String = {
                 if freeRestricted { return "免费版仅限官方 Colab Notebook" }
                 if !endpointDisplayURL.isEmpty { return endpointDisplayURL }
-                if rt.sshTunnelActive { return "http://127.0.0.1:\(String(account.localSSHTunnelPort))" }
+                if let bp = activeTunnelPort { return "http://127.0.0.1:\(String(bp))" }
                 return "远端端口 :\(String(activeServicePort))（可开隧道）"
             }()
             let copyableEndpoint: String = freeRestricted
                 ? ""
                 : (!endpointDisplayURL.isEmpty
                     ? endpointDisplayURL
-                    : (rt.sshTunnelActive ? "http://127.0.0.1:\(String(account.localSSHTunnelPort))" : ""))
+                    : (activeTunnelPort.map { "http://127.0.0.1:\(String($0))" } ?? ""))
 
                 HStack(spacing: 6) {
                     Text("端点")
@@ -986,14 +1017,19 @@ struct AccountDetailView: View {
     private var bottomDockCard: some View {
         VStack(spacing: 10) {
             if effectiveKind == .llm {
+                let syncSt = integrationSyncStatus
                 HStack(spacing: 6) {
                     QuickActionButton(
-                        title: rt.ccSwitchSynced ? "已同步" : "同步 CC",
-                        icon: rt.ccSwitchSynced ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath",
-                        disabled: !CCSwitchSync.isInstalled || rt.publicURL.isEmpty,
-                        active: rt.ccSwitchSynced
+                        title: syncSt.allSynced ? "已同步" : (syncSt.hasTargets ? "同步工具" : "接入…"),
+                        icon: syncSt.allSynced ? "checkmark.circle.fill" : (syncSt.hasTargets ? "arrow.triangle.2.circlepath" : "puzzlepiece.extension"),
+                        disabled: syncSt.hasTargets && rt.publicURL.isEmpty,
+                        active: syncSt.allSynced
                     ) {
-                        store.syncToCCSwitch(accountId: account.id, silent: false)
+                        if syncSt.hasTargets {
+                            store.syncAllEnabledClients(accountId: account.id, silent: false)
+                        } else {
+                            store.openSettings(section: .integrations)
+                        }
                     }
 
                     QuickActionButton(

@@ -21,11 +21,12 @@ enum PreviewExporter {
         do {
             try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
-            // 1. Single-account dashboard showcase
+            // 1. Single-account streamlined menu bar popover showcase
             let singleStore = makeDemoStore(multiAccount: false)
             try renderPanel(
                 RootPopoverView(store: singleStore, isPreviewMode: true),
-                to: dirURL.appendingPathComponent("preview-dashboard.png")
+                to: dirURL.appendingPathComponent("preview-dashboard.png"),
+                dark: true
             )
 
             // 2. Multi-account overview showcase
@@ -37,28 +38,31 @@ enum PreviewExporter {
                 dark: true
             )
 
-            // 3. Optional extra visual QA checks (Light/Dark Settings, Queue, Multimodal, About)
+            // 3. Standalone Settings App: Compute & Queue Workbench showcase
+            let queueSettingsStore = makeSettingsDemoStore(section: .compute)
+            try renderPanel(
+                SettingsAppView(store: queueSettingsStore, isPreviewMode: true),
+                to: dirURL.appendingPathComponent("preview-settings-queue.png"),
+                dark: true
+            )
+
+            // 4. Standalone Settings App: Integrations Hub showcase
+            let integrationsStore = makeSettingsDemoStore(section: .integrations)
+            try renderPanel(
+                SettingsAppView(store: integrationsStore, isPreviewMode: true),
+                to: dirURL.appendingPathComponent("preview-settings-integrations.png"),
+                dark: true
+            )
+
+            // 5. Optional extra visual QA checks (Light & Dark across popover and all settings tabs)
             if let qaDir = ProcessInfo.processInfo.environment["COLABTOOLS_RENDER_QA"], !qaDir.isEmpty {
                 let qaURL = URL(fileURLWithPath: qaDir, isDirectory: true)
                 try FileManager.default.createDirectory(at: qaURL, withIntermediateDirectories: true)
 
-                let settingsStore = makeDemoStore(multiAccount: false)
-                settingsStore.selectedTab = .settings
-                settingsStore.settings.menuBarMode = .iconOnly
+                let lightDashStore = makeDemoStore(multiAccount: false)
                 try renderPanel(
-                    RootPopoverView(store: settingsStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-settings-light-icononly.png"),
-                    dark: false
-                )
-                try renderPanel(
-                    RootPopoverView(store: settingsStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-settings-dark-icononly.png"),
-                    dark: true
-                )
-                let liveDashStore = makeDemoStore(multiAccount: false)
-                try renderPanel(
-                    RootPopoverView(store: liveDashStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-dashboard-live-light.png"),
+                    RootPopoverView(store: lightDashStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-dashboard-light.png"),
                     dark: false
                 )
 
@@ -66,6 +70,12 @@ enum PreviewExporter {
                 if var acc = queueStore.settings.accounts.first {
                     acc.enablePoliteQueue = true
                     acc.queueTargets = [.g4, .h100]
+                    acc.queueFallbackEnabled = true
+                    acc.queueFallbackAfterRounds = 2
+                    acc.queueFallbackTarget = .l4
+                    acc.scheduledStartEnabled = true
+                    acc.scheduledStartHour = 7
+                    acc.scheduledStartMinute = 0
                     queueStore.settings.accounts = [acc]
                     var qst = queueStore.state(for: acc.id)
                     qst.phase = .queuing(
@@ -78,6 +88,9 @@ enum PreviewExporter {
                     qst.vramTotalMB = 0
                     qst.gpuUtilPercent = 0
                     qst.serverHealthy = false
+                    qst.publicURL = ""
+                    qst.ccSwitchSynced = false
+                    qst.openCodeSynced = false
                     qst.sessions = []
                     queueStore.runtimeByAccount[acc.id] = qst
                 }
@@ -86,93 +99,31 @@ enum PreviewExporter {
                     to: qaURL.appendingPathComponent("qa-queue-active-dark.png"),
                     dark: true
                 )
+
                 try renderPanel(
-                    RootPopoverView(store: queueStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-queue-active-light.png"),
+                    SettingsAppView(store: makeSettingsDemoStore(section: .compute), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-settings-queue-light.png"),
                     dark: false
                 )
-
-                let aboutStore = makeDemoStore(multiAccount: false)
-                aboutStore.selectedTab = .about
                 try renderPanel(
-                    RootPopoverView(store: aboutStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-about-noqr-dark.png"),
-                    dark: true
-                )
-
-                let videoStore = makeDemoStore(multiAccount: false)
-                if var acc = videoStore.settings.accounts.first {
-                    acc.workloadKind = .video
-                    acc.remoteServicePort = 8188
-                    acc.localSSHTunnelPort = 8188
-                    acc.autoShutdownEnabled = true
-                    videoStore.settings.accounts = [acc]
-                    var vst = videoStore.state(for: acc.id)
-                    vst.gpuName = "NVIDIA H100 80GB HBM3"
-                    vst.activeHardware = "H100"
-                    vst.vramUsedMB = 54200
-                    vst.vramTotalMB = 81559
-                    vst.gpuUtilPercent = 94
-                    vst.cpuUtilPercent = 38
-                    vst.cudaProcessCount = 1
-                    vst.cuRatePerHour = 18.0
-                    vst.workloadName = "Wan2.2-14B (ComfyUI)"
-                    vst.workloadMetricLabel = "渲染进度"
-                    vst.workloadMetricValue = "18/30"
-                    vst.workloadMetricUnit = "steps"
-                    vst.workloadMetricRatio = 0.60
-                    vst.workloadDetail = "运行 1 · 排队 2 · 720p"
-                    vst.queueRunning = 1
-                    vst.queuePending = 2
-                    vst.detectedServicePort = 8188
-                    vst.displayUIURL = "https://wan-comfy-demo.trycloudflare.com"
-                    vst.publicURL = ""
-                    vst.activitySignal = .busy(observedAt: Date())
-                    vst.signalSource = .statusFile
-                    vst.gpuUtilHistory = [42, 78, 92, 96, 89, 95, 94, 91, 96, 94]
-                    vst.sessions = [
-                        ColabSessionItem(name: "wan-video", endpoint: "gpu-h100-demo", hardware: "H100", shape: "High-RAM", variant: "GPU")
-                    ]
-                    videoStore.runtimeByAccount[acc.id] = vst
-                }
-                try renderPanel(
-                    RootPopoverView(store: videoStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-multimodal-video-dark.png"),
-                    dark: true
-                )
-
-                let musicStore = makeDemoStore(multiAccount: false)
-                if var acc = musicStore.settings.accounts.first {
-                    acc.workloadKind = .music
-                    acc.remoteServicePort = 7860
-                    acc.localSSHTunnelPort = 7860
-                    acc.autoShutdownEnabled = true
-                    musicStore.settings.accounts = [acc]
-                    var mst = musicStore.state(for: acc.id)
-                    mst.gpuName = "NVIDIA L4"
-                    mst.activeHardware = "L4"
-                    mst.vramUsedMB = 11400
-                    mst.vramTotalMB = 23034
-                    mst.gpuUtilPercent = 2
-                    mst.cpuUtilPercent = 9
-                    mst.cudaProcessCount = 1
-                    mst.workloadName = "ACE-Step 音乐工坊"
-                    mst.workloadMetricLabel = ""
-                    mst.workloadMetricValue = ""
-                    mst.detectedServicePort = 7860
-                    mst.displayUIURL = ""
-                    mst.publicURL = ""
-                    mst.sshTunnelActive = true
-                    mst.serverHealthy = true
-                    mst.activitySignal = .idle(observedAt: Date())
-                    mst.signalSource = .hardwareDualLowLoad
-                    mst.idleSeconds = 420
-                    musicStore.runtimeByAccount[acc.id] = mst
-                }
-                try renderPanel(
-                    RootPopoverView(store: musicStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-multimodal-music-light.png"),
+                    SettingsAppView(store: makeSettingsDemoStore(section: .integrations), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-settings-integrations-light.png"),
                     dark: false
+                )
+                try renderPanel(
+                    SettingsAppView(store: makeSettingsDemoStore(section: .general), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-settings-general-dark.png"),
+                    dark: true
+                )
+                try renderPanel(
+                    SettingsAppView(store: makeSettingsDemoStore(section: .advanced), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-settings-advanced-dark.png"),
+                    dark: true
+                )
+                try renderPanel(
+                    SettingsAppView(store: makeSettingsDemoStore(section: .about), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-settings-about-dark.png"),
+                    dark: true
                 )
             }
             return true
@@ -182,8 +133,67 @@ enum PreviewExporter {
         }
     }
 
+    private static func makeSettingsDemoStore(section: WorkspaceStore.SettingsSection) -> WorkspaceStore {
+        let store = makeDemoStore(multiAccount: true)
+        store.selectedSettingsSection = section
+        if var acc = store.settings.accounts.first {
+            acc.enablePoliteQueue = true
+            acc.queueTargets = [.g4, .h100]
+            acc.queueFallbackEnabled = true
+            acc.queueFallbackAfterRounds = 2
+            acc.queueFallbackTarget = .l4
+            acc.scheduledStartEnabled = true
+            acc.scheduledStartHour = 7
+            acc.scheduledStartMinute = 0
+            acc.scheduledStartRepeatDaily = true
+            acc.autoSyncCCSwitch = true
+            acc.autoSyncOpenCode = true
+            acc.autoSyncCodex = false
+            store.settings.accounts[0] = acc
+            if var st = store.runtimeByAccount[acc.id] {
+                st.phase = .offline
+                st.ccSwitchSynced = true
+                st.openCodeSynced = true
+                // Keep a live demo publicURL on integrations showcase so Sync buttons look active
+                if section == .integrations {
+                    st.phase = .running
+                    st.publicURL = "https://demo-colab-node.trycloudflare.com"
+                }
+                store.runtimeByAccount[acc.id] = st
+            }
+        }
+        store.clientDetection = ClientDetectionSnapshot(
+            ccSwitchInstalled: true,
+            openCodeInstalled: true,
+            codexInstalled: true,
+            claudeCodeInstalled: true
+        )
+        store.insights = AllocationInsights(bucketsByHardware: [
+            "G4": [
+                "1": AllocationBucket(attempts: 4, successes: 2),
+                "6": AllocationBucket(attempts: 8, successes: 7),
+                "10": AllocationBucket(attempts: 6, successes: 3),
+                "14": AllocationBucket(attempts: 5, successes: 1),
+                "18": AllocationBucket(attempts: 5, successes: 1),
+                "22": AllocationBucket(attempts: 6, successes: 2)
+            ],
+            "H100": [
+                "6": AllocationBucket(attempts: 5, successes: 4),
+                "10": AllocationBucket(attempts: 4, successes: 2),
+                "22": AllocationBucket(attempts: 5, successes: 1)
+            ]
+        ])
+        return store
+    }
+
     private static func makeDemoStore(multiAccount: Bool) -> WorkspaceStore {
         let store = WorkspaceStore(skipAutoBootstrap: true)
+        store.clientDetection = ClientDetectionSnapshot(
+            ccSwitchInstalled: true,
+            openCodeInstalled: true,
+            codexInstalled: true,
+            claudeCodeInstalled: true
+        )
 
         let id1 = UUID()
         let acc1 = AccountProfile(
@@ -197,9 +207,20 @@ enum PreviewExporter {
             preferredAccelerator: .autoBest,
             highMem: false,
             enableLLMModule: true,
+            enablePoliteQueue: true,
+            queueTargets: [.g4, .h100],
+            queueFallbackEnabled: true,
+            queueFallbackAfterRounds: 2,
+            queueFallbackTarget: .l4,
+            scheduledStartEnabled: true,
+            scheduledStartHour: 7,
+            scheduledStartMinute: 0,
+            scheduledStartRepeatDaily: true,
             autoShutdownEnabled: true,
             idleTimeoutMinutes: 40,
-            warnBeforeMinutes: 2
+            warnBeforeMinutes: 2,
+            autoSyncCCSwitch: true,
+            autoSyncOpenCode: true
         )
 
         var st1 = AccountRuntimeState()
@@ -224,6 +245,7 @@ enum PreviewExporter {
         st1.promptTokensUsed = 58200
         st1.idleSeconds = 180
         st1.ccSwitchSynced = true
+        st1.openCodeSynced = true
         st1.lastUsageFetchAt = Date()
         st1.gpuUtilHistory = [6, 12, 44, 68, 52, 24, 15, 9, 8, 35, 74, 61, 28, 18, 14, 18]
         st1.sessions = [

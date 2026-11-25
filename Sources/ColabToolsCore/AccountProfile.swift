@@ -116,15 +116,29 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
     // Polite anti-abuse queue preferences (single-layer, minute-scale Equal Jitter, max 5 rounds / 40m)
     public var enablePoliteQueue: Bool
     public var queueTargets: [AcceleratorOption]
+    // Two-stage auto-fallback: stick to primary cards for N rounds, then append fallback card
+    public var queueFallbackEnabled: Bool
+    public var queueFallbackAfterRounds: Int
+    public var queueFallbackTarget: AcceleratorOption
+
+    // Off-peak scheduled start (100% compliant single-shot / polite queue trigger at off-peak hours)
+    public var scheduledStartEnabled: Bool
+    public var scheduledStartHour: Int
+    public var scheduledStartMinute: Int
+    public var scheduledStartRepeatDaily: Bool
+    public var scheduledNextFireAt: Date?
+    public var lastScheduledFireDay: String
 
     // Idle shutdown watchdog settings (customizable per account)
     public var autoShutdownEnabled: Bool
     public var idleTimeoutMinutes: Int
     public var warnBeforeMinutes: Int
 
-    // Workload script, service port & optional LLM / CC Switch integration
+    // Workload script, service port & multi-client auto-sync integrations
     public var driveScriptPath: String
     public var autoSyncCCSwitch: Bool
+    public var autoSyncOpenCode: Bool
+    public var autoSyncCodex: Bool
     public var ccSwitchProviderId: String
     public var ccSwitchProviderName: String
     public var localEnvPath: String
@@ -142,8 +156,10 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         case sessionName, preferredAccelerator, highMem
         case workloadKind, enableLLMModule, enableHardwareIdleFallback
         case enablePoliteQueue, queueTargets
+        case queueFallbackEnabled, queueFallbackAfterRounds, queueFallbackTarget
+        case scheduledStartEnabled, scheduledStartHour, scheduledStartMinute, scheduledStartRepeatDaily, scheduledNextFireAt, lastScheduledFireDay
         case autoShutdownEnabled, idleTimeoutMinutes, warnBeforeMinutes
-        case driveScriptPath, autoSyncCCSwitch, ccSwitchProviderId, ccSwitchProviderName
+        case driveScriptPath, autoSyncCCSwitch, autoSyncOpenCode, autoSyncCodex, ccSwitchProviderId, ccSwitchProviderName
         case localEnvPath, localSSHTunnelPort, remoteServicePort, remoteLLMPort
     }
 
@@ -162,11 +178,22 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         enableHardwareIdleFallback: Bool = true,
         enablePoliteQueue: Bool = false,
         queueTargets: [AcceleratorOption]? = nil,
+        queueFallbackEnabled: Bool = false,
+        queueFallbackAfterRounds: Int = 2,
+        queueFallbackTarget: AcceleratorOption? = nil,
+        scheduledStartEnabled: Bool = false,
+        scheduledStartHour: Int = 7,
+        scheduledStartMinute: Int = 0,
+        scheduledStartRepeatDaily: Bool = false,
+        scheduledNextFireAt: Date? = nil,
+        lastScheduledFireDay: String = "",
         autoShutdownEnabled: Bool = false,
         idleTimeoutMinutes: Int = 40,
         warnBeforeMinutes: Int = 2,
         driveScriptPath: String = "/content/drive/MyDrive/colab-llm/scripts/start_server.sh",
         autoSyncCCSwitch: Bool = true,
+        autoSyncOpenCode: Bool = false,
+        autoSyncCodex: Bool = false,
         ccSwitchProviderId: String = "colab-qwen38-uncensored",
         ccSwitchProviderName: String = "Colab Qwen3.8-27B (无审查)",
         localEnvPath: String = "",
@@ -188,12 +215,31 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         self.enableHardwareIdleFallback = enableHardwareIdleFallback
         self.enablePoliteQueue = enablePoliteQueue
         let defaultQueue = Array(tier.queueableAccelerators.prefix(2))
-        self.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: queueTargets ?? defaultQueue, for: tier)
+        let sanitizedQueue = PoliteQueuePolicy.sanitizedTargets(selected: queueTargets ?? defaultQueue, for: tier)
+        self.queueTargets = sanitizedQueue
+        self.queueFallbackEnabled = queueFallbackEnabled
+        self.queueFallbackAfterRounds = max(1, min(PoliteQueuePolicy.maxAttempts - 1, queueFallbackAfterRounds))
+        let eligibleFallbacks = PoliteQueuePolicy.eligibleFallbackTargets(excluding: sanitizedQueue, for: tier)
+        if let explicitFB = queueFallbackTarget, eligibleFallbacks.contains(explicitFB) {
+            self.queueFallbackTarget = explicitFB
+        } else {
+            self.queueFallbackTarget = PoliteQueuePolicy.defaultFallbackTarget(excluding: sanitizedQueue, for: tier)
+        }
+        self.scheduledStartEnabled = scheduledStartEnabled
+        self.scheduledStartHour = max(0, min(23, scheduledStartHour))
+        self.scheduledStartMinute = max(0, min(59, scheduledStartMinute))
+        self.scheduledStartRepeatDaily = scheduledStartRepeatDaily
+        self.scheduledNextFireAt = scheduledStartEnabled
+            ? (scheduledNextFireAt ?? PoliteQueuePolicy.nextScheduledFireDate(hour: self.scheduledStartHour, minute: self.scheduledStartMinute))
+            : nil
+        self.lastScheduledFireDay = lastScheduledFireDay
         self.autoShutdownEnabled = autoShutdownEnabled
         self.idleTimeoutMinutes = max(5, min(720, idleTimeoutMinutes))
         self.warnBeforeMinutes = max(0, min(15, warnBeforeMinutes))
         self.driveScriptPath = driveScriptPath
         self.autoSyncCCSwitch = autoSyncCCSwitch
+        self.autoSyncOpenCode = autoSyncOpenCode
+        self.autoSyncCodex = autoSyncCodex
         self.ccSwitchProviderId = ccSwitchProviderId
         self.ccSwitchProviderName = ccSwitchProviderName
         self.localEnvPath = localEnvPath
@@ -203,37 +249,57 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         self.localSSHTunnelPort = max(1024, min(65535, resolvedLocal))
     }
 
-    // Backwards-compatible decoding migrating legacy `enableLLMModule` and `remoteLLMPort` seamlessly
+    // Backwards-compatible decoding migrating legacy configs seamlessly
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         displayName = try c.decode(String.self, forKey: .displayName)
         email = try c.decode(String.self, forKey: .email)
-        colorTag = try c.decode(AccountColorTag.self, forKey: .colorTag)
-        tier = try c.decode(SubscriptionTier.self, forKey: .tier)
-        authMode = try c.decode(AccountAuthMode.self, forKey: .authMode)
+        colorTag = (try? c.decodeIfPresent(AccountColorTag.self, forKey: .colorTag)) ?? .amber
+        tier = (try? c.decodeIfPresent(SubscriptionTier.self, forKey: .tier)) ?? .colabPro
+        authMode = (try? c.decodeIfPresent(AccountAuthMode.self, forKey: .authMode)) ?? .systemDefaultOAuth2
         sessionName = InputValidator.sanitizeSessionName(try c.decode(String.self, forKey: .sessionName))
-        preferredAccelerator = try c.decode(AcceleratorOption.self, forKey: .preferredAccelerator)
+        preferredAccelerator = (try? c.decodeIfPresent(AcceleratorOption.self, forKey: .preferredAccelerator)) ?? tier.defaultAccelerator
         highMem = try c.decode(Bool.self, forKey: .highMem)
-        if let decodedKind = try c.decodeIfPresent(WorkloadKind.self, forKey: .workloadKind) {
+        if let decodedKind = try? c.decodeIfPresent(WorkloadKind.self, forKey: .workloadKind) {
             workloadKind = decodedKind
         } else {
-            let legacyLLM = try c.decodeIfPresent(Bool.self, forKey: .enableLLMModule) ?? false
+            let legacyLLM = (try? c.decodeIfPresent(Bool.self, forKey: .enableLLMModule)) ?? false
             workloadKind = legacyLLM ? .llm : .general
         }
         // Preserve legacy safe paused behavior when upgrading old config.json lacking `enableHardwareIdleFallback`
-        enableHardwareIdleFallback = try c.decodeIfPresent(Bool.self, forKey: .enableHardwareIdleFallback) ?? false
-        enablePoliteQueue = try c.decodeIfPresent(Bool.self, forKey: .enablePoliteQueue) ?? false
-        let decodedQueue = try c.decodeIfPresent([AcceleratorOption].self, forKey: .queueTargets)
+        enableHardwareIdleFallback = (try? c.decodeIfPresent(Bool.self, forKey: .enableHardwareIdleFallback)) ?? false
+        enablePoliteQueue = (try? c.decodeIfPresent(Bool.self, forKey: .enablePoliteQueue)) ?? false
+        let decodedQueueRaw = (try? c.decodeIfPresent([String].self, forKey: .queueTargets))?.compactMap(AcceleratorOption.init(rawValue:))
         queueTargets = PoliteQueuePolicy.sanitizedTargets(
-            selected: decodedQueue ?? Array(tier.queueableAccelerators.prefix(2)),
+            selected: decodedQueueRaw ?? Array(tier.queueableAccelerators.prefix(2)),
             for: tier
         )
+        queueFallbackEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .queueFallbackEnabled)) ?? false
+        queueFallbackAfterRounds = max(1, min(PoliteQueuePolicy.maxAttempts - 1, (try? c.decodeIfPresent(Int.self, forKey: .queueFallbackAfterRounds)) ?? 2))
+        let decodedFallback = (try? c.decodeIfPresent(String.self, forKey: .queueFallbackTarget)).flatMap(AcceleratorOption.init(rawValue:))
+        let eligibleFB = PoliteQueuePolicy.eligibleFallbackTargets(excluding: queueTargets, for: tier)
+        if let decodedFallback, eligibleFB.contains(decodedFallback) {
+            queueFallbackTarget = decodedFallback
+        } else {
+            queueFallbackTarget = PoliteQueuePolicy.defaultFallbackTarget(excluding: queueTargets, for: tier)
+        }
+        scheduledStartEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .scheduledStartEnabled)) ?? false
+        scheduledStartHour = max(0, min(23, (try? c.decodeIfPresent(Int.self, forKey: .scheduledStartHour)) ?? 7))
+        scheduledStartMinute = max(0, min(59, (try? c.decodeIfPresent(Int.self, forKey: .scheduledStartMinute)) ?? 0))
+        scheduledStartRepeatDaily = (try? c.decodeIfPresent(Bool.self, forKey: .scheduledStartRepeatDaily)) ?? false
+        let decodedNextFire = try? c.decodeIfPresent(Date.self, forKey: .scheduledNextFireAt)
+        scheduledNextFireAt = scheduledStartEnabled
+            ? (decodedNextFire ?? PoliteQueuePolicy.nextScheduledFireDate(hour: scheduledStartHour, minute: scheduledStartMinute))
+            : nil
+        lastScheduledFireDay = (try? c.decodeIfPresent(String.self, forKey: .lastScheduledFireDay)) ?? ""
         autoShutdownEnabled = try c.decode(Bool.self, forKey: .autoShutdownEnabled)
         idleTimeoutMinutes = max(5, min(720, try c.decode(Int.self, forKey: .idleTimeoutMinutes)))
         warnBeforeMinutes = max(0, min(15, try c.decode(Int.self, forKey: .warnBeforeMinutes)))
         driveScriptPath = try c.decode(String.self, forKey: .driveScriptPath)
         autoSyncCCSwitch = try c.decode(Bool.self, forKey: .autoSyncCCSwitch)
+        autoSyncOpenCode = try c.decodeIfPresent(Bool.self, forKey: .autoSyncOpenCode) ?? false
+        autoSyncCodex = try c.decodeIfPresent(Bool.self, forKey: .autoSyncCodex) ?? false
         ccSwitchProviderId = try c.decode(String.self, forKey: .ccSwitchProviderId)
         ccSwitchProviderName = try c.decode(String.self, forKey: .ccSwitchProviderName)
         localEnvPath = try c.decode(String.self, forKey: .localEnvPath)
@@ -261,11 +327,22 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         try c.encode(enableHardwareIdleFallback, forKey: .enableHardwareIdleFallback)
         try c.encode(enablePoliteQueue, forKey: .enablePoliteQueue)
         try c.encode(queueTargets, forKey: .queueTargets)
+        try c.encode(queueFallbackEnabled, forKey: .queueFallbackEnabled)
+        try c.encode(queueFallbackAfterRounds, forKey: .queueFallbackAfterRounds)
+        try c.encode(queueFallbackTarget, forKey: .queueFallbackTarget)
+        try c.encode(scheduledStartEnabled, forKey: .scheduledStartEnabled)
+        try c.encode(scheduledStartHour, forKey: .scheduledStartHour)
+        try c.encode(scheduledStartMinute, forKey: .scheduledStartMinute)
+        try c.encode(scheduledStartRepeatDaily, forKey: .scheduledStartRepeatDaily)
+        try c.encodeIfPresent(scheduledNextFireAt, forKey: .scheduledNextFireAt)
+        try c.encode(lastScheduledFireDay, forKey: .lastScheduledFireDay)
         try c.encode(autoShutdownEnabled, forKey: .autoShutdownEnabled)
         try c.encode(idleTimeoutMinutes, forKey: .idleTimeoutMinutes)
         try c.encode(warnBeforeMinutes, forKey: .warnBeforeMinutes)
         try c.encode(driveScriptPath, forKey: .driveScriptPath)
         try c.encode(autoSyncCCSwitch, forKey: .autoSyncCCSwitch)
+        try c.encode(autoSyncOpenCode, forKey: .autoSyncOpenCode)
+        try c.encode(autoSyncCodex, forKey: .autoSyncCodex)
         try c.encode(ccSwitchProviderId, forKey: .ccSwitchProviderId)
         try c.encode(ccSwitchProviderName, forKey: .ccSwitchProviderName)
         try c.encode(localEnvPath, forKey: .localEnvPath)
@@ -288,6 +365,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Minimum background refresh interval in seconds (default 180s to remain polite to official endpoints).
     public var backgroundRefreshSeconds: Int = 180
     public var lowBalanceWarningCU: Double = 20.0
+    public var enableNotifications: Bool = true
     /// Persisted anti-abuse circuit-breaker cooldown deadlines keyed by account identity (survives app restarts).
     public var circuitBreakUntilByAccount: [String: Date] = [:]
 
@@ -304,6 +382,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         menuBarMode = try c.decodeIfPresent(MenuBarDisplayMode.self, forKey: .menuBarMode) ?? .compact
         backgroundRefreshSeconds = try c.decodeIfPresent(Int.self, forKey: .backgroundRefreshSeconds) ?? 180
         lowBalanceWarningCU = try c.decodeIfPresent(Double.self, forKey: .lowBalanceWarningCU) ?? 20.0
+        enableNotifications = try c.decodeIfPresent(Bool.self, forKey: .enableNotifications) ?? true
         circuitBreakUntilByAccount = try c.decodeIfPresent([String: Date].self, forKey: .circuitBreakUntilByAccount) ?? [:]
     }
 
@@ -477,7 +556,11 @@ public struct AccountRuntimeState: Equatable, Sendable {
     // Bookkeeping
     public var lastUsageFetchAt: Date? = nil
     public var ccSwitchSynced: Bool = false
+    public var openCodeSynced: Bool = false
+    public var codexSynced: Bool = false
     public var sshTunnelActive: Bool = false
+    /// Verified actual bound local port of the active SSH tunnel process (immune to in-flight settings edits).
+    public var activeSSHTunnelPort: Int? = nil
     public var queueCircuitBreakUntil: Date? = nil
     public var nonLLMReminderPending: Bool = false
     public var lastError: String? = nil

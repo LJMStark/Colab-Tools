@@ -6,7 +6,7 @@
 
 **A native macOS menu bar companion for the official Google Colab CLI.**
 
-Monitor Compute Units across subscriptions, manage isolated multi-account GPU/TPU sessions in parallel, protect your balance with safe idle auto-shutdown, and optionally wire self-hosted LLMs into Claude Code & CC Switch.
+Monitor Compute Units across subscriptions, manage isolated multi-account GPU/TPU sessions in parallel, queue and schedule off-peak scarce GPUs politely, run any multimodal workload with dual low-load idle shutdown, and sync seamlessly with CC Switch, OpenCode, Codex CLI, Claude Code & more.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [Download Latest](https://github.com/LJMStark/Colab-Tools/releases/latest) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
@@ -22,12 +22,22 @@ Monitor Compute Units across subscriptions, manage isolated multi-account GPU/TP
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/images/preview-dashboard.png" alt="Colab Tools Dashboard HUD" width="380" /><br />
-      <sub><b>Single-Account Live HUD</b> · VRAM segments, GPU sparkline, 256K context & idle watchdog</sub>
+      <img src="docs/images/preview-dashboard.png" alt="Colab Tools Dashboard HUD" width="360" /><br />
+      <sub><b>Streamlined Menu Bar HUD</b> · Live VRAM/GPU charts, strategy summary & quick `⚙` Settings</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-multi-account.png" alt="Colab Tools Multi-Account Overview" width="380" /><br />
-      <sub><b>Multi-Account Workspace</b> · Isolated Keychain profiles, aggregate CU balance & one-click stop-all</sub>
+      <img src="docs/images/preview-multi-account.png" alt="Colab Tools Multi-Account Overview" width="360" /><br />
+      <sub><b>Multi-Account Workspace</b> · Isolated Keychain profiles, aggregate CU balance & stop-all</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/preview-settings-queue.png" alt="Compute & Queue Workbench" width="420" /><br />
+      <sub><b>Compute & Queue Workbench (<code>⌘,</code>)</b> · Priority cards, two-stage fallback, off-peak schedule & local heatmap</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/preview-settings-integrations.png" alt="Multi-Client Integrations Hub" width="420" /><br />
+      <sub><b>Integrations Hub</b> · Auto-detected CC Switch, OpenCode, Codex CLI, Claude Code + dual-protocol copy</sub>
     </td>
   </tr>
 </table>
@@ -38,18 +48,17 @@ Monitor Compute Units across subscriptions, manage isolated multi-account GPU/TP
 
 ## Overview
 
-Google's official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) brings Colab GPUs and TPUs directly to the terminal for **Google AI Ultra (5x / 20x)**, **Colab Pro+ / Pro**, **Google AI Pro**, **Pay As You Go**, and **Free** users. **Colab Tools** wraps those official commands into a lightweight, zero-Dock, native SwiftUI menu bar HUD (`~2.5 MB`, zero Electron overhead).
+Google's official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) brings Colab GPUs and TPUs directly to the terminal for **Google AI Ultra (5x / 20x)**, **Colab Pro+ / Pro**, **Google AI Pro**, **Pay As You Go**, and **Free** users. **Colab Tools** wraps those official commands into a lightweight, zero-Dock, native SwiftUI menu bar HUD + standalone macOS Settings window (`~2.5 MB`, zero Electron overhead).
 
 ### Key Capabilities
 
 | Area | What Colab Tools Does |
 | :--- | :--- |
-| **Live Telemetry HUD** | Hero Compute Units (CU) readout, GPU utilization sparkline, 10-segment VRAM bar, 256K context bar, session uptime vs. 24h cap, and remaining hours estimate. |
-| **Subscription-Aware Controls** | Select your tier (`AI Ultra`, `Pro+`, `AI Pro`, `Pro`, `PAYG`, `Free`) with automatic CU-based suggestions and tier-appropriate accelerator menus (`G4 / H100 / A100 / L4 / T4 / TPU v6e / v5e / CPU` + `--high-mem`). |
-| **Adaptive Single & Multi-Account** | Clean zero-noise layout for 1 account; automatically reveals a horizontal account switcher + parallel Overview when managing 2+ accounts, with **external/orphan session `[?]` billing warnings**. |
-| **Three-State Idle Auto-Shutdown** | Customizable timeout (`5–720 min`, quick `15 / 40 / 60m` pills + pre-shutdown macOS notification + one-click extend). Only advances countdown on fresh verified `/slots` `idle` observations — never kills active notebooks or training runs. |
-| **Verified Billing Stop** | After `colab stop`, independently re-verifies server-side `colab sessions` (bypassing UI cooldown) before confirming billing has stopped. |
-| **Optional LLM & Claude Code Integration** | Optional module to boot `llama-server` + Cloudflare HTTPS tunnel from Google Drive, launch Claude Code via `0700` self-deleting wrappers (zero keys in shell history), and WAL-safely sync a dedicated standby provider in [CC Switch](https://github.com/farion1231/cc-switch) without touching your official Claude subscription. |
+| **Streamlined Live HUD** | Hero Compute Units (CU) readout, GPU utilization sparkline, 10-segment VRAM bar, workload/context progress bar, 24h cap countdown, and one-click access to the native `⌘,` Settings app. |
+| **Compute & Polite Queue Workbench** | Visual 2-column hardware selector with custom `↑/↓` priority order (`G4 / H100 / A100 / L4 / T4 / TPU v6e / v5e`), **two-stage auto-fallback** (chase scarce cards for N rounds, then append a fallback card), **off-peak scheduled starts** (one-shot or daily), and a strictly local **6-slot allocation hit-rate heatmap** — backed by Equal Jitter backoff (`5` rounds / `40m` cap) and automatic `412/429` circuit breakers. |
+| **Multi-Client Integrations Hub** | Auto-detects installed tools on your Mac. Safely writes isolated per-account standby entries with `0700/0600` private backups without modifying official defaults: **OpenCode** (`opencode.json`) and **Codex CLI** (`config.toml`) use environment variable references only (zero plaintext API keys in config files), while **[CC Switch](https://github.com/farion1231/cc-switch)** uses WAL-safe standby provider transactions. Launches **Claude Code** via self-deleting `0700` wrappers, and provides one-click **OpenAI (`/v1`) & Anthropic** safe copy templates for Cherry Studio, Cline, Roo Code, Cursor, Claude Code Router, and `ccm`. |
+| **All-Modal Workloads & Anti-False-Shutdown** | Supports `LLM`, `Video`, `Image`, `Audio`, `Music`, and `Training / General` workloads with `/tmp/colab-tools-status.json` + ComfyUI `:8188/queue` detection, dynamic SSH port tunnels, and a **dual low-load watchdog** (app signal first, falling back to `GPU < 5% AND CPU < 25%` so weight downloads or FFmpeg transcoding are never killed). |
+| **Adaptive Multi-Account & Verified Stop** | Clean zero-noise layout for 1 account; automatically expands a horizontal switcher + parallel Overview for 2+ isolated Keychain profiles, flags orphan `[?]` sessions, and re-verifies server-side `colab sessions` after `colab stop` before confirming billing stopped. |
 
 ---
 
@@ -80,7 +89,7 @@ flowchart LR
   ```
 
 ### Option 1: Download Prebuilt App
-1. Download `Colab-Tools-v0.3.4-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest).
+1. Download `Colab-Tools-v0.3.5-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest).
 2. Unzip and move **`Colab Tools.app`** into `/Applications`.
 3. Launch **`Colab Tools`** — your existing `colab` CLI login is detected automatically on first start.
 

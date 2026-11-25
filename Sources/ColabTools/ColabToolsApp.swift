@@ -17,6 +17,7 @@ struct ColabToolsEntry {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
+    private var settingsWindowController: SettingsWindowController?
     private var store: WorkspaceStore?
     private var eventMonitor: Any?
 
@@ -25,14 +26,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSApplication.shared.terminate(nil)
             return
         }
+        setupMainMenu()
+
         let s = WorkspaceStore()
         store = s
+        settingsWindowController = SettingsWindowController(store: s)
         s.onStatusBarNeedsUpdate = { [weak self] in
             self?.updateStatusItem()
         }
         // Keep popover pinned open during browser OAuth2 authorization so pasted codes aren't lost
         s.onPopoverPinChanged = { [weak self] pinned in
             self?.popover?.behavior = pinned ? .applicationDefined : .transient
+        }
+        s.onOpenSettingsWindow = { [weak self] section in
+            self?.openSettingsWindow(section: section)
         }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -134,6 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         menu.addItem(.separator())
+        menu.addItem(withTitle: "偏好设置…", action: #selector(menuOpenSettings), keyEquivalent: ",")
         menu.addItem(withTitle: "管理订阅 / 购点 (colab pay)", action: #selector(menuPay), keyEquivalent: "")
         menu.addItem(withTitle: "退出 Colab Tools", action: #selector(menuQuit), keyEquivalent: "q")
 
@@ -180,8 +188,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         store.openColabInBrowser(accountId: acc.id)
     }
 
+    @objc private func menuOpenSettings() { openSettingsWindow(section: .general) }
     @objc private func menuPay() { store?.openPayPage() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
+
+    private func openSettingsWindow(section: WorkspaceStore.SettingsSection) {
+        popover?.performClose(nil)
+        settingsWindowController?.show(section: section)
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu(title: "Colab Tools")
+        let prefsItem = NSMenuItem(title: "偏好设置…", action: #selector(menuOpenSettings), keyEquivalent: ",")
+        prefsItem.target = self
+        appMenu.addItem(prefsItem)
+        appMenu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出 Colab Tools", action: #selector(menuQuit), keyEquivalent: "q")
+        quitItem.target = self
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenuItem.submenu = windowMenu
+
+        NSApp.mainMenu = mainMenu
+    }
 
     private func updateStatusItem() {
         guard let store, let button = statusItem?.button else { return }

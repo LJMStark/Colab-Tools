@@ -3,6 +3,25 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.5] - 2026-11-25
+
+### Added
+- **Standalone Native macOS Settings App (`Cmd + ,`)**: Moved complex configuration out of the narrow menu bar popover into a dedicated Apple System Settings–style sidebar window (`General`, `Compute & Queue`, `Integrations`, `Accounts`, `Advanced`, `About`) with instant-apply controls and native `SMAppService.mainApp` Launch-at-Login support.
+- **Visual Compute & Queue Workbench**:
+  - **2-Column Hardware Target Grid**: Select GPUs/TPUs (`G4 / H100 / A100 / L4 / T4 / v6e-1 / v5e-1`) with VRAM & estimated `CU/h` readouts and `↑ / ↓` priority ordering preserved across saves.
+  - **Two-Stage Auto-Fallback**: Focus rounds `1..N` exclusively on primary scarce cards (e.g., `G4 → H100`), then automatically append a safe fallback card (e.g., `L4`) from round `N+1` onward.
+  - **Off-Peak Scheduled Start**: Schedule one-shot or daily off-peak launches (e.g., `07:00` local morning presets) with automatic de-duplication, cooldown checks, and global queue mutex compliance.
+  - **Local Allocation Hit-Rate Heatmap (`AllocationInsights`)**: Strictly local, privacy-preserving 6-slot (`00–04` .. `20–24`) hit-rate chart in `~/.config/colab-tools/allocation-stats.json` with automatic golden-hour recommendations after 3+ samples.
+- **Multi-Client Integrations Hub (`ClientIntegrations`)**:
+  - Automatically scans installed AI coding clients (`CC Switch`, `OpenCode`, `Codex CLI`, `Claude Code`) and floats detected tools to the top.
+  - **Native Safe Standby Sync**: Extends safe standby writes beyond CC Switch to **OpenCode** (`~/.config/opencode/opencode.json` using per-account `{env:COLAB_TOOLS_API_KEY_<UUID>}`, never storing plaintext keys) and **Codex CLI** (`~/.codex/config.toml` idempotent per-account `# BEGIN COLAB-TOOLS MANAGED <key>` block without touching top-level defaults), with serialized writes, symlink/ownership verification, unmanaged conflict rejection, and private `0700`/`0600` timestamped backups under `~/.config/colab-tools/backups/`.
+  - **Universal Dual-Protocol Copy Hub**: Safe-by-default `OpenAI (/v1)` and `Anthropic` template copy cards (never embedding Keychain secrets into offline placeholders; explicit online-only button to copy raw secret) for Cherry Studio, Cline, Roo Code, Cursor, Claude Code Router, `ccm`, and any standard client.
+- **9 New Core Unit Test Suites (25/25 total passing)**: Full regression coverage for per-account client isolation, unmanaged TOML/JSON conflict protection, invalid UTF-8 non-overwrite + `0700/0600` backup permissions, two-stage fallback & 10-minute schedule grace/expiry windows, corrupted stats clamping & unknown enum field-level decoding, and safe default snippet export.
+
+### Changed
+- **Streamlined Menu Bar Popover**: Removed the top 3-tab segmented switcher (`Control / Settings / About`) in favor of crisp `+ / Refresh / ⚙` action icons; kept high-frequency workload picker & queue toggle in the popover while summarizing queue priority, fallback, and schedule into a clean single-line status row with a one-click `Configure ›` deep link into the Settings window.
+- **Multi-Client Bottom Action**: Upgraded the LLM dock button to sync all enabled integrations in one click and added notification toggle support (`enableNotifications`) while keeping critical billing and circuit-breaker alerts active.
+
 ## [0.3.4] - 2026-11-25
 
 ### Security & Anti-False-Shutdown Hardening (Codex Review Follow-Up)

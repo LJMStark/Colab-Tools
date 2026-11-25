@@ -4,8 +4,15 @@ import Foundation
 public enum ProvisionOutcome: Equatable, Sendable {
     case allocated(hardware: String)
     case capacityUnavailable503(message: String)
+    case budgetExhausted(message: String)
     case unsupportedTier400(message: String)
     case circuitBroken(code: String, message: String)
+}
+
+public enum ScheduleDecision: Equatable, Sendable {
+    case waiting
+    case triggerNow(nextFireAt: Date?)
+    case missedExpired(nextFireAt: Date?)
 }
 
 /// Best-practice anti-abuse queue policy derived from AWS/Google Equal Jitter backoff
@@ -20,23 +27,123 @@ public enum ProvisionOutcome: Equatable, Sendable {
 public struct PoliteQueuePolicy: Sendable {
     public static let maxAttempts: Int = 5
     public static let maxTotalWaitSeconds: TimeInterval = 40 * 60
+    public static let minProvisionBudgetSeconds: TimeInterval = 15
+    public static let scheduledGraceWindowSeconds: TimeInterval = 10 * 60
     public static let circuitBreakerCooldownSeconds: TimeInterval = 15 * 60
     public static let nonLLMPostAllocateReminderSeconds: TimeInterval = 10 * 60
 
     /// Exponential base ceilings (in seconds) between round 1->2, 2->3, 3->4, 4->5.
     public static let roundBaseDelaysSeconds: [TimeInterval] = [180, 360, 540, 720]
 
-    /// Filters, deduplicates, and preserves high-to-low priority order against the account's legal subscription tier.
+    /// Filters and deduplicates against the account's legal subscription tier while PRESERVING user custom priority order.
     public static func sanitizedTargets(
         selected: [AcceleratorOption],
         for tier: SubscriptionTier
     ) -> [AcceleratorOption] {
-        let allowed = tier.queueableAccelerators
-        let selectedSet = Set(selected)
-        let ordered = allowed.filter { selectedSet.contains($0) }
+        let allowedSet = Set(tier.queueableAccelerators)
+        var seen: Set<AcceleratorOption> = []
+        var ordered: [AcceleratorOption] = []
+        for opt in selected where allowedSet.contains(opt) && !seen.contains(opt) {
+            seen.insert(opt)
+            ordered.append(opt)
+        }
         if !ordered.isEmpty { return ordered }
-        if let first = allowed.first { return [first] }
+        if let first = tier.queueableAccelerators.first { return [first] }
         return [.t4]
+    }
+
+    /// Two-stage queue strategy:
+    /// - Rounds `1...fallbackAfterRounds` try ONLY the user's primary priority targets.
+    /// - Starting at round `fallbackAfterRounds + 1`, if `fallbackEnabled` is true, appends the legal fallback card.
+    public static func targetsForRound(
+        attempt: Int,
+        primaryTargets: [AcceleratorOption],
+        fallbackEnabled: Bool,
+        fallbackAfterRounds: Int,
+        fallbackTarget: AcceleratorOption,
+        tier: SubscriptionTier
+    ) -> [AcceleratorOption] {
+        var base = sanitizedTargets(selected: primaryTargets, for: tier)
+        let threshold = max(1, min(maxAttempts - 1, fallbackAfterRounds))
+        if fallbackEnabled && attempt > threshold {
+            let allowed = Set(tier.queueableAccelerators)
+            if allowed.contains(fallbackTarget) && !base.contains(fallbackTarget) {
+                base.append(fallbackTarget)
+            }
+        }
+        return base
+    }
+
+    /// Computes the next wall-clock fire date for off-peak scheduled start (today if in the future, else tomorrow).
+    public static func nextScheduledFireDate(
+        hour: Int,
+        minute: Int,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Date {
+        let h = max(0, min(23, hour))
+        let m = max(0, min(59, minute))
+        var comps = calendar.dateComponents([.year, .month, .day], from: now)
+        comps.hour = h
+        comps.minute = m
+        comps.second = 0
+        if let todayTarget = calendar.date(from: comps), todayTarget > now {
+            return todayTarget
+        }
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now.addingTimeInterval(86400)
+        var tComps = calendar.dateComponents([.year, .month, .day], from: tomorrow)
+        tComps.hour = h
+        tComps.minute = m
+        tComps.second = 0
+        return calendar.date(from: tComps) ?? now.addingTimeInterval(86400)
+    }
+
+    /// Returns legal fallback cards that are NOT already in the user's primary target list.
+    public static func eligibleFallbackTargets(
+        excluding primaryTargets: [AcceleratorOption],
+        for tier: SubscriptionTier
+    ) -> [AcceleratorOption] {
+        let primarySet = Set(sanitizedTargets(selected: primaryTargets, for: tier))
+        return tier.queueableAccelerators.filter { !primarySet.contains($0) }
+    }
+
+    public static func defaultFallbackTarget(
+        excluding primaryTargets: [AcceleratorOption],
+        for tier: SubscriptionTier
+    ) -> AcceleratorOption {
+        let candidates = eligibleFallbackTargets(excluding: primaryTargets, for: tier)
+        if candidates.contains(.l4) { return .l4 }
+        if let first = candidates.first { return first }
+        return tier.queueableAccelerators.last ?? .t4
+    }
+
+    /// Evaluates a persisted scheduled fire timestamp against `now`:
+    /// - Before `fireAt`: `.waiting`.
+    /// - Within `[fireAt, fireAt + 10m]`: `.triggerNow` (computes next day's slot if `repeatDaily`, else `nil`).
+    /// - Past `fireAt + 10m` (e.g., Mac slept past the window): `.missedExpired` so one-shot schedules NEVER fire unexpectedly the next day!
+    public static func evaluateSchedule(
+        fireAt: Date,
+        repeatDaily: Bool,
+        hour: Int,
+        minute: Int,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> ScheduleDecision {
+        if now < fireAt {
+            return .waiting
+        }
+        let nextIfDaily: Date? = repeatDaily
+            ? nextScheduledFireDate(hour: hour, minute: minute, now: max(now, fireAt.addingTimeInterval(60)), calendar: calendar)
+            : nil
+        if now.timeIntervalSince(fireAt) <= scheduledGraceWindowSeconds {
+            return .triggerNow(nextFireAt: nextIfDaily)
+        }
+        return .missedExpired(nextFireAt: nextIfDaily)
+    }
+
+    public static func dayStamp(for date: Date, calendar: Calendar = .current) -> String {
+        let c = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
     /// Computes Equal Jitter delay before the next attempt, or `nil` when attempts or total elapsed cap are exhausted.

@@ -67,14 +67,31 @@ public struct RemoteTelemetry: Equatable, Sendable {
     public init() {}
 }
 
+public struct ProbeAttemptRecord: Equatable, Sendable {
+    public let hardware: String
+    public let succeeded: Bool
+
+    public init(hardware: String, succeeded: Bool) {
+        self.hardware = hardware
+        self.succeeded = succeeded
+    }
+}
+
 public struct ProvisionRoundResult: Equatable, Sendable {
     public let outcome: ProvisionOutcome
     /// Target values that returned HTTP 400 (unsupported by current subscription) and must not be retried in later rounds.
     public let unsupportedTargetValues: Set<String>
+    /// Exact per-target attempt observations executed in this round (only confirmed allocated or 503 capacity misses).
+    public let probeRecords: [ProbeAttemptRecord]
 
-    public init(outcome: ProvisionOutcome, unsupportedTargetValues: Set<String> = []) {
+    public init(
+        outcome: ProvisionOutcome,
+        unsupportedTargetValues: Set<String> = [],
+        probeRecords: [ProbeAttemptRecord] = []
+    ) {
         self.outcome = outcome
         self.unsupportedTargetValues = unsupportedTargetValues
+        self.probeRecords = probeRecords
     }
 }
 
@@ -676,29 +693,41 @@ public enum ColabCLIEngine {
         var lastOutcome: ProvisionOutcome = .capacityUnavailable503(message: "当前目标算力无库存 (503)")
         var sawCapacity503 = false
         var unsupportedValues: Set<String> = []
+        var probeRecords: [ProbeAttemptRecord] = []
 
         for (index, target) in targets.enumerated() {
             if Task.isCancelled {
-                return ProvisionRoundResult(outcome: .circuitBroken(code: "CANCELLED", message: "已取消申请"), unsupportedTargetValues: unsupportedValues)
+                return ProvisionRoundResult(outcome: .circuitBroken(code: "CANCELLED", message: "已取消申请"), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
             }
-            if let deadline, Date() >= deadline {
-                return ProvisionRoundResult(outcome: .capacityUnavailable503(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues)
+            if let deadline, deadline.timeIntervalSinceNow < PoliteQueuePolicy.minProvisionBudgetSeconds {
+                return ProvisionRoundResult(outcome: .budgetExhausted(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
             }
             if index > 0, let delayFn = interTargetDelaySeconds {
                 let pause = max(0, delayFn())
-                if let deadline, Date().addingTimeInterval(pause) >= deadline {
-                    return ProvisionRoundResult(outcome: .capacityUnavailable503(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues)
+                if let deadline, deadline.timeIntervalSince(Date().addingTimeInterval(pause)) < PoliteQueuePolicy.minProvisionBudgetSeconds {
+                    return ProvisionRoundResult(outcome: .budgetExhausted(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
                 }
                 if pause > 0 {
                     onProgress("准备尝试 \(target.display)（间隔 \(Int(pause))s）…")
                     try? await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
                     if Task.isCancelled {
-                        return ProvisionRoundResult(outcome: .circuitBroken(code: "CANCELLED", message: "已取消申请"), unsupportedTargetValues: unsupportedValues)
+                        return ProvisionRoundResult(outcome: .circuitBroken(code: "CANCELLED", message: "已取消申请"), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
                     }
-                    if let deadline, Date() >= deadline {
-                        return ProvisionRoundResult(outcome: .capacityUnavailable503(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues)
+                    if let deadline, deadline.timeIntervalSinceNow < PoliteQueuePolicy.minProvisionBudgetSeconds {
+                        return ProvisionRoundResult(outcome: .budgetExhausted(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
                     }
                 }
+            }
+
+            let stepTimeout: TimeInterval
+            if let deadline {
+                let rem = deadline.timeIntervalSinceNow
+                guard rem >= PoliteQueuePolicy.minProvisionBudgetSeconds else {
+                    return ProvisionRoundResult(outcome: .budgetExhausted(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
+                }
+                stepTimeout = min(50, floor(rem))
+            } else {
+                stepTimeout = 50
             }
 
             onBeforeAttempt?(target)
@@ -710,9 +739,10 @@ public enum ColabCLIEngine {
             if profile.highMem && profile.tier.supportsHighMem {
                 args.append("--high-mem")
             }
-            let r = await runColab(profile: profile, subcommandArgs: args, timeoutSeconds: 50)
+            let r = await runColab(profile: profile, subcommandArgs: args, timeoutSeconds: stepTimeout)
             if r.exitCode == 0 {
-                return ProvisionRoundResult(outcome: .allocated(hardware: target.display), unsupportedTargetValues: unsupportedValues)
+                probeRecords.append(ProbeAttemptRecord(hardware: target.display, succeeded: true))
+                return ProvisionRoundResult(outcome: .allocated(hardware: target.display), unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
             }
             let outcome = PoliteQueuePolicy.classifyFailure(
                 exitCode: r.exitCode,
@@ -723,11 +753,13 @@ public enum ColabCLIEngine {
             )
             switch outcome {
             case .allocated:
-                return ProvisionRoundResult(outcome: outcome, unsupportedTargetValues: unsupportedValues)
-            case .circuitBroken:
+                probeRecords.append(ProbeAttemptRecord(hardware: target.display, succeeded: true))
+                return ProvisionRoundResult(outcome: outcome, unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
+            case .circuitBroken, .budgetExhausted:
                 // Hard circuit-breaker: stop immediately on 412 / 429 / 401 / 403 / timeout / unknown
-                return ProvisionRoundResult(outcome: outcome, unsupportedTargetValues: unsupportedValues)
+                return ProvisionRoundResult(outcome: outcome, unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
             case .capacityUnavailable503:
+                probeRecords.append(ProbeAttemptRecord(hardware: target.display, succeeded: false))
                 sawCapacity503 = true
                 lastOutcome = outcome
                 continue
@@ -741,7 +773,7 @@ public enum ColabCLIEngine {
                 continue
             }
         }
-        return ProvisionRoundResult(outcome: lastOutcome, unsupportedTargetValues: unsupportedValues)
+        return ProvisionRoundResult(outcome: lastOutcome, unsupportedTargetValues: unsupportedValues, probeRecords: probeRecords)
     }
 
     public static func stopSession(profile: AccountProfile, sessionName: String? = nil) async -> ShellResult {

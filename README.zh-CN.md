@@ -6,7 +6,7 @@
 
 **面向 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣**
 
-实时监控多订阅 Compute Units 点数 · 安全隔离并行管理多账号 GPU/TPU · 三态防误停空闲自动关机 · 可选 Claude Code 与 CC Switch 无感联动
+实时监控多订阅 Compute Units 点数 · 可视化合规抢卡、两阶段降级与错峰预约 · 独立原生 macOS 设置窗口 · 全生态 AI 客户端无缝接入
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [下载最新版](https://github.com/LJMStark/Colab-Tools/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](SECURITY.md)
 
@@ -22,12 +22,22 @@
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/images/preview-dashboard.png" alt="Colab Tools 单账号监控 HUD" width="380" /><br />
-      <sub><b>单账号实况 HUD</b> · 显存分格条、GPU 折线、256K 上下文与空闲关机</sub>
+      <img src="docs/images/preview-dashboard.png" alt="Colab Tools 单账号监控 HUD" width="360" /><br />
+      <sub><b>半精简菜单栏 HUD</b> · 显存/GPU 微图表、策略摘要与 <code>⚙</code> 直达设置窗</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-multi-account.png" alt="Colab Tools 多账号并行总览" width="380" /><br />
+      <img src="docs/images/preview-multi-account.png" alt="Colab Tools 多账号并行总览" width="360" /><br />
       <sub><b>多账号并行总览</b> · 独立钥匙串隔离、聚合点数统计与一键全停止损</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/preview-settings-queue.png" alt="算力与抢卡工作台" width="420" /><br />
+      <sub><b>算力与抢卡工作台（<code>⌘,</code>）</b> · 可视化顺位排序、两阶段保底降级、错峰预约与本机热力图</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/preview-settings-integrations.png" alt="全生态接入工具中心" width="420" /><br />
+      <sub><b>接入工具中心</b> · 自动探测 CC Switch / OpenCode / Codex CLI / Claude Code + 双协议一键复制</sub>
     </td>
   </tr>
 </table>
@@ -40,12 +50,11 @@
 
 | 模块 | 能力说明 |
 | :--- | :--- |
-| **原生 HUD 监控美学** | 纯原生 Swift 6 + SwiftUI + AppKit（`~2.5 MB`，不占 Dock）；大字号点数读数、GPU 实时折线、10 格显存柱状条、上下文进度条、24h 平台上限与预计可用小时数一目了然。 |
-| **全订阅档位自适应** | 支持 **Google AI Ultra (5x / 20x)**、**Colab Pro+**、**Google AI Pro**、**Colab Pro**、**Pay As You Go** 与 **Free**；按实时 CU 自动推荐订阅并匹配对应加速器菜单（`G4 / H100 / A100 / L4 / T4 / TPU v6e / v5e / CPU` + `--high-mem`）。 |
-| **单 / 多账号无感切换** | 单账号时界面纯净零噪音；绑定 2+ 账号后自动展开顶部横向切换条与「并行总览」，并针对外部/孤儿运行中会话 `[?]` 弹出幽灵计费提醒。 |
-| **三态安全空闲关机** | 支持 `5–720` 分钟自定义（内置 `15 / 40 / 60m` 快捷药丸、关机前弹窗预警、一键续命）。严格基于近期有效的 `/slots` 空闲观测推进计时，普通 Notebook 训练或网络波动时自动暂停，绝不误杀。 |
-| **停机二次核验** | 执行 `colab stop` 后绕过 UI 冷却独立复查服务端 `colab sessions`，确认释放后才报告停止计费，失败明确告警。 |
-| **可选 LLM & Claude Code 闭环** | 可选挂载 Google Drive 启动自托管 `llama-server` 与 Cloudflare HTTPS 隧道；通过 `0700` 启动即自删脚本拉起 Claude Code（零密钥残留历史）；采用 WAL 在线备份与短事务安全同步 [CC Switch](https://github.com/farion1231/cc-switch) 独立待机渠道，绝不触碰官方 Claude 订阅。 |
+| **独立原生设置 App + 精简 HUD** | 纯原生 Swift 6 + SwiftUI + AppKit（`~2.5 MB`，不占 Dock）。菜单栏弹窗只留高频状态与启停，低频复杂配置全部迁入标准 macOS 左侧边栏设置窗口（`⌘,`），支持开机自启、普通项说人话、极客项藏进「高级」。 |
+| **可视化抢卡、两阶段降级与错峰预约** | 2 列硬件卡片自由勾选与 `↑/↓` 调序（`G4 / H100 / A100 / L4 / T4 / TPU v6e / v5e`）；支持**前 N 轮专冲高配卡、第 N+1 轮起加入保底卡**；支持**清晨低峰单次/每日定时预约**与纯本地 **6 时段命中率热力图**；底层严守单层重试、Equal Jitter 低频间隔（上限 5 轮 / 40 分钟）与 `412/429` 自动硬熔断。 |
+| **全生态客户端接入中心** | 自动探测本机已安装工具并置顶。原生安全写入（写前自动备份、绝不改官方默认、OpenCode/Codex 不写明文 Key）：**[CC Switch](https://github.com/farion1231/cc-switch)**、**OpenCode**（`opencode.json`）与 **Codex CLI**（`config.toml`）；一键安全拉起 **Claude Code**；并为 Cherry Studio、Cline、Roo Code、Cursor、Claude Code Router、`ccm` 等提供 **OpenAI (`/v1`) + Anthropic 双协议一键复制**。 |
+| **全模态负载与双低载防误杀** | 覆盖 `LLM 大模型`、`视频生成`、`图像生成`、`音频语音`、`音乐生成`、`训练通用` 六类场景；自动探测 `/tmp/colab-tools-status.json` 与 ComfyUI `:8188/queue`，支持动态端口 SSH 隧道；空闲关机优先读应用信号，兜底需同时满足 **`GPU < 5%` 且 `CPU < 25%`**，下载权重或转码绝不误关。 |
+| **多账号隔离与停机二次核验** | 单账号清爽无干扰，2+ 账号自动展开横向切换与「并行总览」，标注外部/孤儿 `[?]` 幽灵计费会话；`colab stop` 后独立复查服务端确认释放，避免漏关计费。 |
 
 ---
 
@@ -60,7 +69,7 @@
   ```
 
 ### 方式一：直接下载预编译包
-1. 前往 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 `Colab-Tools-v0.3.4-macOS-arm64.zip`。
+1. 前往 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 `Colab-Tools-v0.3.5-macOS-arm64.zip`。
 2. 解压后将 **`Colab Tools.app`** 拖入 `/Applications` 并打开（首次启动会自动识别你已登录的官方 `colab` CLI 账号）。
 
 > 若 macOS Gatekeeper 提示未公证，右键应用选择「打开」，或执行 `xattr -cr "/Applications/Colab Tools.app"`。

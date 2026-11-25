@@ -15,13 +15,15 @@ public final class WorkspaceStore: ObservableObject {
     }
     @Published public var runtimeByAccount: [UUID: AccountRuntimeState] = [:]
     @Published public var selectedViewMode: WorkspaceViewMode = .singleAccount
-    @Published public var selectedTab: PanelTab = .dashboard
+    @Published public var selectedSettingsSection: SettingsSection = .general
     @Published public var showingAddAccount: Bool = false {
         didSet {
             onPopoverPinChanged?(showingAddAccount)
         }
     }
     @Published public var cliInstalled: Bool = true
+    @Published public var clientDetection: ClientDetectionSnapshot = ClientDetectionSnapshot()
+    @Published public var insights: AllocationInsights = AllocationInsights()
     @Published public var toastMessage: String? = nil
     @Published public var activeQueueAccountId: UUID? = nil
     @Published public var queueTickVersion: Int = 0
@@ -31,15 +33,36 @@ public final class WorkspaceStore: ObservableObject {
         case singleAccount
     }
 
-    public enum PanelTab: String, CaseIterable, Identifiable {
-        case dashboard = "控制"
-        case settings = "设置"
+    public enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
+        case general = "通用"
+        case compute = "算力与抢卡"
+        case integrations = "接入工具"
+        case accounts = "账号管理"
+        case advanced = "高级"
         case about = "关于"
+
         public var id: String { rawValue }
+
+        public var iconName: String {
+            switch self {
+            case .general: return "gearshape"
+            case .compute: return "cpu"
+            case .integrations: return "puzzlepiece.extension"
+            case .accounts: return "person.2"
+            case .advanced: return "slider.horizontal.3"
+            case .about: return "info.circle"
+            }
+        }
+    }
+
+    public enum SnippetFormat {
+        case env
+        case json
     }
 
     public var onStatusBarNeedsUpdate: (() -> Void)?
     public var onPopoverPinChanged: ((Bool) -> Void)?
+    public var onOpenSettingsWindow: ((SettingsSection) -> Void)?
 
     private var tickTimer: Timer?
     private var slotTimer: Timer?
@@ -65,6 +88,8 @@ public final class WorkspaceStore: ObservableObject {
         }
         KeychainVault.cleanupStaleEphemeralFiles()
         self.settings = AppSettings.load()
+        self.insights = AllocationInsights.load()
+        self.clientDetection = ClientIntegrations.detectInstalledTools()
         let now = Date()
         for acc in settings.accounts {
             var st = AccountRuntimeState()
@@ -80,6 +105,31 @@ public final class WorkspaceStore: ObservableObject {
         Task {
             await bootstrapInitialAccounts()
         }
+    }
+
+    public func refreshClientDetection() {
+        clientDetection = ClientIntegrations.detectInstalledTools()
+    }
+
+    private func sendNotice(title: String, body: String, criticalBillingAlert: Bool = false) {
+        if criticalBillingAlert || settings.enableNotifications {
+            ColabCLIEngine.sendNotification(title: title, body: body)
+        }
+    }
+
+    private func recordAllocationInsight(hardware: String, succeeded: Bool) {
+        insights.record(hardware: hardware, succeeded: succeeded)
+        if persistSettingsChanges {
+            insights.save()
+        }
+    }
+
+    public func clearAllocationInsights() {
+        insights = AllocationInsights()
+        if persistSettingsChanges {
+            insights.save()
+        }
+        showToast("已清空本机时段统计记录")
     }
 
     public func cleanup() {
@@ -104,22 +154,18 @@ public final class WorkspaceStore: ObservableObject {
         }
     }
 
-    // MARK: - Unified Navigation Helpers (Fixes Settings -> Add Account conflict)
+    // MARK: - Unified Navigation Helpers
 
     public func openAddAccountFlow() {
         withAnimation(.snappy(duration: 0.18)) {
-            selectedTab = .dashboard
             showingAddAccount = true
         }
     }
 
-    public func switchTab(to tab: PanelTab) {
-        withAnimation(.snappy(duration: 0.16)) {
-            selectedTab = tab
-            if tab != .dashboard {
-                showingAddAccount = false
-            }
-        }
+    public func openSettings(section: SettingsSection = .general) {
+        selectedSettingsSection = section
+        refreshClientDetection()
+        onOpenSettingsWindow?(section)
     }
 
     // MARK: - Computed Workspace Aggregates
@@ -236,7 +282,11 @@ public final class WorkspaceStore: ObservableObject {
         var needsStatusUpdate = false
         var anyQueueOrCooldown = false
         let now = Date()
-        for acc in settings.accounts {
+        let cal = Calendar.current
+        let todayStamp = PoliteQueuePolicy.dayStamp(for: now, calendar: cal)
+
+        for idx in settings.accounts.indices {
+            let acc = settings.accounts[idx]
             guard var st = runtimeByAccount[acc.id] else { continue }
             if let until = st.queueCircuitBreakUntil {
                 if until <= now {
@@ -250,6 +300,95 @@ public final class WorkspaceStore: ObservableObject {
                     anyQueueOrCooldown = true
                 }
             }
+
+            // Off-peak scheduled start evaluation using exact persisted fire timestamp + 10-minute grace window.
+            // Acquires queue mutex / busy state synchronously BEFORE consuming the schedule so two accounts
+            // scheduled in the same minute never silently drop a one-shot schedule.
+            if acc.scheduledStartEnabled {
+                let fireAt = acc.scheduledNextFireAt ?? PoliteQueuePolicy.nextScheduledFireDate(
+                    hour: acc.scheduledStartHour,
+                    minute: acc.scheduledStartMinute,
+                    now: now,
+                    calendar: cal
+                )
+                let decision = PoliteQueuePolicy.evaluateSchedule(
+                    fireAt: fireAt,
+                    repeatDaily: acc.scheduledStartRepeatDaily,
+                    hour: acc.scheduledStartHour,
+                    minute: acc.scheduledStartMinute,
+                    now: now,
+                    calendar: cal
+                )
+                switch decision {
+                case .waiting:
+                    if acc.scheduledNextFireAt == nil {
+                        var copy = acc
+                        copy.scheduledNextFireAt = fireAt
+                        settings.accounts[idx] = copy
+                    }
+                case .missedExpired(let nextFireAt):
+                    var copy = acc
+                    if copy.scheduledStartRepeatDaily {
+                        copy.scheduledNextFireAt = nextFireAt
+                    } else {
+                        copy.scheduledStartEnabled = false
+                        copy.scheduledNextFireAt = nil
+                    }
+                    settings.accounts[idx] = copy
+                    let tStr = String(format: "%02d:%02d", acc.scheduledStartHour, acc.scheduledStartMinute)
+                    sendNotice(
+                        title: "Colab Tools 预约已过期 · \(acc.displayName)",
+                        body: "已错过 \(tStr) 预约窗口（超过 10 分钟），为防意外计费未自动启动。"
+                    )
+                case .triggerNow(let nextFireAt):
+                    if case .offline = st.phase, activeCircuitBreakerUntil(for: acc.id, now: now) == nil {
+                        let timeLabel = String(format: "%02d:%02d", acc.scheduledStartHour, acc.scheduledStartMinute)
+                        if acc.enablePoliteQueue {
+                            // Synchronously claim the single-account queue mutex BEFORE consuming the schedule
+                            if startPoliteQueueSession(acc.id, silentIfBlocked: true) {
+                                var copy = acc
+                                copy.lastScheduledFireDay = todayStamp
+                                if copy.scheduledStartRepeatDaily {
+                                    copy.scheduledNextFireAt = nextFireAt
+                                } else {
+                                    copy.scheduledStartEnabled = false
+                                    copy.scheduledNextFireAt = nil
+                                }
+                                settings.accounts[idx] = copy
+                                sendNotice(
+                                    title: "Colab Tools 错峰预约已启动 · \(acc.displayName)",
+                                    body: "已按预约时间 \(timeLabel) 自动进入合规排队。"
+                                )
+                            } else {
+                                // Another account currently holds the queue mutex: keep schedule pending inside the grace window
+                                // and surface a clear status note without silently dropping the schedule.
+                                if st.lastError == nil {
+                                    st.lastError = "预约 \(timeLabel) 等待另一账号排队释放后自动尝试（10 分钟宽限内）"
+                                    runtimeByAccount[acc.id] = st
+                                }
+                            }
+                        } else {
+                            // Synchronously mark starting generation & consume schedule before kicking off async run
+                            var copy = acc
+                            copy.lastScheduledFireDay = todayStamp
+                            if copy.scheduledStartRepeatDaily {
+                                copy.scheduledNextFireAt = nextFireAt
+                            } else {
+                                copy.scheduledStartEnabled = false
+                                copy.scheduledNextFireAt = nil
+                            }
+                            settings.accounts[idx] = copy
+                            sendNotice(
+                                title: "Colab Tools 错峰预约已启动 · \(acc.displayName)",
+                                body: "已到达预约时间 \(timeLabel)，正在自动申请目标算力。"
+                            )
+                            let accId = acc.id
+                            Task { await self.runSingleStartSession(accId) }
+                        }
+                    }
+                }
+            }
+
             if st.phase.isQueuing {
                 anyQueueOrCooldown = true
                 needsStatusUpdate = true
@@ -305,14 +444,14 @@ public final class WorkspaceStore: ObservableObject {
                 break
             case .warn(let leftMin):
                 st.warnedForCurrentIdle = true
-                ColabCLIEngine.sendNotification(
+                sendNotice(
                     title: "Colab Tools 空闲预警 · \(acc.displayName)",
                     body: "已确认连续空闲，约 \(leftMin) 分钟后自动释放 GPU（点击菜单栏可一键续命）"
                 )
             case .shutdown:
                 st.warnedForCurrentIdle = false
                 runtimeByAccount[acc.id] = st
-                ColabCLIEngine.sendNotification(
+                sendNotice(
                     title: "Colab Tools 自动关机 · \(acc.displayName)",
                     body: "连续空闲满 \(acc.idleTimeoutMinutes) 分钟，正在执行 colab stop 停止计费。"
                 )
@@ -407,10 +546,13 @@ public final class WorkspaceStore: ObservableObject {
             cur.activeEndpoint = primary.endpoint
             cur.activeHardware = primary.hardware
             if wasOffline || endpointChanged {
-                // Invalidate any prior session's credential-bearing API URL when session/endpoint changes
+                // Invalidate any prior session's credential-bearing API URL and client sync badges when session/endpoint changes
                 cur.publicURL = ""
                 cur.llmURLBoundEndpoint = ""
                 cur.displayUIURL = ""
+                cur.ccSwitchSynced = false
+                cur.openCodeSynced = false
+                cur.codexSynced = false
                 cur.lastActiveAt = Date()
                 cur.idleSeconds = 0
                 cur.warnedForCurrentIdle = false
@@ -450,6 +592,9 @@ public final class WorkspaceStore: ObservableObject {
             cur.publicURL = ""
             cur.llmURLBoundEndpoint = ""
             cur.displayUIURL = ""
+            cur.ccSwitchSynced = false
+            cur.openCodeSynced = false
+            cur.codexSynced = false
             cur.serverHealthy = false
             cur.activitySignal = .unknown
             cur.signalSource = .none
@@ -683,18 +828,41 @@ public final class WorkspaceStore: ObservableObject {
     public func toggleQueueTarget(_ option: AcceleratorOption, for accountId: UUID) {
         guard var acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
         guard acc.tier.queueableAccelerators.contains(option) else { return }
-        var set = Set(acc.queueTargets)
-        if set.contains(option) {
-            if set.count <= 1 {
+        var list = PoliteQueuePolicy.sanitizedTargets(selected: acc.queueTargets, for: acc.tier)
+        if let idx = list.firstIndex(of: option) {
+            if list.count <= 1 {
                 showToast("至少保留 1 个排队目标")
                 return
             }
-            set.remove(option)
+            list.remove(at: idx)
         } else {
-            set.insert(option)
+            list.append(option)
         }
-        acc.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: Array(set), for: acc.tier)
+        acc.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: list, for: acc.tier)
         updateAccount(acc)
+    }
+
+    public func moveQueueTarget(_ option: AcceleratorOption, direction: Int, for accountId: UUID) {
+        guard var acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        var list = PoliteQueuePolicy.sanitizedTargets(selected: acc.queueTargets, for: acc.tier)
+        guard let idx = list.firstIndex(of: option) else { return }
+        let targetIdx = idx + direction
+        guard targetIdx >= 0, targetIdx < list.count else { return }
+        list.swapAt(idx, targetIdx)
+        acc.queueTargets = list
+        updateAccount(acc)
+    }
+
+    /// Clears only the transient UI error banner; NEVER bypasses the mandatory 15-minute server-side anti-abuse cooldown.
+    public func clearDisplayedError(for accountId: UUID) {
+        if var st = runtimeByAccount[accountId] {
+            st.lastError = nil
+            if case .error = st.phase {
+                st.phase = .offline
+            }
+            runtimeByAccount[accountId] = st
+            showToast("已清除界面错误提示")
+        }
     }
 
     private func activeCircuitBreakerUntil(for accountId: UUID, now: Date = Date()) -> Date? {
@@ -920,10 +1088,21 @@ public final class WorkspaceStore: ObservableObject {
                 }
             }
             guard isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+            for rec in roundRes.probeRecords {
+                recordAllocationInsight(hardware: rec.hardware, succeeded: rec.succeeded)
+            }
             switch roundRes.outcome {
             case .allocated(let hw):
                 allocatedHW = hw
-            case .capacityUnavailable503(let msg), .unsupportedTier400(let msg):
+            case .capacityUnavailable503(let msg), .budgetExhausted(let msg):
+                var errState = state(for: accountId)
+                errState.phase = .error(msg)
+                errState.lastError = msg
+                runtimeByAccount[accountId] = errState
+                showToast(msg)
+                onStatusBarNeedsUpdate?()
+                return
+            case .unsupportedTier400(let msg):
                 var errState = state(for: accountId)
                 errState.phase = .error(msg)
                 errState.lastError = msg
@@ -953,28 +1132,39 @@ public final class WorkspaceStore: ObservableObject {
         )
     }
 
-    public func startPoliteQueueSession(_ accountId: UUID) {
-        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+    @discardableResult
+    public func startPoliteQueueSession(_ accountId: UUID, silentIfBlocked: Bool = false) -> Bool {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return false }
         let st = state(for: accountId)
-        guard !st.phase.isBusy && !st.phase.isRunning && !st.phase.isQueuing else { return }
+        guard !st.phase.isBusy && !st.phase.isRunning && !st.phase.isQueuing else { return false }
 
         // Global single-account mutex to strictly prevent multi-account polling / abuse
         if let activeId = activeQueueAccountId, activeId != accountId {
-            let otherName = settings.accounts.first(where: { $0.id == activeId })?.displayName ?? "另一账号"
-            showToast("「\(otherName)」正在排队，防风控限制同时仅允许单账号排队")
-            return
+            if !silentIfBlocked {
+                let otherName = settings.accounts.first(where: { $0.id == activeId })?.displayName ?? "另一账号"
+                showToast("「\(otherName)」正在排队，防风控限制同时仅允许单账号排队")
+            }
+            return false
         }
 
         // Enforce persisted circuit-breaker cooldown after 412 / 429 / 403 / abuse signal
         if let until = activeCircuitBreakerUntil(for: accountId) {
-            let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
-            showToast("触发防风控硬熔断，冷却剩余约 \(remMin) 分钟后再试")
-            return
+            if !silentIfBlocked {
+                let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
+                showToast("触发防风控硬熔断，冷却剩余约 \(remMin) 分钟后再试")
+            }
+            return false
         }
 
-        let cleanTargets = PoliteQueuePolicy.sanitizedTargets(selected: acc.queueTargets, for: acc.tier)
-        var remainingTargets = cleanTargets.flatMap(\.probeTargets)
-        var summary = PoliteQueuePolicy.targetsSummary(cleanTargets)
+        let initialTargets = PoliteQueuePolicy.targetsForRound(
+            attempt: 1,
+            primaryTargets: acc.queueTargets,
+            fallbackEnabled: acc.queueFallbackEnabled,
+            fallbackAfterRounds: acc.queueFallbackAfterRounds,
+            fallbackTarget: acc.queueFallbackTarget,
+            tier: acc.tier
+        )
+        let initialSummary = PoliteQueuePolicy.targetsSummary(initialTargets)
 
         let myToken = UUID()
         var nextSt = st
@@ -982,7 +1172,7 @@ public final class WorkspaceStore: ObservableObject {
         let runGen = nextSt.generation
         nextSt.lastError = nil
         nextSt.queueInFlightProvisioning = false
-        nextSt.phase = .queuing(attempt: 1, maxAttempts: PoliteQueuePolicy.maxAttempts, nextRetryAt: nil, targetsSummary: summary)
+        nextSt.phase = .queuing(attempt: 1, maxAttempts: PoliteQueuePolicy.maxAttempts, nextRetryAt: nil, targetsSummary: initialSummary)
         runtimeByAccount[accountId] = nextSt
         activeQueueAccountId = accountId
         activeQueueToken = myToken
@@ -994,6 +1184,7 @@ public final class WorkspaceStore: ObservableObject {
 
         queueTasks[accountId] = Task { @MainActor [weak self] in
             guard let self else { return }
+            var permanentlyUnsupportedValues: Set<String> = []
             defer {
                 // Only the active token holder may clear the task entry or release the global queue mutex
                 if self.queueTokens[accountId] == myToken {
@@ -1014,6 +1205,35 @@ public final class WorkspaceStore: ObservableObject {
 
             for attempt in 1...PoliteQueuePolicy.maxAttempts {
                 guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+                guard let latestAcc = self.settings.accounts.first(where: { $0.id == accountId }) else { return }
+
+                // Compute two-stage targets for this round (primary targets for early rounds, append fallback later)
+                let roundOptions = PoliteQueuePolicy.targetsForRound(
+                    attempt: attempt,
+                    primaryTargets: latestAcc.queueTargets,
+                    fallbackEnabled: latestAcc.queueFallbackEnabled,
+                    fallbackAfterRounds: latestAcc.queueFallbackAfterRounds,
+                    fallbackTarget: latestAcc.queueFallbackTarget,
+                    tier: latestAcc.tier
+                )
+                let roundTargets = roundOptions.flatMap(\.probeTargets).filter { target in
+                    guard let val = target.value?.uppercased() else { return true }
+                    return !permanentlyUnsupportedValues.contains(val)
+                }
+                let fallbackActiveThisRound = latestAcc.queueFallbackEnabled
+                    && attempt > max(1, min(PoliteQueuePolicy.maxAttempts - 1, latestAcc.queueFallbackAfterRounds))
+                    && roundOptions.contains(latestAcc.queueFallbackTarget)
+                    && !PoliteQueuePolicy.sanitizedTargets(selected: latestAcc.queueTargets, for: latestAcc.tier).contains(latestAcc.queueFallbackTarget)
+                let baseSummary = roundTargets.map(\.display).joined(separator: " → ")
+                let summary = fallbackActiveThisRound ? "\(baseSummary) (含保底)" : baseSummary
+
+                guard !roundTargets.isEmpty else {
+                    var noLeft = self.state(for: accountId)
+                    noLeft.phase = .error("所选算力均不受当前订阅支持，已停止排队")
+                    self.runtimeByAccount[accountId] = noLeft
+                    return
+                }
+
                 guard Date() < absoluteDeadline else {
                     var done = self.state(for: accountId)
                     done.phase = .offline
@@ -1021,7 +1241,6 @@ public final class WorkspaceStore: ObservableObject {
                     self.runtimeByAccount[accountId] = done
                     return
                 }
-                guard let latestAcc = self.settings.accounts.first(where: { $0.id == accountId }) else { return }
 
                 // Re-verify default OAuth2 CLI identity before EVERY round so switching `colab login` never provisions on another account
                 guard await self.verifySystemDefaultIdentityIfNeeded(for: latestAcc) else {
@@ -1068,7 +1287,7 @@ public final class WorkspaceStore: ObservableObject {
 
                 let roundRes = await ColabCLIEngine.provisionSession(
                     profile: latestAcc,
-                    overrideTargets: remainingTargets,
+                    overrideTargets: roundTargets,
                     deadline: absoluteDeadline,
                     interTargetDelaySeconds: { PoliteQueuePolicy.interTargetDelaySeconds() },
                     onBeforeAttempt: { [weak self] _ in
@@ -1091,11 +1310,12 @@ public final class WorkspaceStore: ObservableObject {
 
                 // Permanently prune any targets that returned HTTP 400 so we never re-probe unsupported tiers in later rounds
                 if !roundRes.unsupportedTargetValues.isEmpty {
-                    remainingTargets.removeAll { target in
-                        guard let val = target.value?.uppercased() else { return false }
-                        return roundRes.unsupportedTargetValues.contains(val)
-                    }
-                    summary = remainingTargets.map(\.display).joined(separator: " → ")
+                    permanentlyUnsupportedValues.formUnion(roundRes.unsupportedTargetValues)
+                }
+
+                // Record only verified per-target probe observations (allocated or explicit 503)
+                for rec in roundRes.probeRecords {
+                    self.recordAllocationInsight(hardware: rec.hardware, succeeded: rec.succeeded)
                 }
 
                 switch roundRes.outcome {
@@ -1115,9 +1335,10 @@ public final class WorkspaceStore: ObservableObject {
                     broken.lastError = msg
                     self.runtimeByAccount[accountId] = broken
                     self.recordCircuitBreaker(for: accountId)
-                    ColabCLIEngine.sendNotification(
+                    self.sendNotice(
                         title: "Colab Tools 排队熔断 · \(latestAcc.displayName)",
-                        body: msg
+                        body: msg,
+                        criticalBillingAlert: true
                     )
                     self.showToast(msg)
                     return
@@ -1130,8 +1351,32 @@ public final class WorkspaceStore: ObservableObject {
                     self.showToast(msg)
                     return
 
+                case .budgetExhausted(let msg):
+                    var done = self.state(for: accountId)
+                    done.phase = .offline
+                    done.lastError = "\(msg)（上限 40 分钟），\(summary) 仍暂无库存，已自动停止"
+                    self.runtimeByAccount[accountId] = done
+                    self.sendNotice(
+                        title: "Colab Tools 排队结束 · \(latestAcc.displayName)",
+                        body: "\(summary) 暂未释放库存，已按防风控 40 分钟上限自动停止排队。"
+                    )
+                    self.showToast("已达安全排队时长上限，自动停止")
+                    return
+
                 case .capacityUnavailable503(let msg):
-                    if remainingTargets.isEmpty {
+                    let nextRoundOptions = PoliteQueuePolicy.targetsForRound(
+                        attempt: attempt + 1,
+                        primaryTargets: latestAcc.queueTargets,
+                        fallbackEnabled: latestAcc.queueFallbackEnabled,
+                        fallbackAfterRounds: latestAcc.queueFallbackAfterRounds,
+                        fallbackTarget: latestAcc.queueFallbackTarget,
+                        tier: latestAcc.tier
+                    )
+                    let nextLegalTargets = nextRoundOptions.flatMap(\.probeTargets).filter { target in
+                        guard let val = target.value?.uppercased() else { return true }
+                        return !permanentlyUnsupportedValues.contains(val)
+                    }
+                    if nextLegalTargets.isEmpty {
                         var noLeft = self.state(for: accountId)
                         noLeft.phase = .error("所选算力均不受当前订阅支持，已停止排队")
                         noLeft.lastError = msg
@@ -1147,7 +1392,7 @@ public final class WorkspaceStore: ObservableObject {
                         done.phase = .offline
                         done.lastError = "已完成 \(attempt) 轮合规排队（上限 40 分钟），\(summary) 仍暂无库存，已自动停止"
                         self.runtimeByAccount[accountId] = done
-                        ColabCLIEngine.sendNotification(
+                        self.sendNotice(
                             title: "Colab Tools 排队结束 · \(latestAcc.displayName)",
                             body: "\(summary) 暂未释放库存，已按防风控上限自动停止排队。"
                         )
@@ -1171,6 +1416,7 @@ public final class WorkspaceStore: ObservableObject {
                 }
             }
         }
+        return true
     }
 
     private func finalizeStartedSession(
@@ -1280,8 +1526,8 @@ public final class WorkspaceStore: ObservableObject {
         await refreshAccount(accountId, force: true, bypassCooldown: true, silent: true)
 
         let latest = state(for: accountId)
-        if acc.enableLLMModule && acc.autoSyncCCSwitch && CCSwitchSync.isInstalled && !latest.publicURL.isEmpty {
-            syncToCCSwitch(accountId: accountId, silent: true)
+        if acc.enableLLMModule && !latest.publicURL.isEmpty {
+            syncAllEnabledClients(accountId: accountId, silent: true)
         }
 
         let rate = latest.cuRatePerHour > 0
@@ -1295,7 +1541,7 @@ public final class WorkspaceStore: ObservableObject {
         }
 
         let readyLabel = (acc.enableLLMModule || shouldRunCustomNonLLMScript) ? "已上线" : "实例已分配"
-        ColabCLIEngine.sendNotification(
+        sendNotice(
             title: fromQueue ? "Colab Tools 排到卡啦 · \(acc.displayName)" : "Colab Tools \(readyLabel) · \(acc.displayName)",
             body: "\(latest.shortGPUName) \(readyLabel)（约 \(rateText)）"
         )
@@ -1364,6 +1610,9 @@ public final class WorkspaceStore: ObservableObject {
                 cur.publicURL = ""
                 cur.llmURLBoundEndpoint = ""
                 cur.displayUIURL = ""
+                cur.ccSwitchSynced = false
+                cur.openCodeSynced = false
+                cur.codexSynced = false
                 cur.serverHealthy = false
                 cur.activitySignal = .unknown
                 cur.signalSource = .none
@@ -1461,15 +1710,260 @@ public final class WorkspaceStore: ObservableObject {
         normalized.remoteServicePort = max(1024, min(65535, normalized.remoteServicePort))
         normalized.localSSHTunnelPort = max(1024, min(65535, normalized.localSSHTunnelPort))
         normalized.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: normalized.queueTargets, for: normalized.tier)
+        normalized.queueFallbackAfterRounds = max(1, min(PoliteQueuePolicy.maxAttempts - 1, normalized.queueFallbackAfterRounds))
+        let eligibleFallbacks = PoliteQueuePolicy.eligibleFallbackTargets(excluding: normalized.queueTargets, for: normalized.tier)
+        if eligibleFallbacks.isEmpty {
+            normalized.queueFallbackEnabled = false
+            normalized.queueFallbackTarget = normalized.tier.queueableAccelerators.last ?? .t4
+        } else if !eligibleFallbacks.contains(normalized.queueFallbackTarget) {
+            normalized.queueFallbackTarget = PoliteQueuePolicy.defaultFallbackTarget(excluding: normalized.queueTargets, for: normalized.tier)
+        }
+        normalized.scheduledStartHour = max(0, min(23, normalized.scheduledStartHour))
+        normalized.scheduledStartMinute = max(0, min(59, normalized.scheduledStartMinute))
+        if normalized.scheduledStartEnabled {
+            let scheduleChanged = !old.scheduledStartEnabled
+                || old.scheduledStartHour != normalized.scheduledStartHour
+                || old.scheduledStartMinute != normalized.scheduledStartMinute
+                || old.scheduledStartRepeatDaily != normalized.scheduledStartRepeatDaily
+            if scheduleChanged || normalized.scheduledNextFireAt == nil {
+                normalized.scheduledNextFireAt = PoliteQueuePolicy.nextScheduledFireDate(
+                    hour: normalized.scheduledStartHour,
+                    minute: normalized.scheduledStartMinute
+                )
+            }
+        } else {
+            normalized.scheduledNextFireAt = nil
+        }
         normalized.idleTimeoutMinutes = max(5, min(720, normalized.idleTimeoutMinutes))
         settings.accounts[idx] = normalized
     }
 
     // MARK: - Integrations & Safe Launchers (Zero Shell Injection / Zero Key in osascript)
 
-    public func syncToCCSwitch(accountId: UUID, silent: Bool = false) {
+    public func syncAllEnabledClients(accountId: UUID, silent: Bool = false) {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
         let st = state(for: accountId)
+        guard !st.publicURL.isEmpty else {
+            if !silent { showToast("请先启动 LLM 获取公网地址后再同步") }
+            return
+        }
+        refreshClientDetection()
+        let doCC = acc.autoSyncCCSwitch && clientDetection.ccSwitchInstalled
+        let doOC = acc.autoSyncOpenCode
+        let doCodex = acc.autoSyncCodex
+        guard doCC || doOC || doCodex else {
+            if !silent { showToast("尚未勾选要同步的工具，请到设置 → 接入工具开启") }
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var succeededNames: [String] = []
+            var failedNotes: [String] = []
+
+            if doCC {
+                switch await self.performCCSwitchSync(accountId: accountId) {
+                case .success: succeededNames.append("CC Switch")
+                case .failure(let err): failedNotes.append("CC Switch：\(err.localizedDescription)")
+                }
+            }
+            if doOC {
+                switch await self.performOpenCodeSync(accountId: accountId) {
+                case .success: succeededNames.append("OpenCode")
+                case .failure(let err): failedNotes.append("OpenCode：\(err.localizedDescription)")
+                }
+            }
+            if doCodex {
+                switch await self.performCodexSync(accountId: accountId) {
+                case .success: succeededNames.append("Codex")
+                case .failure(let err): failedNotes.append("Codex：\(err.localizedDescription)")
+                }
+            }
+
+            guard !silent else { return }
+            if failedNotes.isEmpty {
+                self.showToast("已同步至 \(succeededNames.joined(separator: "、"))")
+            } else if succeededNames.isEmpty {
+                self.showToast("同步失败：\(failedNotes.first ?? "")")
+            } else {
+                self.showToast("部分成功（\(succeededNames.joined(separator: "、"))）；失败：\(failedNotes.first ?? "")")
+            }
+        }
+    }
+
+    public func syncToOpenCode(accountId: UUID, silent: Bool = false) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.performOpenCodeSync(accountId: accountId)
+            guard !silent else { return }
+            switch result {
+            case .success(let msg): self.showToast(msg)
+            case .failure(let err): self.showToast(err.localizedDescription)
+            }
+        }
+    }
+
+    public func syncToCodex(accountId: UUID, silent: Bool = false) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.performCodexSync(accountId: accountId)
+            guard !silent else { return }
+            switch result {
+            case .success(let msg): self.showToast(msg)
+            case .failure(let err): self.showToast(err.localizedDescription)
+            }
+        }
+    }
+
+    private func performOpenCodeSync(accountId: UUID) async -> Result<String, Error> {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else {
+            return .failure(ClientSyncError.ioError("账号不存在"))
+        }
+        let st = state(for: accountId)
+        let startGen = st.generation
+        let baseURL = st.publicURL
+        let modelAlias = st.modelAlias
+        let ids = ClientIntegrations.identifiers(for: accountId)
+        let displayName = acc.ccSwitchProviderName.isEmpty ? "Colab Tools · \(acc.displayName)" : acc.ccSwitchProviderName
+
+        let result: Result<URL, Error> = await Task.detached(priority: .userInitiated) {
+            Result {
+                try ClientIntegrations.syncOpenCode(
+                    baseURL: baseURL,
+                    modelAlias: modelAlias,
+                    providerKey: ids.openCodeProviderKey,
+                    envKey: ids.envKey,
+                    displayName: displayName
+                )
+            }
+        }.value
+
+        guard isStillValid(accountId: accountId, expectedGeneration: startGen),
+              var cur = runtimeByAccount[accountId],
+              cur.publicURL == baseURL else {
+            return .failure(ClientSyncError.ioError("端点已变更，已丢弃过期写入结果"))
+        }
+
+        switch result {
+        case .success:
+            cur.openCodeSynced = true
+            runtimeByAccount[accountId] = cur
+            return .success("已安全写入 OpenCode（独立账号隔离 · 未存明文 Key）")
+        case .failure(let error):
+            cur.openCodeSynced = false
+            runtimeByAccount[accountId] = cur
+            return .failure(error)
+        }
+    }
+
+    private func performCodexSync(accountId: UUID) async -> Result<String, Error> {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else {
+            return .failure(ClientSyncError.ioError("账号不存在"))
+        }
+        let st = state(for: accountId)
+        let startGen = st.generation
+        let baseURL = st.publicURL
+        let modelAlias = st.modelAlias
+        let ids = ClientIntegrations.identifiers(for: accountId)
+        let displayName = acc.ccSwitchProviderName.isEmpty ? "Colab Tools · \(acc.displayName)" : acc.ccSwitchProviderName
+
+        let result: Result<URL, Error> = await Task.detached(priority: .userInitiated) {
+            Result {
+                try ClientIntegrations.syncCodexCLI(
+                    baseURL: baseURL,
+                    modelAlias: modelAlias,
+                    providerTableKey: ids.codexTableKey,
+                    envKey: ids.envKey,
+                    displayName: displayName
+                )
+            }
+        }.value
+
+        guard isStillValid(accountId: accountId, expectedGeneration: startGen),
+              var cur = runtimeByAccount[accountId],
+              cur.publicURL == baseURL else {
+            return .failure(ClientSyncError.ioError("端点已变更，已丢弃过期写入结果"))
+        }
+
+        switch result {
+        case .success:
+            cur.codexSynced = true
+            runtimeByAccount[accountId] = cur
+            return .success("已安全写入 Codex CLI 独立区块（不改官方默认）")
+        case .failure(let error):
+            cur.codexSynced = false
+            runtimeByAccount[accountId] = cur
+            return .failure(error)
+        }
+    }
+
+    public func copyClientSnippet(
+        accountId: UUID,
+        protocolKind: CopyProtocolKind,
+        format: SnippetFormat,
+        includeRawSecret: Bool = false
+    ) {
+        guard settings.accounts.contains(where: { $0.id == accountId }) else { return }
+        let st = state(for: accountId)
+        let ids = ClientIntegrations.identifiers(for: accountId)
+
+        let liveEndpoint: String? = {
+            if !st.publicURL.isEmpty { return st.publicURL }
+            if st.sshTunnelActive, let boundPort = st.activeSSHTunnelPort {
+                return "http://127.0.0.1:\(String(boundPort))"
+            }
+            return nil
+        }()
+
+        // NEVER inject a real Keychain secret into an offline/example placeholder URL
+        let allowSecret = includeRawSecret && liveEndpoint != nil
+        let effectiveURL = liveEndpoint ?? "https://your-colab-endpoint.trycloudflare.com"
+        let apiKey = allowSecret ? (KeychainVault.loadAPIKey(for: accountId) ?? "") : ""
+        let text: String
+        switch format {
+        case .env:
+            text = ClientIntegrations.exportEnvSnippet(
+                protocolKind: protocolKind,
+                baseURL: effectiveURL,
+                modelAlias: st.modelAlias,
+                apiKey: apiKey,
+                envKey: ids.envKey,
+                includeRawSecret: allowSecret
+            )
+        case .json:
+            text = ClientIntegrations.exportJSONSnippet(
+                protocolKind: protocolKind,
+                baseURL: effectiveURL,
+                modelAlias: st.modelAlias,
+                apiKey: apiKey,
+                envKey: ids.envKey,
+                includeRawSecret: allowSecret
+            )
+        }
+        let label = allowSecret
+            ? "\(protocolKind.rawValue) 含真实密钥的配置（请注意保密）"
+            : "\(protocolKind.rawValue) 安全\(format == .env ? "环境变量" : "JSON")模板"
+        copyToClipboard(text, label: label)
+    }
+
+    public func syncToCCSwitch(accountId: UUID, silent: Bool = false) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.performCCSwitchSync(accountId: accountId)
+            guard !silent else { return }
+            switch result {
+            case .success(let msg): self.showToast(msg)
+            case .failure(let err): self.showToast(err.localizedDescription)
+            }
+        }
+    }
+
+    private func performCCSwitchSync(accountId: UUID) async -> Result<String, Error> {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else {
+            return .failure(ClientSyncError.ioError("账号不存在"))
+        }
+        let st = state(for: accountId)
+        let startGen = st.generation
         let apiKey = KeychainVault.loadAPIKey(for: accountId) ?? ""
         let providerId = acc.ccSwitchProviderId
         let providerName = acc.ccSwitchProviderName
@@ -1479,33 +1973,35 @@ public final class WorkspaceStore: ObservableObject {
         let gpuLabel = st.shortGPUName
         let accountLabel = acc.displayName
 
-        Task { [weak self] in
-            let result: Result<String, Error> = await Task.detached(priority: .userInitiated) {
-                Result {
-                    try CCSwitchSync.syncProvider(
-                        providerId: providerId,
-                        providerName: providerName,
-                        baseURL: baseURL,
-                        apiKey: apiKey,
-                        modelAlias: modelAlias,
-                        contextLimit: ctx,
-                        gpuLabel: gpuLabel,
-                        accountLabel: accountLabel
-                    )
-                }
-            }.value
-
-            guard let self, var cur = self.runtimeByAccount[accountId] else { return }
-            switch result {
-            case .success(let msg):
-                cur.ccSwitchSynced = true
-                self.runtimeByAccount[accountId] = cur
-                if !silent { self.showToast(msg) }
-            case .failure(let error):
-                cur.ccSwitchSynced = false
-                self.runtimeByAccount[accountId] = cur
-                if !silent { self.showToast(error.localizedDescription) }
+        let result: Result<String, Error> = await Task.detached(priority: .userInitiated) {
+            Result {
+                try CCSwitchSync.syncProvider(
+                    providerId: providerId,
+                    providerName: providerName,
+                    baseURL: baseURL,
+                    apiKey: apiKey,
+                    modelAlias: modelAlias,
+                    contextLimit: ctx,
+                    gpuLabel: gpuLabel,
+                    accountLabel: accountLabel
+                )
             }
+        }.value
+
+        guard isStillValid(accountId: accountId, expectedGeneration: startGen),
+              var cur = runtimeByAccount[accountId],
+              cur.publicURL == baseURL else {
+            return .failure(ClientSyncError.ioError("端点已变更，已丢弃过期写入结果"))
+        }
+        switch result {
+        case .success(let msg):
+            cur.ccSwitchSynced = true
+            runtimeByAccount[accountId] = cur
+            return .success(msg)
+        case .failure(let error):
+            cur.ccSwitchSynced = false
+            runtimeByAccount[accountId] = cur
+            return .failure(error)
         }
     }
 
@@ -1535,9 +2031,9 @@ public final class WorkspaceStore: ObservableObject {
             showToast("已在浏览器打开 \(acc.workloadKind.webUIButtonTitle)")
             return
         }
-        if st.sshTunnelActive, let url = URL(string: "http://127.0.0.1:\(acc.localSSHTunnelPort)") {
+        if st.sshTunnelActive, let boundPort = st.activeSSHTunnelPort, let url = URL(string: "http://127.0.0.1:\(String(boundPort))") {
             NSWorkspace.shared.open(url)
-            showToast("已通过本地隧道打开 127.0.0.1:\(acc.localSSHTunnelPort)")
+            showToast("已通过本地隧道打开 127.0.0.1:\(String(boundPort))")
             return
         }
         showToast("暂无公网地址，可先开端口隧道；正打开 Colab 网页")
@@ -1603,9 +2099,14 @@ public final class WorkspaceStore: ObservableObject {
 
     /// Launches Claude Code via an owner-only (`0700`) self-deleting wrapper script — API keys NEVER appear in `osascript` or Terminal history.
     public func launchClaudeTerminal(accountId: UUID) {
-        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        guard settings.accounts.contains(where: { $0.id == accountId }) else { return }
         let st = state(for: accountId)
-        let baseURL = st.sshTunnelActive ? "http://127.0.0.1:\(acc.localSSHTunnelPort)" : st.publicURL
+        let baseURL: String
+        if st.sshTunnelActive, let boundPort = st.activeSSHTunnelPort {
+            baseURL = "http://127.0.0.1:\(String(boundPort))"
+        } else {
+            baseURL = st.publicURL
+        }
         let apiKey = KeychainVault.loadAPIKey(for: accountId) ?? ""
 
         guard InputValidator.isValidEndpointURL(baseURL),
@@ -1706,6 +2207,7 @@ public final class WorkspaceStore: ObservableObject {
                     }
                     if var cur = self.runtimeByAccount[accountId] {
                         cur.sshTunnelActive = false
+                        cur.activeSSHTunnelPort = nil
                         self.runtimeByAccount[accountId] = cur
                     }
                 }
@@ -1733,11 +2235,12 @@ public final class WorkspaceStore: ObservableObject {
                 if bound, let proc, self.sshTunnelProcesses[accountId] === proc {
                     var cur = self.state(for: accountId)
                     cur.sshTunnelActive = true
+                    cur.activeSSHTunnelPort = port
                     self.runtimeByAccount[accountId] = cur
-                    self.showToast("SSH 隧道已连通：127.0.0.1:\(port)")
+                    self.showToast("SSH 隧道已连通：127.0.0.1:\(String(port))")
                 } else if let proc, self.sshTunnelProcesses[accountId] === proc {
                     self.stopSSHTunnel(for: accountId)
-                    self.showToast("SSH 隧道未能绑定本地端口 \(port)")
+                    self.showToast("SSH 隧道未能绑定本地端口 \(String(port))")
                 }
             }
         } catch {
@@ -1761,6 +2264,7 @@ public final class WorkspaceStore: ObservableObject {
         }
         if var st = runtimeByAccount[accountId] {
             st.sshTunnelActive = false
+            st.activeSSHTunnelPort = nil
             runtimeByAccount[accountId] = st
         }
     }

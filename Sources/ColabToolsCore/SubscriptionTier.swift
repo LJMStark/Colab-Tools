@@ -144,6 +144,34 @@ public enum AcceleratorOption: String, CaseIterable, Codable, Identifiable, Send
         self == .tpuV6e1 || self == .tpuV5e1
     }
 
+    public var specSubtitle: String {
+        switch self {
+        case .g4: return "96GB 显存 · 约 7 CU/h"
+        case .h100: return "80GB HBM3 · 约 18 CU/h"
+        case .a100: return "40/80GB · 约 12 CU/h"
+        case .l4: return "24GB 显存 · 约 2.3 CU/h"
+        case .t4: return "16GB 显存 · 约 1.3 CU/h"
+        case .tpuV6e1: return "TPU v6e · 约 6 CU/h"
+        case .tpuV5e1: return "TPU v5e · 约 3 CU/h"
+        case .autoBest: return "高配优先自动尝试"
+        case .autoPro: return "常用卡自动优选"
+        case .cpu: return "标准 CPU 环境"
+        }
+    }
+
+    public var roleTag: String {
+        switch self {
+        case .g4: return "大显存主力"
+        case .h100: return "极速旗舰"
+        case .a100: return "训练/视频"
+        case .l4: return "性价比保底"
+        case .t4: return "轻量入门"
+        case .tpuV6e1: return "JAX/新TPU"
+        case .tpuV5e1: return "TPU 推理"
+        default: return ""
+        }
+    }
+
     public struct ProbeTarget: Equatable, Sendable {
         public let flag: String? // "--gpu", "--tpu", or nil for CPU
         public let value: String?

@@ -240,7 +240,7 @@ final class ColabToolsCoreTests: XCTestCase {
     func testPoliteQueueEqualJitterCapsAndTierFiltering() {
         // 1. Tier filtering strips illegal accelerators and preserves high-to-low order
         let proFiltered = PoliteQueuePolicy.sanitizedTargets(selected: [.l4, .g4, .h100, .a100], for: .colabPro)
-        XCTAssertEqual(proFiltered, [.a100, .l4])
+        XCTAssertEqual(proFiltered, [.l4, .a100])
 
         let freeFiltered = PoliteQueuePolicy.sanitizedTargets(selected: [.h100, .a100], for: .free)
         XCTAssertEqual(freeFiltered, [.t4])
@@ -445,5 +445,348 @@ final class ColabToolsCoreTests: XCTestCase {
             ),
             .pausedNoSignal
         )
+    }
+
+    func testOpenCodeSyncPreservesExistingProvidersAndNeverWritesRawKey() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("colab-opencode-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let cfgURL = tmp.appendingPathComponent("opencode.json")
+        let backupDir = tmp.appendingPathComponent("backups", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        let existingJSON = """
+        {
+          "model": "anthropic/claude-sonnet-4",
+          "provider": {
+            "anthropic": { "name": "Official Anthropic" }
+          }
+        }
+        """
+        try Data(existingJSON.utf8).write(to: cfgURL)
+
+        _ = try ClientIntegrations.syncOpenCode(
+            baseURL: "https://demo-node.trycloudflare.com",
+            modelAlias: "qwen3.8-27b-uncensored",
+            configURL: cfgURL,
+            backupDir: backupDir
+        )
+
+        let outRaw = try String(contentsOf: cfgURL, encoding: .utf8)
+        let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(outRaw.utf8)) as? [String: Any])
+        XCTAssertEqual(parsed["model"] as? String, "anthropic/claude-sonnet-4")
+
+        let providers = try XCTUnwrap(parsed["provider"] as? [String: Any])
+        XCTAssertNotNil(providers["anthropic"])
+        let colab = try XCTUnwrap(providers["colab-tools"] as? [String: Any])
+        let opts = try XCTUnwrap(colab["options"] as? [String: Any])
+        XCTAssertEqual(opts["baseURL"] as? String, "https://demo-node.trycloudflare.com/v1")
+        XCTAssertEqual(opts["apiKey"] as? String, "{env:COLAB_TOOLS_API_KEY}")
+        XCTAssertFalse(outRaw.contains("sk-"))
+
+        let backups = try FileManager.default.contentsOfDirectory(atPath: backupDir.path)
+        XCTAssertEqual(backups.filter { $0.hasSuffix(".json.bak") }.count, 1)
+    }
+
+    func testCodexTOMLSyncIsIdempotentAndPreservesDefaultProvider() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("colab-codex-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let cfgURL = tmp.appendingPathComponent("config.toml")
+        let backupDir = tmp.appendingPathComponent("backups", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        let originalTOML = """
+        model_provider = "openai"
+        model = "o3"
+        """
+        try originalTOML.write(to: cfgURL, atomically: true, encoding: .utf8)
+
+        _ = try ClientIntegrations.syncCodexCLI(
+            baseURL: "https://node-1.trycloudflare.com",
+            modelAlias: "qwen3.8-27b",
+            configURL: cfgURL,
+            backupDir: backupDir
+        )
+        _ = try ClientIntegrations.syncCodexCLI(
+            baseURL: "https://node-2.trycloudflare.com/",
+            modelAlias: "qwen3.8-27b",
+            configURL: cfgURL,
+            backupDir: backupDir
+        )
+
+        let out = try String(contentsOf: cfgURL, encoding: .utf8)
+        XCTAssertTrue(out.contains(#"model_provider = "openai""#))
+        XCTAssertTrue(out.contains(#"model = "o3""#))
+        XCTAssertTrue(out.contains(#"base_url = "https://node-2.trycloudflare.com/v1""#))
+        XCTAssertTrue(out.contains(#"env_key = "COLAB_TOOLS_API_KEY""#))
+        XCTAssertFalse(out.contains("node-1.trycloudflare.com"))
+        let markerCount = out.components(separatedBy: "# BEGIN COLAB-TOOLS MANAGED").count - 1
+        XCTAssertEqual(markerCount, 1)
+    }
+
+    func testTwoStageQueueFallbackAndScheduledFireDate() throws {
+        let round1 = PoliteQueuePolicy.targetsForRound(
+            attempt: 1,
+            primaryTargets: [.g4, .h100],
+            fallbackEnabled: true,
+            fallbackAfterRounds: 2,
+            fallbackTarget: .l4,
+            tier: .aiUltra
+        )
+        XCTAssertEqual(round1, [.g4, .h100])
+
+        let round2 = PoliteQueuePolicy.targetsForRound(
+            attempt: 2,
+            primaryTargets: [.g4, .h100],
+            fallbackEnabled: true,
+            fallbackAfterRounds: 2,
+            fallbackTarget: .l4,
+            tier: .aiUltra
+        )
+        XCTAssertEqual(round2, [.g4, .h100])
+
+        let round3 = PoliteQueuePolicy.targetsForRound(
+            attempt: 3,
+            primaryTargets: [.g4, .h100],
+            fallbackEnabled: true,
+            fallbackAfterRounds: 2,
+            fallbackTarget: .l4,
+            tier: .aiUltra
+        )
+        XCTAssertEqual(round3, [.g4, .h100, .l4])
+
+        // Free tier must never inject paid fallback card
+        let freeRound3 = PoliteQueuePolicy.targetsForRound(
+            attempt: 3,
+            primaryTargets: [.t4],
+            fallbackEnabled: true,
+            fallbackAfterRounds: 1,
+            fallbackTarget: .h100,
+            tier: .free
+        )
+        XCTAssertEqual(freeRound3, [.t4])
+
+        // Scheduled fire date: before target -> today; after target -> tomorrow
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 8 * 3600)!
+        let morning6 = try XCTUnwrap(cal.date(from: DateComponents(year: 2026, month: 5, day: 10, hour: 6, minute: 30)))
+        let fireToday = PoliteQueuePolicy.nextScheduledFireDate(hour: 7, minute: 0, now: morning6, calendar: cal)
+        XCTAssertEqual(PoliteQueuePolicy.dayStamp(for: fireToday, calendar: cal), "2026-05-10")
+        XCTAssertEqual(cal.component(.hour, from: fireToday), 7)
+
+        let morning8 = try XCTUnwrap(cal.date(from: DateComponents(year: 2026, month: 5, day: 10, hour: 8, minute: 15)))
+        let fireTomorrow = PoliteQueuePolicy.nextScheduledFireDate(hour: 7, minute: 0, now: morning8, calendar: cal)
+        XCTAssertEqual(PoliteQueuePolicy.dayStamp(for: fireTomorrow, calendar: cal), "2026-05-11")
+    }
+
+    func testAllocationInsightsSixSlotHeatmapAndRecommendation() throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 8 * 3600)!
+        let h06 = try XCTUnwrap(cal.date(from: DateComponents(year: 2026, month: 5, day: 10, hour: 6, minute: 15)))
+        let h21 = try XCTUnwrap(cal.date(from: DateComponents(year: 2026, month: 5, day: 10, hour: 21, minute: 0)))
+
+        var insights = AllocationInsights()
+        insights.record(hardware: "NVIDIA RTX PRO 6000", succeeded: true, at: h06, calendar: cal)
+        insights.record(hardware: "G4", succeeded: true, at: h06, calendar: cal)
+        insights.record(hardware: "G4", succeeded: false, at: h06, calendar: cal)
+        insights.record(hardware: "G4", succeeded: false, at: h21, calendar: cal)
+        insights.record(hardware: "G4", succeeded: false, at: h21, calendar: cal)
+
+        let slots = insights.sixSlotHeatmap(for: "G4")
+        XCTAssertEqual(slots.count, 6)
+        XCTAssertEqual(slots[1].label, "04–08")
+        XCTAssertEqual(slots[1].attempts, 3)
+        XCTAssertEqual(slots[1].successes, 2)
+        XCTAssertEqual(slots[5].attempts, 2)
+        XCTAssertEqual(slots[5].successes, 0)
+
+        let summary = try XCTUnwrap(insights.recommendedWindowSummary(for: "G4"))
+        XCTAssertTrue(summary.contains("04–08"))
+        XCTAssertTrue(summary.contains("67%"))
+    }
+
+    func testPerAccountIsolationAndUnmanagedConflictProtection() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("colab-iso-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let ocURL = tmp.appendingPathComponent("opencode.json")
+        let cxURL = tmp.appendingPathComponent("config.toml")
+        let bakDir = tmp.appendingPathComponent("backups", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        let idA = ClientIntegrations.identifiers(for: UUID())
+        let idB = ClientIntegrations.identifiers(for: UUID())
+        XCTAssertNotEqual(idA.openCodeProviderKey, idB.openCodeProviderKey)
+        XCTAssertNotEqual(idA.codexTableKey, idB.codexTableKey)
+        XCTAssertNotEqual(idA.envKey, idB.envKey)
+
+        // Sync both A and B into the same files without clobbering each other
+        _ = try ClientIntegrations.syncOpenCode(
+            baseURL: "https://node-a.trycloudflare.com", modelAlias: "model-a",
+            providerKey: idA.openCodeProviderKey, envKey: idA.envKey,
+            configURL: ocURL, backupDir: bakDir
+        )
+        _ = try ClientIntegrations.syncOpenCode(
+            baseURL: "https://node-b.trycloudflare.com", modelAlias: "model-b",
+            providerKey: idB.openCodeProviderKey, envKey: idB.envKey,
+            configURL: ocURL, backupDir: bakDir
+        )
+        let ocParsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: ocURL)) as? [String: Any])
+        let providers = try XCTUnwrap(ocParsed["provider"] as? [String: Any])
+        XCTAssertNotNil(providers[idA.openCodeProviderKey])
+        XCTAssertNotNil(providers[idB.openCodeProviderKey])
+
+        // Unmanaged OpenCode provider with same key must be rejected
+        var manualRoot = ocParsed
+        var manualProviders = providers
+        manualProviders["custom-user"] = ["name": "User Manual", "options": ["apiKey": "user-key"]]
+        manualRoot["provider"] = manualProviders
+        try JSONSerialization.data(withJSONObject: manualRoot).write(to: ocURL)
+        XCTAssertThrowsError(try ClientIntegrations.syncOpenCode(
+            baseURL: "https://node-a.trycloudflare.com", modelAlias: "model-a",
+            providerKey: "custom-user", envKey: idA.envKey,
+            configURL: ocURL, backupDir: bakDir
+        ))
+
+        // Unmanaged Codex table conflict & invalid table key must both throw
+        try "[model_providers.\(idA.codexTableKey)]\nname = \"Manual\"\n".write(to: cxURL, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try ClientIntegrations.syncCodexCLI(
+            baseURL: "https://node-a.trycloudflare.com", modelAlias: "model-a",
+            providerTableKey: idA.codexTableKey, envKey: idA.envKey,
+            configURL: cxURL, backupDir: bakDir
+        ))
+        XCTAssertThrowsError(try ClientIntegrations.syncCodexCLI(
+            baseURL: "https://node-a.trycloudflare.com", modelAlias: "model-a",
+            providerTableKey: "bad]\n[evil", envKey: idA.envKey,
+            configURL: cxURL, backupDir: bakDir
+        ))
+    }
+
+    func testCodexInvalidUTF8RefusesOverwriteAndCreatesPrivate0600Backup() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("colab-utf8-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let cxURL = tmp.appendingPathComponent("config.toml")
+        let bakDir = tmp.appendingPathComponent("backups", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        // Invalid UTF-8 bytes must abort without clobbering file
+        let badBytes = Data([0xFF, 0xFE, 0x00, 0x41])
+        try badBytes.write(to: cxURL)
+        XCTAssertThrowsError(try ClientIntegrations.syncCodexCLI(
+            baseURL: "https://node-ok.trycloudflare.com", modelAlias: "qwen",
+            configURL: cxURL, backupDir: bakDir
+        ))
+        XCTAssertEqual(try Data(contentsOf: cxURL), badBytes)
+
+        // Valid config sync creates 0700 backup dir and 0600 backup file
+        try "model_provider = \"openai\"\n".write(to: cxURL, atomically: true, encoding: .utf8)
+        _ = try ClientIntegrations.syncCodexCLI(
+            baseURL: "https://node-ok.trycloudflare.com", modelAlias: "qwen",
+            configURL: cxURL, backupDir: bakDir
+        )
+        let dirAttrs = try FileManager.default.attributesOfItem(atPath: bakDir.path)
+        XCTAssertEqual((dirAttrs[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        let bakFiles = try FileManager.default.contentsOfDirectory(atPath: bakDir.path).filter { $0.hasSuffix(".bak") }
+        XCTAssertFalse(bakFiles.isEmpty)
+        let bakAttrs = try FileManager.default.attributesOfItem(atPath: bakDir.appendingPathComponent(bakFiles[0]).path)
+        XCTAssertEqual((bakAttrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+    }
+
+    func testScheduleEvaluationGraceWindowAndMissedOneShotExpiry() throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 8 * 3600)!
+        let fireAt = try XCTUnwrap(cal.date(from: DateComponents(year: 2026, month: 5, day: 10, hour: 7, minute: 0)))
+
+        // Before target -> waiting
+        let early = fireAt.addingTimeInterval(-30)
+        XCTAssertEqual(PoliteQueuePolicy.evaluateSchedule(fireAt: fireAt, repeatDaily: false, hour: 7, minute: 0, now: early, calendar: cal), .waiting)
+
+        // 3 minutes late (within 10m grace window) -> triggerNow
+        let withinGrace = fireAt.addingTimeInterval(180)
+        XCTAssertEqual(PoliteQueuePolicy.evaluateSchedule(fireAt: fireAt, repeatDaily: false, hour: 7, minute: 0, now: withinGrace, calendar: cal), .triggerNow(nextFireAt: nil))
+
+        // 20 minutes late (Mac woke up late) -> one-shot expires cleanly with nil nextFireAt
+        let missed = fireAt.addingTimeInterval(20 * 60)
+        XCTAssertEqual(PoliteQueuePolicy.evaluateSchedule(fireAt: fireAt, repeatDaily: false, hour: 7, minute: 0, now: missed, calendar: cal), .missedExpired(nextFireAt: nil))
+
+        // Daily repeat missed -> advances to next day without firing today
+        if case .missedExpired(let next) = PoliteQueuePolicy.evaluateSchedule(fireAt: fireAt, repeatDaily: true, hour: 7, minute: 0, now: missed, calendar: cal) {
+            let nextUnwrapped = try XCTUnwrap(next)
+            XCTAssertEqual(PoliteQueuePolicy.dayStamp(for: nextUnwrapped, calendar: cal), "2026-05-11")
+        } else {
+            XCTFail("Expected missedExpired with next day fire date")
+        }
+    }
+
+    func testCorruptedAllocationInsightsAndUnknownEnumDecodeSafely() throws {
+        // Malformed extreme/negative/inverted counts must clamp safely without overflow
+        let corruptJSON = """
+        {
+          "bucketsByHardware": {
+            "G4": {
+              "6": { "attempts": -5, "successes": 999 },
+              "7": { "attempts": 9223372036854775807, "successes": 9223372036854775807 },
+              "99": { "attempts": 10, "successes": 5 }
+            }
+          }
+        }
+        """
+        let decodedInsights = try JSONDecoder().decode(AllocationInsights.self, from: Data(corruptJSON.utf8))
+        let slots = decodedInsights.sixSlotHeatmap(for: "G4")
+        XCTAssertEqual(slots[1].attempts, AllocationBucket.maxSafeCount)
+        XCTAssertEqual(slots[1].successes, AllocationBucket.maxSafeCount)
+        XCTAssertNotNil(decodedInsights.recommendedWindowSummary(for: "G4"))
+
+        // Unknown queueFallbackTarget enum string must fall back per-field instead of failing entire AccountProfile decode
+        let futureConfigJSON = """
+        {
+          "id": "22222222-2222-2222-2222-222222222222",
+          "displayName": "FutureProof",
+          "email": "user@example.com",
+          "colorTag": "#F59E0B",
+          "tier": "colab_pro",
+          "authMode": "system_oauth2",
+          "sessionName": "llm-coder",
+          "preferredAccelerator": "AUTO_PRO",
+          "highMem": false,
+          "enableLLMModule": true,
+          "queueTargets": ["A100", "L4"],
+          "queueFallbackEnabled": true,
+          "queueFallbackTarget": "B200_FUTURE_UNKNOWN",
+          "autoShutdownEnabled": true,
+          "idleTimeoutMinutes": 40,
+          "warnBeforeMinutes": 2,
+          "driveScriptPath": "/content/drive/MyDrive/colab-llm/scripts/start_server.sh",
+          "autoSyncCCSwitch": true,
+          "ccSwitchProviderId": "colab-qwen",
+          "ccSwitchProviderName": "Colab Qwen",
+          "localEnvPath": ""
+        }
+        """
+        let decodedAcc = try JSONDecoder().decode(AccountProfile.self, from: Data(futureConfigJSON.utf8))
+        XCTAssertEqual(decodedAcc.displayName, "FutureProof")
+        // Colab Pro primary [A100, L4] -> default fallback excludes primary cards -> T4
+        XCTAssertEqual(decodedAcc.queueFallbackTarget, .t4)
+    }
+
+    func testDefaultCopySnippetsNeverLeakRawSecretUnlessExplicitlyRequested() {
+        let safeEnv = ClientIntegrations.exportEnvSnippet(
+            protocolKind: .openAI,
+            baseURL: "https://demo.trycloudflare.com",
+            modelAlias: "qwen",
+            apiKey: "sk-real-secret-token",
+            envKey: "COLAB_TOOLS_API_KEY_TEST",
+            includeRawSecret: false
+        )
+        XCTAssertFalse(safeEnv.contains("sk-real-secret-token"))
+        XCTAssertTrue(safeEnv.contains("COLAB_TOOLS_API_KEY_TEST"))
+
+        let secretEnv = ClientIntegrations.exportEnvSnippet(
+            protocolKind: .openAI,
+            baseURL: "https://demo.trycloudflare.com",
+            modelAlias: "qwen",
+            apiKey: "sk-real-secret-token",
+            envKey: "COLAB_TOOLS_API_KEY_TEST",
+            includeRawSecret: true
+        )
+        XCTAssertTrue(secretEnv.contains("sk-real-secret-token"))
     }
 }

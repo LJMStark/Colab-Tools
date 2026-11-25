@@ -20,7 +20,7 @@ struct RootPopoverView: View {
 
     private var maxScrollHeight: CGFloat {
         let visibleH = NSScreen.main?.visibleFrame.height ?? 920
-        let chromeH: CGFloat = (store.selectedTab == .dashboard && !store.showingAddAccount && store.isMultiAccount) ? 148 : 112
+        let chromeH: CGFloat = (!store.showingAddAccount && store.isMultiAccount) ? 148 : 112
         return min(860, max(540, visibleH - chromeH))
     }
 
@@ -35,21 +35,12 @@ struct RootPopoverView: View {
                         store.showingAddAccount = false
                     }
                 }
-            } else {
-                switch store.selectedTab {
-                case .dashboard:
-                    if store.settings.accounts.isEmpty {
-                        emptyAccountOnboardingCard
-                    } else if store.isMultiAccount && store.selectedViewMode == .overview {
-                        AccountOverviewView(store: store)
-                    } else if let acc = store.selectedAccount {
-                        AccountDetailView(store: store, account: acc)
-                    }
-                case .settings:
-                    SettingsTabView(store: store)
-                case .about:
-                    AboutTabView()
-                }
+            } else if store.settings.accounts.isEmpty {
+                emptyAccountOnboardingCard
+            } else if store.isMultiAccount && store.selectedViewMode == .overview {
+                AccountOverviewView(store: store)
+            } else if let acc = store.selectedAccount {
+                AccountDetailView(store: store, account: acc)
             }
         }
         .frame(width: Self.panelWidth - 24, alignment: .topLeading)
@@ -67,7 +58,7 @@ struct RootPopoverView: View {
             headerBar
             Divider().opacity(0.4)
 
-            if store.selectedTab == .dashboard && !store.showingAddAccount && store.isMultiAccount {
+            if !store.showingAddAccount && store.isMultiAccount {
                 multiAccountRail
                 Divider().opacity(0.35)
             }
@@ -135,46 +126,44 @@ struct RootPopoverView: View {
 
             Spacer(minLength: 4)
 
-            Picker("", selection: Binding(
-                get: { store.selectedTab },
-                set: { store.switchTab(to: $0) }
-            )) {
-                ForEach(WorkspaceStore.PanelTab.allCases) { tab in
-                    Text(tab.rawValue).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 124)
-            .controlSize(.small)
-
-            Button {
-                if store.showingAddAccount {
-                    withAnimation(.snappy(duration: 0.18)) { store.showingAddAccount = false }
-                } else {
-                    store.openAddAccountFlow()
-                }
-            } label: {
-                Image(systemName: store.showingAddAccount ? "xmark" : "person.badge.plus")
-                    .font(.system(size: 11.5, weight: .medium))
-            }
-            .buttonStyle(.borderless)
-            .help("添加新的 Colab 订阅账号")
-
-            Button {
-                Task {
-                    if store.isMultiAccount && store.selectedViewMode == .overview {
-                        await store.refreshAllAccounts(force: true, silent: false)
-                    } else if let acc = store.selectedAccount {
-                        await store.refreshAccount(acc.id, force: true, silent: false)
+            HStack(spacing: 11) {
+                Button {
+                    if store.showingAddAccount {
+                        withAnimation(.snappy(duration: 0.18)) { store.showingAddAccount = false }
+                    } else {
+                        store.openAddAccountFlow()
                     }
+                } label: {
+                    Image(systemName: store.showingAddAccount ? "xmark" : "person.badge.plus")
+                        .font(.system(size: 12, weight: .medium))
                 }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 11.5, weight: .medium))
+                .buttonStyle(.borderless)
+                .help("添加新的 Colab 订阅账号")
+
+                Button {
+                    Task {
+                        if store.isMultiAccount && store.selectedViewMode == .overview {
+                            await store.refreshAllAccounts(force: true, silent: false)
+                        } else if let acc = store.selectedAccount {
+                            await store.refreshAccount(acc.id, force: true, silent: false)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .help("立即同步官方 CLI 状态（5 秒防抖）")
+
+                Button {
+                    store.openSettings(section: .general)
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .help("打开独立偏好设置窗口 (⌘,)")
             }
-            .buttonStyle(.borderless)
-            .help("立即同步官方 CLI 状态（5 秒防抖）")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -368,6 +357,17 @@ struct RootPopoverView: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer()
+            Button("偏好设置…") {
+                store.openSettings(section: .general)
+            }
+            .font(.system(size: 11))
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+
+            Text("·")
+                .font(.system(size: 10))
+                .foregroundStyle(.quaternary)
+
             Button("退出") {
                 store.cleanup()
                 NSApplication.shared.terminate(nil)
