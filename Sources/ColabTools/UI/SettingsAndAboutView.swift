@@ -103,13 +103,41 @@ struct SettingsTabView: View {
                         Spacer()
                     }
 
-                    Divider().opacity(0.35)
+                    HStack {
+                        Text("负载模式")
+                            .font(.system(size: 11.5))
+                            .frame(width: 68, alignment: .leading)
+                        Picker("", selection: binding(for: acc, \.workloadKind)) {
+                            ForEach(WorkloadKind.allCases) { k in
+                                Text("\(k.displayName) (:\(String(k.defaultRemotePort)))").tag(k)
+                            }
+                        }
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity)
+                    }
 
-                    Toggle(isOn: binding(for: acc, \.autoSyncCCSwitch)) {
+                    HStack {
+                        Text("服务端口")
+                            .font(.system(size: 11.5))
+                            .frame(width: 68, alignment: .leading)
+                        TextField("", value: binding(for: acc, \.remoteServicePort), format: .number.grouping(.never))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 72)
+                            .multilineTextAlignment(.trailing)
+                            .controlSize(.small)
+                        Text("隧道本地 :\(String(acc.localSSHTunnelPort))")
+                            .font(.system(size: 10.5))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+
+                    Toggle(isOn: binding(for: acc, \.enableHardwareIdleFallback)) {
                         VStack(alignment: .leading, spacing: 1) {
-                            Text("开机自动同步公网地址到 CC Switch")
+                            Text("非 LLM 负载启用 GPU+CPU 双低载防误杀关机")
                                 .font(.system(size: 11.5))
-                            Text("仅写入独立待机渠道，不改动官方订阅")
+                            Text("须同时满足 GPU < 5% 且整机 CPU < 25%，防下载权重或转码误停")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
@@ -118,21 +146,38 @@ struct SettingsTabView: View {
                     .controlSize(.small)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                    HStack {
-                        Text("渠道显示名")
-                            .font(.system(size: 11.5))
-                            .frame(width: 68, alignment: .leading)
-                        TextField("Colab Tools", text: binding(for: acc, \.ccSwitchProviderName))
-                            .textFieldStyle(.roundedBorder)
-                            .controlSize(.small)
-                            .frame(maxWidth: .infinity)
+                    Divider().opacity(0.35)
+
+                    if acc.workloadKind == .llm {
+                        Toggle(isOn: binding(for: acc, \.autoSyncCCSwitch)) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("开机自动同步公网地址到 CC Switch")
+                                    .font(.system(size: 11.5))
+                                Text("仅写入独立待机渠道，不改动官方订阅")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        HStack {
+                            Text("渠道显示名")
+                                .font(.system(size: 11.5))
+                                .frame(width: 68, alignment: .leading)
+                            TextField("Colab Tools", text: binding(for: acc, \.ccSwitchProviderName))
+                                .textFieldStyle(.roundedBorder)
+                                .controlSize(.small)
+                                .frame(maxWidth: .infinity)
+                        }
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Drive 远端 LLM 启动脚本路径")
+                        Text(acc.workloadKind == .llm ? "Drive 远端 LLM 启动脚本路径" : "Drive 远端工作负载启动脚本（可选，留空仅分配算力）")
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
-                        TextField("/content/drive/MyDrive/colab-llm/scripts/start_server.sh", text: binding(for: acc, \.driveScriptPath))
+                        TextField(acc.workloadKind.defaultScriptHint.isEmpty ? "/content/drive/MyDrive/colab-tools/start.sh" : acc.workloadKind.defaultScriptHint, text: binding(for: acc, \.driveScriptPath))
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 10.5, design: .monospaced))
                             .controlSize(.small)
@@ -232,7 +277,7 @@ struct AboutTabView: View {
 
                 Text("Colab Tools")
                     .font(.system(size: 16, weight: .semibold))
-                Text("v0.3.2 · MIT Open Source")
+                Text("v0.3.3 · MIT Open Source")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Text("面向全体 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣。100% 基于官方 google-colab-cli，支持多订阅并行隔离管理、点数监控、自定义空闲自动关机与 Claude Code / CC Switch 无感联动。")

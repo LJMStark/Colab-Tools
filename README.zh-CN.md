@@ -60,7 +60,7 @@
   ```
 
 ### 方式一：直接下载预编译包
-1. 前往 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 `Colab-Tools-v0.3.2-macOS-arm64.zip`。
+1. 前往 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 `Colab-Tools-v0.3.3-macOS-arm64.zip`。
 2. 解压后将 **`Colab Tools.app`** 拖入 `/Applications` 并打开（首次启动会自动识别你已登录的官方 `colab` CLI 账号）。
 
 > 若 macOS Gatekeeper 提示未公证，右键应用选择「打开」，或执行 `xattr -cr "/Applications/Colab Tools.app"`。

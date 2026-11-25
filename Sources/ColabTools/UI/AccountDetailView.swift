@@ -13,6 +13,14 @@ struct AccountDetailView: View {
         rt.sessions.filter { $0.isOrphan || $0.name != account.sessionName }
     }
 
+    private var effectiveKind: WorkloadKind {
+        account.workloadKind == .general ? (rt.detectedWorkloadKind ?? .general) : account.workloadKind
+    }
+
+    private var activeServicePort: Int {
+        rt.detectedServicePort ?? account.remoteServicePort
+    }
+
     var body: some View {
         let _ = store.queueTickVersion
         VStack(spacing: 9) {
@@ -374,12 +382,15 @@ struct AccountDetailView: View {
 
     private var contextCard: some View {
         let pct = Int((rt.contextRatio * 100).rounded())
+        let kind = effectiveKind
+        let tint = ColabTheme.color(for: kind)
+
         return VStack(alignment: .leading, spacing: 8) {
-            if account.enableLLMModule {
+            if kind == .llm {
                 TileHeader(
-                    icon: "square.stack.3d.up",
-                    iconTint: ColabTheme.sky,
-                    title: "上下文",
+                    icon: kind.iconName,
+                    iconTint: tint,
+                    title: kind.metricCardTitle,
                     badgeText: "\(rt.contextLimit / 1024)K"
                 )
 
@@ -388,7 +399,7 @@ struct AccountDetailView: View {
                     unit: (rt.phase.isRunning && rt.serverHealthy) ? "tok" : ""
                 )
 
-                HorizonBar(progress: rt.serverHealthy ? rt.contextRatio : 0, tint: ColabTheme.sky)
+                HorizonBar(progress: rt.serverHealthy ? rt.contextRatio : 0, tint: tint)
                     .padding(.vertical, 5)
 
                 Spacer(minLength: 0)
@@ -402,25 +413,99 @@ struct AccountDetailView: View {
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            } else {
+            } else if !rt.workloadMetricValue.isEmpty {
+                // Open `/tmp/colab-tools-status.json` custom metric display (video steps / music tracks / audio latency)
                 TileHeader(
-                    icon: "server.rack",
-                    iconTint: ColabTheme.sky,
-                    title: "活跃会话",
-                    badgeText: account.highMem ? "High-RAM" : "Standard"
+                    icon: kind.iconName,
+                    iconTint: tint,
+                    title: rt.workloadMetricLabel.isEmpty ? kind.metricCardTitle : rt.workloadMetricLabel,
+                    badgeText: ":\(activeServicePort)"
                 )
 
-                BigMetricValue(number: "\(rt.activeAssignments)", unit: "个")
+                BigMetricValue(
+                    number: rt.phase.isRunning ? rt.workloadMetricValue : "—",
+                    unit: rt.phase.isRunning ? rt.workloadMetricUnit : ""
+                )
 
-                HorizonBar(progress: min(1.0, Double(rt.activeAssignments) / 3.0), tint: ColabTheme.sky)
-                    .padding(.vertical, 5)
+                HorizonBar(
+                    progress: rt.phase.isRunning ? (rt.workloadMetricRatio ?? (rt.isProcessing ? 0.65 : 0.08)) : 0,
+                    tint: tint
+                )
+                .padding(.vertical, 5)
 
                 Spacer(minLength: 0)
 
-                Text(rt.phase.isRunning ? "官方 CLI 直连托管" : "通用算力管理模式")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                Text(
+                    rt.workloadDetail.isEmpty
+                        ? "CPU \(rt.cpuUtilPercent)% · CUDA \(rt.cudaProcessCount) 进程"
+                        : rt.workloadDetail
+                )
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            } else if kind == .video || kind == .image {
+                let totalJobs = rt.queueRunning + rt.queuePending
+                TileHeader(
+                    icon: kind.iconName,
+                    iconTint: tint,
+                    title: kind.metricCardTitle,
+                    badgeText: ":\(activeServicePort)"
+                )
+
+                BigMetricValue(
+                    number: rt.phase.isRunning ? "\(totalJobs)" : "—",
+                    unit: rt.phase.isRunning ? "任务" : ""
+                )
+
+                HorizonBar(
+                    progress: rt.phase.isRunning ? (totalJobs > 0 ? min(1.0, Double(totalJobs) / 5.0) : Double(rt.cpuUtilPercent) / 100.0) : 0,
+                    tint: tint
+                )
+                .padding(.vertical, 5)
+
+                Spacer(minLength: 0)
+
+                Text(
+                    rt.phase.isRunning
+                        ? "运行 \(rt.queueRunning) · 排队 \(rt.queuePending) · CPU \(rt.cpuUtilPercent)%"
+                        : "支持 ComfyUI / 状态协议"
+                )
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            } else {
+                // Audio / Music / General compute mode
+                TileHeader(
+                    icon: kind.iconName,
+                    iconTint: tint,
+                    title: kind.metricCardTitle,
+                    badgeText: kind == .general ? (account.highMem ? "High-RAM" : "Std") : ":\(activeServicePort)"
+                )
+
+                BigMetricValue(
+                    number: rt.phase.isRunning ? "\(rt.cpuUtilPercent)" : "—",
+                    unit: rt.phase.isRunning ? "% CPU" : ""
+                )
+
+                HorizonBar(
+                    progress: rt.phase.isRunning ? min(1.0, Double(rt.cpuUtilPercent) / 100.0) : 0,
+                    tint: tint
+                )
+                .padding(.vertical, 5)
+
+                Spacer(minLength: 0)
+
+                Text(
+                    rt.phase.isRunning
+                        ? "CUDA \(rt.cudaProcessCount) 进程 · \(rt.serverHealthy ? "服务在线" : "端口 :\(activeServicePort)")"
+                        : "\(kind.displayName) · 端口 :\(activeServicePort)"
+                )
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -518,10 +603,12 @@ struct AccountDetailView: View {
         guard account.autoShutdownEnabled else { return "手动控制关机" }
         guard rt.phase.isRunning else { return "启动后自动守护" }
         if status == .pausedNoSignal {
-            return account.enableLLMModule ? "等待 /slots 信号" : "需开启 LLM 监测"
+            if account.enableLLMModule { return "等待 /slots 信号" }
+            return account.enableHardwareIdleFallback ? "等待 GPU+CPU 采样" : "已关闭硬件兜底"
         }
-        if rt.isProcessing { return "推理中 · 计时暂停" }
-        return "已空闲 \(Formatters.shortMinutes(rt.idleSeconds)) 后关机"
+        let src = rt.signalSource == .none ? "" : " · \(rt.signalSource.shortLabel)"
+        if rt.isProcessing { return "活跃中\(src)" }
+        return "空闲 \(Formatters.shortMinutes(rt.idleSeconds))\(src)"
     }
 
     // MARK: - 3. Wide Focus Card (Quota / Remaining Hours + Accelerator Strategy)
@@ -587,6 +674,39 @@ struct AccountDetailView: View {
             }
 
             HStack(spacing: 10) {
+                Menu {
+                    ForEach(WorkloadKind.allCases) { kind in
+                        Button {
+                            var copy = account
+                            copy.workloadKind = kind
+                            store.updateAccount(copy)
+                        } label: {
+                            HStack {
+                                Text("\(kind.displayName) (:\(String(kind.defaultRemotePort)))")
+                                if kind == account.workloadKind { Image(systemName: "checkmark") }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: effectiveKind.iconName)
+                            .font(.system(size: 10))
+                            .foregroundStyle(ColabTheme.color(for: effectiveKind))
+                        Text(account.workloadKind.displayName)
+                            .font(.system(size: 10.5, weight: .medium))
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 8))
+                            .opacity(0.65)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .disabled(rt.phase.isBusy || rt.phase.isQueuing)
+
                 if account.tier.supportsHighMem {
                     Toggle("高内存", isOn: Binding(
                         get: { account.highMem },
@@ -601,19 +721,6 @@ struct AccountDetailView: View {
                     .controlSize(.mini)
                     .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
                 }
-
-                Toggle("LLM 接入", isOn: Binding(
-                    get: { account.enableLLMModule },
-                    set: { v in
-                        var copy = account
-                        copy.enableLLMModule = v
-                        store.updateAccount(copy)
-                    }
-                ))
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .controlSize(.mini)
-                .disabled(rt.phase.isBusy || rt.phase.isQueuing)
 
                 Toggle("缺卡排队", isOn: Binding(
                     get: { account.enablePoliteQueue },
@@ -750,7 +857,7 @@ struct AccountDetailView: View {
                 }
             }
 
-            if account.enableLLMModule {
+            if effectiveKind == .llm {
                 Divider().opacity(0.35)
 
                 HStack(spacing: 6) {
@@ -804,6 +911,66 @@ struct AccountDetailView: View {
                         tint: rt.ccSwitchSynced ? ColabTheme.emerald : nil
                     )
                 }
+            } else {
+                Divider().opacity(0.35)
+
+                HStack(spacing: 6) {
+                    Text("负载")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .leading)
+                    Text(rt.workloadName.isEmpty ? effectiveKind.displayName : rt.workloadName)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    CardBadge(
+                        text: rt.serverHealthy ? "\(effectiveKind.shortBadge) · 在线" : effectiveKind.shortBadge,
+                        tint: rt.serverHealthy ? ColabTheme.emerald : ColabTheme.color(for: effectiveKind)
+                    )
+                }
+
+                let endpointText: String = {
+                    if !rt.publicURL.isEmpty { return rt.publicURL }
+                    if rt.sshTunnelActive { return "http://127.0.0.1:\(String(account.localSSHTunnelPort))" }
+                    return "远端端口 :\(String(activeServicePort))（可开隧道）"
+                }()
+                let copyableEndpoint: String = !rt.publicURL.isEmpty
+                    ? rt.publicURL
+                    : (rt.sshTunnelActive ? "http://127.0.0.1:\(String(account.localSSHTunnelPort))" : "")
+
+                HStack(spacing: 6) {
+                    Text("端点")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .leading)
+                    Text(endpointText)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(copyableEndpoint.isEmpty ? .tertiary : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        store.copyToClipboard(copyableEndpoint, label: "服务访问地址")
+                    } label: {
+                        Image(systemName: "doc.on.doc").font(.system(size: 11.5))
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(copyableEndpoint.isEmpty)
+                    .help("复制访问地址")
+                }
+
+                HStack(spacing: 6) {
+                    Text("守护")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .leading)
+                    Text(rt.signalSource == .none ? (account.enableHardwareIdleFallback ? "GPU+CPU 双低载" : "仅手动关机") : rt.signalSource.shortLabel)
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                    Spacer()
+                    CardBadge(text: "CPU \(rt.cpuUtilPercent)% · CUDA \(rt.cudaProcessCount)")
+                }
             }
         }
         .padding(11)
@@ -813,7 +980,7 @@ struct AccountDetailView: View {
     // MARK: - 5. Bottom Utility Strip + 3-Column Big Summary
     private var bottomDockCard: some View {
         VStack(spacing: 10) {
-            if account.enableLLMModule {
+            if effectiveKind == .llm {
                 HStack(spacing: 6) {
                     QuickActionButton(
                         title: rt.ccSwitchSynced ? "已同步" : "同步 CC",
@@ -846,24 +1013,33 @@ struct AccountDetailView: View {
                     }
                 }
             } else {
-                HStack(spacing: 7) {
+                HStack(spacing: 6) {
                     QuickActionButton(
-                        title: "网页打开",
+                        title: effectiveKind.webUIButtonTitle,
                         icon: "safari",
                         disabled: !rt.phase.isRunning
                     ) {
-                        store.openColabInBrowser(accountId: account.id)
+                        store.openWorkloadWebUI(accountId: account.id)
                     }
 
                     QuickActionButton(
-                        title: "SSH 终端",
+                        title: rt.sshTunnelActive ? "断隧道" : "隧道",
+                        icon: rt.sshTunnelActive ? "lock.fill" : "arrow.left.arrow.right",
+                        disabled: !rt.phase.isRunning && !rt.sshTunnelActive,
+                        active: rt.sshTunnelActive
+                    ) {
+                        store.toggleSSHTunnel(for: account.id)
+                    }
+
+                    QuickActionButton(
+                        title: "SSH",
                         icon: "terminal",
                         disabled: !rt.phase.isRunning
                     ) {
                         store.openRemoteSSHShell(accountId: account.id)
                     }
 
-                    QuickActionButton(title: "订阅 / 购点", icon: "creditcard") {
+                    QuickActionButton(title: "续费", icon: "creditcard") {
                         store.openPayPage()
                     }
                 }
@@ -881,8 +1057,10 @@ struct AccountDetailView: View {
                     label: "CU / 小时"
                 )
                 FooterStatCell(
-                    value: account.enableLLMModule ? "\(rt.contextLimit / 1024)K" : "\(rt.activeAssignments)",
-                    label: account.enableLLMModule ? "上下文上限" : "运行会话"
+                    value: effectiveKind == .llm
+                        ? "\(rt.contextLimit / 1024)K"
+                        : (rt.phase.isRunning ? "\(rt.cpuUtilPercent)%" : ":\(activeServicePort)"),
+                    label: effectiveKind == .llm ? "上下文上限" : (rt.phase.isRunning ? "整机 CPU" : "服务端口")
                 )
             }
         }

@@ -93,6 +93,80 @@ enum PreviewExporter {
                 to: qaURL.appendingPathComponent("qa-about-noqr-dark.png"),
                 dark: true
             )
+
+            // Multimodal video (ComfyUI queue) & music (Gradio) visual QA
+            let videoStore = makeDemoStore(multiAccount: false)
+            if var acc = videoStore.settings.accounts.first {
+                acc.workloadKind = .video
+                acc.remoteServicePort = 8188
+                acc.localSSHTunnelPort = 8188
+                acc.autoShutdownEnabled = true
+                videoStore.settings.accounts = [acc]
+                var vst = videoStore.state(for: acc.id)
+                vst.gpuName = "NVIDIA H100 80GB HBM3"
+                vst.activeHardware = "H100"
+                vst.vramUsedMB = 54200
+                vst.vramTotalMB = 81559
+                vst.gpuUtilPercent = 94
+                vst.cpuUtilPercent = 38
+                vst.cudaProcessCount = 1
+                vst.cuRatePerHour = 18.0
+                vst.workloadName = "Wan2.2-14B (ComfyUI)"
+                vst.workloadMetricLabel = "渲染进度"
+                vst.workloadMetricValue = "18/30"
+                vst.workloadMetricUnit = "steps"
+                vst.workloadMetricRatio = 0.60
+                vst.workloadDetail = "运行 1 · 排队 2 · 720p"
+                vst.queueRunning = 1
+                vst.queuePending = 2
+                vst.detectedServicePort = 8188
+                vst.publicURL = "https://wan-comfy-demo.trycloudflare.com"
+                vst.activitySignal = .busy(observedAt: Date())
+                vst.signalSource = .statusFile
+                vst.gpuUtilHistory = [42, 78, 92, 96, 89, 95, 94, 91, 96, 94]
+                vst.sessions = [
+                    ColabSessionItem(name: "wan-video", endpoint: "gpu-h100-demo", hardware: "H100", shape: "High-RAM", variant: "GPU")
+                ]
+                videoStore.runtimeByAccount[acc.id] = vst
+            }
+            renderPanel(
+                RootPopoverView(store: videoStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-multimodal-video-dark.png"),
+                dark: true
+            )
+
+            let musicStore = makeDemoStore(multiAccount: false)
+            if var acc = musicStore.settings.accounts.first {
+                acc.workloadKind = .music
+                acc.remoteServicePort = 7860
+                acc.localSSHTunnelPort = 7860
+                acc.autoShutdownEnabled = true
+                musicStore.settings.accounts = [acc]
+                var mst = musicStore.state(for: acc.id)
+                mst.gpuName = "NVIDIA L4"
+                mst.activeHardware = "L4"
+                mst.vramUsedMB = 11400
+                mst.vramTotalMB = 23034
+                mst.gpuUtilPercent = 2
+                mst.cpuUtilPercent = 9
+                mst.cudaProcessCount = 1
+                mst.workloadName = "ACE-Step 音乐工坊"
+                mst.workloadMetricLabel = ""
+                mst.workloadMetricValue = ""
+                mst.detectedServicePort = 7860
+                mst.publicURL = ""
+                mst.sshTunnelActive = true
+                mst.serverHealthy = true
+                mst.activitySignal = .idle(observedAt: Date())
+                mst.signalSource = .hardwareDualLowLoad
+                mst.idleSeconds = 420
+                musicStore.runtimeByAccount[acc.id] = mst
+            }
+            renderPanel(
+                RootPopoverView(store: musicStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-multimodal-music-light.png"),
+                dark: false
+            )
         }
         return true
     }

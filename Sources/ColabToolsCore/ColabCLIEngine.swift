@@ -44,6 +44,8 @@ public struct RemoteTelemetry: Equatable, Sendable {
     public var vramUsedMB: Int = 0
     public var vramTotalMB: Int = 0
     public var gpuUtil: Int = 0
+    public var cpuUtil: Int = 0
+    public var cudaProcessCount: Int = 0
     public var publicURL: String = ""
     public var modelFile: String = ""
     public var modelAlias: String = ""
@@ -51,6 +53,9 @@ public struct RemoteTelemetry: Equatable, Sendable {
     public var kvQuant: String = "q4_0"
     public var healthy: Bool = false
     public var uptimeSeconds: Int = 0
+    public var statusPayload: WorkloadStatusPayload? = nil
+    public var comfyQueue: ComfyQueueSummary? = nil
+    public var detectedWebPort: Int? = nil
 
     public init() {}
 }
@@ -415,22 +420,69 @@ public enum ColabCLIEngine {
     }
 
     /// Fetches sanitized telemetry ONLY (never prints API keys or raw process cmdlines with secrets into CLI history).
+    /// Collects universal GPU/VRAM/CPU/CUDA stats, open `/tmp/colab-tools-status.json` protocol,
+    /// ComfyUI `/queue`, Gradio/service port health, and optional llama-server metadata.
     public static func fetchRemoteTelemetry(profile: AccountProfile) async -> RemoteTelemetry? {
-        let port = profile.remoteLLMPort
+        let port = profile.remoteServicePort
         let py = """
-        import subprocess, json, pathlib
+        import subprocess, json, pathlib, time, urllib.request
         def sh(cmd):
             r = subprocess.run(["bash", "-c", cmd], text=True, capture_output=True)
             return r.stdout.strip()
+        def read_cpu():
+            def sample():
+                parts = pathlib.Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+                vals = [int(x) for x in parts[:8]]
+                idle = vals[3] + vals[4]
+                return idle, sum(vals)
+            try:
+                i1, t1 = sample()
+                time.sleep(0.35)
+                i2, t2 = sample()
+                dt = max(1, t2 - t1)
+                return max(0, min(100, int(round(100.0 * (dt - (i2 - i1)) / dt))))
+            except Exception:
+                return 0
+        def http_get(url, timeout=2.0):
+            try:
+                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                    if 200 <= resp.status < 400:
+                        return resp.read(32768).decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            return ""
         print("NV=" + sh("nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || true"))
+        print("CUDA_PROCS=" + sh("nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c '[0-9]' || true"))
+        print("CPU=" + str(read_cpu()))
         print("URL=" + sh("cat /tmp/public_url.txt 2>/dev/null || true"))
-        print("HEALTH=" + sh("curl -sf --max-time 3 http://127.0.0.1:\(port)/health || true"))
         print("UPTIME=" + sh("awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0"))
+        status_p = pathlib.Path("/tmp/colab-tools-status.json")
+        if status_p.exists():
+            raw_s = status_p.read_text(errors="ignore").strip().replace("\\n", " ")
+            if raw_s:
+                print("STATUS_JSON=" + raw_s)
+        health_ok = False
+        if http_get("http://127.0.0.1:\(port)/health"):
+            health_ok = True
+        comfy_ports = [\(port)] if \(port) == 8188 else [\(port), 8188]
+        for cp in comfy_ports:
+            cq = http_get(f"http://127.0.0.1:{cp}/queue")
+            if cq and "queue_running" in cq:
+                print("COMFY_QUEUE=" + cq.replace("\\n", " "))
+                print(f"WEB_PORT={cp}")
+                health_ok = True
+                break
+        if not health_ok:
+            for wp in ([\(port)] + [p for p in (7860, 8188) if p != \(port)]):
+                if http_get(f"http://127.0.0.1:{wp}/", timeout=1.2):
+                    print(f"WEB_PORT={wp}")
+                    health_ok = True
+                    break
+        print("HEALTH=" + ("ok" if health_ok else ""))
         meta_p = pathlib.Path("/tmp/llama-server.meta")
         if meta_p.exists():
             print("META=" + meta_p.read_text(errors="ignore").strip())
         else:
-            # Fallback: extract only -m / -c / -ctk / --alias without printing --api-key
             cmd = sh("ps -eo args | grep '[l]lama-server' | head -1 || true")
             import re
             m = re.search(r'-m\\s+(\\S+)', cmd)
@@ -457,6 +509,10 @@ public enum ColabCLIEngine {
                     t.vramTotalMB = Int(parts[2]) ?? 0
                     t.gpuUtil = Int(parts[3]) ?? 0
                 }
+            } else if line.hasPrefix("CUDA_PROCS=") {
+                t.cudaProcessCount = Int(line.dropFirst(11).trimmingCharacters(in: .whitespaces)) ?? 0
+            } else if line.hasPrefix("CPU=") {
+                t.cpuUtil = Int(line.dropFirst(4).trimmingCharacters(in: .whitespaces)) ?? 0
             } else if line.hasPrefix("URL=") {
                 let raw = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
                 if InputValidator.isValidEndpointURL(raw) {
@@ -466,6 +522,26 @@ public enum ColabCLIEngine {
                 t.healthy = line.contains("ok")
             } else if line.hasPrefix("UPTIME=") {
                 t.uptimeSeconds = Int(line.dropFirst(7).trimmingCharacters(in: .whitespaces)) ?? 0
+            } else if line.hasPrefix("WEB_PORT="), let wp = Int(line.dropFirst(9).trimmingCharacters(in: .whitespaces)) {
+                t.detectedWebPort = wp
+            } else if line.hasPrefix("STATUS_JSON=") {
+                let raw = String(line.dropFirst(12))
+                if let payload = WorkloadStatusParser.parseStatusJSON(raw) {
+                    t.statusPayload = payload
+                    if let ui = payload.uiURL, InputValidator.isValidEndpointURL(ui) {
+                        t.publicURL = ui
+                    }
+                    if let p = payload.port, (1024...65535).contains(p) {
+                        t.detectedWebPort = p
+                    }
+                    t.healthy = true
+                }
+            } else if line.hasPrefix("COMFY_QUEUE=") {
+                let raw = String(line.dropFirst(12))
+                if let q = WorkloadStatusParser.parseComfyQueueJSON(raw) {
+                    t.comfyQueue = q
+                    t.healthy = true
+                }
             } else if line.hasPrefix("META="),
                       let d = String(line.dropFirst(5)).data(using: .utf8),
                       let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
@@ -609,16 +685,19 @@ public enum ColabCLIEngine {
         return verify.exitCode == 0 && verify.stdout.contains("DRIVE_MOUNTED=1")
     }
 
-    /// Streams output incrementally so `colab exec` never hits idle-output timeout, and validates explicit sentinel `SERVER_READY=1`.
+    /// Streams output incrementally so `colab exec` never hits idle-output timeout, and validates explicit sentinel `SERVER_READY=1` or `WORKLOAD_READY=1`.
     public static func runDriveStartScript(profile: AccountProfile) async -> (ok: Bool, stdout: String, error: String?) {
         let escapedPath = profile.driveScriptPath
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        let port = profile.remoteLLMPort
+        let port = profile.remoteServicePort
+        let kind = profile.workloadKind.rawValue
         let py = """
         import subprocess, os
         env = os.environ.copy()
         env["LLAMA_PORT"] = "\(port)"
+        env["SERVICE_PORT"] = "\(port)"
+        env["WORKLOAD_KIND"] = "\(kind)"
         p = subprocess.Popen(["bash", "\(escapedPath)"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
         for line in p.stdout:
             print(line, end="", flush=True)
@@ -628,7 +707,7 @@ public enum ColabCLIEngine {
         let r = await runColab(profile: profile, subcommandArgs: ["exec", "-s", profile.sessionName], stdinText: py, timeoutSeconds: 240)
         guard r.exitCode == 0,
               r.stdout.contains("SCRIPT_EXIT_CODE=0"),
-              r.stdout.contains("SERVER_READY=1") else {
+              (r.stdout.contains("SERVER_READY=1") || r.stdout.contains("WORKLOAD_READY=1")) else {
             let reason = r.timedOut ? "启动脚本超时" : "远端启动脚本未返回就绪标志"
             return (false, r.stdout, reason)
         }

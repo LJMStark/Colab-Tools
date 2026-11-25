@@ -146,6 +146,7 @@ public final class WorkspaceStore: ObservableObject {
 
     public func watchdogStatus(for account: AccountProfile) -> WatchdogAction {
         let st = state(for: account.id)
+        let allowFallback = account.enableHardwareIdleFallback || st.signalSource == .statusFile || st.signalSource == .comfyQueue
         return IdleWatchdogEvaluator.evaluate(
             isRunning: st.phase.isRunning,
             enableLLMModule: account.enableLLMModule,
@@ -154,7 +155,8 @@ public final class WorkspaceStore: ObservableObject {
             idleSeconds: st.idleSeconds,
             timeoutMinutes: account.idleTimeoutMinutes,
             warnBeforeMinutes: account.warnBeforeMinutes,
-            alreadyWarned: st.warnedForCurrentIdle
+            alreadyWarned: st.warnedForCurrentIdle,
+            allowHardwareFallback: allowFallback
         )
     }
 
@@ -214,6 +216,7 @@ public final class WorkspaceStore: ObservableObject {
         backgroundTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.refreshAllAccounts(force: false, silent: true)
+                await self?.pollRunningMultimodalTelemetry()
             }
         }
     }
@@ -245,10 +248,15 @@ public final class WorkspaceStore: ObservableObject {
                 st.sessionUptimeSeconds += 1
             }
 
+            let allowFallback = acc.enableHardwareIdleFallback || st.signalSource == .statusFile || st.signalSource == .comfyQueue
+            let maxAge = (allowFallback && !acc.enableLLMModule)
+                ? IdleWatchdogEvaluator.hardwareSignalMaxAgeSeconds
+                : IdleWatchdogEvaluator.defaultSignalMaxAgeSeconds
+
             // Only advance idleSeconds when we hold a fresh verified `.idle` signal
             switch st.activitySignal {
             case .busy(let observedAt):
-                if now.timeIntervalSince(observedAt) <= IdleWatchdogEvaluator.defaultSignalMaxAgeSeconds {
+                if now.timeIntervalSince(observedAt) <= maxAge {
                     st.lastActiveAt = now
                     st.idleSeconds = 0
                     st.warnedForCurrentIdle = false
@@ -256,7 +264,7 @@ public final class WorkspaceStore: ObservableObject {
                     st.activitySignal = .unknown
                 }
             case .idle(let observedAt):
-                if now.timeIntervalSince(observedAt) <= IdleWatchdogEvaluator.defaultSignalMaxAgeSeconds {
+                if now.timeIntervalSince(observedAt) <= maxAge {
                     st.idleSeconds = max(0, Int(now.timeIntervalSince(st.lastActiveAt)))
                 } else {
                     st.activitySignal = .unknown
@@ -274,7 +282,8 @@ public final class WorkspaceStore: ObservableObject {
                 timeoutMinutes: acc.idleTimeoutMinutes,
                 warnBeforeMinutes: acc.warnBeforeMinutes,
                 alreadyWarned: st.warnedForCurrentIdle,
-                now: now
+                now: now,
+                allowHardwareFallback: allowFallback
             )
 
             switch action {
@@ -390,21 +399,9 @@ public final class WorkspaceStore: ObservableObject {
 
             if let remote = await ColabCLIEngine.fetchRemoteTelemetry(profile: acc) {
                 guard isStillValid(accountId: accountId, expectedGeneration: startGen) else { return }
-                var latest = state(for: accountId)
-                if !remote.gpuName.isEmpty { latest.gpuName = remote.gpuName }
-                latest.vramUsedMB = remote.vramUsedMB
-                latest.vramTotalMB = remote.vramTotalMB
-                latest.gpuUtilPercent = remote.gpuUtil
-                if !remote.publicURL.isEmpty { latest.publicURL = remote.publicURL }
-                if !remote.modelFile.isEmpty { latest.modelFile = remote.modelFile }
-                if !remote.modelAlias.isEmpty { latest.modelAlias = remote.modelAlias }
-                latest.contextLimit = remote.contextLimit
-                latest.kvQuant = remote.kvQuant
-                latest.serverHealthy = remote.healthy
-                latest.sessionUptimeSeconds = remote.uptimeSeconds
-                latest.appendTelemetrySample(gpuUtil: remote.gpuUtil, vramRatio: latest.vramRatio)
-                runtimeByAccount[accountId] = latest
+                applyRemoteTelemetry(remote, to: accountId, account: acc)
 
+                let latest = state(for: accountId)
                 // Ensure API key is cached in Keychain via safe `colab download` (never via `colab exec` history)
                 if acc.enableLLMModule && latest.serverHealthy && KeychainVault.loadAPIKey(for: acc.id) == nil {
                     if let key = await ColabCLIEngine.fetchRemoteAPIKeySafely(profile: acc) {
@@ -412,7 +409,9 @@ public final class WorkspaceStore: ObservableObject {
                     }
                 }
             }
-            await pollSlots(for: accountId)
+            if acc.enableLLMModule {
+                await pollSlots(for: accountId)
+            }
             if !silent { showToast("\(acc.displayName) 状态已刷新") }
         } else {
             if !cur.phase.isQueuing {
@@ -424,13 +423,124 @@ public final class WorkspaceStore: ObservableObject {
             cur.vramUsedMB = 0
             cur.vramTotalMB = 0
             cur.gpuUtilPercent = 0
+            cur.cpuUtilPercent = 0
+            cur.cudaProcessCount = 0
             cur.serverHealthy = false
             cur.activitySignal = .unknown
+            cur.signalSource = .none
             cur.promptTokensUsed = 0
+            cur.queueRunning = 0
+            cur.queuePending = 0
+            cur.detectedServicePort = nil
             cur.sessionUptimeSeconds = 0
             cur.idleSeconds = 0
             runtimeByAccount[accountId] = cur
             if !silent { showToast("\(acc.displayName) 主会话未运行") }
+        }
+    }
+
+    /// Applies universal GPU/VRAM/CPU telemetry + multimodal status.json / ComfyUI queue signals
+    /// and updates the anti-false-shutdown ActivitySignal with strict priority:
+    /// 1) status.json explicit `busy` -> 2) ComfyUI `/queue` -> 3) GPU+CPU dual low-load fallback.
+    private func applyRemoteTelemetry(_ remote: RemoteTelemetry, to accountId: UUID, account acc: AccountProfile) {
+        var latest = state(for: accountId)
+        guard latest.phase.isRunning else { return }
+        let now = Date()
+
+        if !remote.gpuName.isEmpty { latest.gpuName = remote.gpuName }
+        latest.vramUsedMB = remote.vramUsedMB
+        latest.vramTotalMB = remote.vramTotalMB
+        latest.gpuUtilPercent = remote.gpuUtil
+        latest.cpuUtilPercent = remote.cpuUtil
+        latest.cudaProcessCount = remote.cudaProcessCount
+        if !remote.publicURL.isEmpty { latest.publicURL = remote.publicURL }
+        if !remote.modelFile.isEmpty { latest.modelFile = remote.modelFile }
+        if !remote.modelAlias.isEmpty { latest.modelAlias = remote.modelAlias }
+        latest.contextLimit = remote.contextLimit
+        latest.kvQuant = remote.kvQuant
+        latest.serverHealthy = remote.healthy
+        latest.sessionUptimeSeconds = remote.uptimeSeconds
+        latest.detectedServicePort = remote.detectedWebPort ?? latest.detectedServicePort
+        latest.appendTelemetrySample(gpuUtil: remote.gpuUtil, vramRatio: latest.vramRatio)
+
+        if let payload = remote.statusPayload {
+            if let pk = payload.parsedKind { latest.detectedWorkloadKind = pk }
+            if let nm = payload.name, !nm.isEmpty { latest.workloadName = nm }
+            latest.workloadMetricLabel = payload.metricLabel ?? ""
+            latest.workloadMetricValue = payload.metricValue ?? ""
+            latest.workloadMetricUnit = payload.metricUnit ?? ""
+            latest.workloadMetricRatio = payload.metricRatio
+            latest.workloadDetail = payload.detail ?? ""
+            if let r = payload.queueRunning { latest.queueRunning = max(0, r) }
+            if let p = payload.queuePending { latest.queuePending = max(0, p) }
+        }
+
+        if let cq = remote.comfyQueue {
+            latest.queueRunning = cq.running
+            latest.queuePending = cq.pending
+            if latest.workloadName.isEmpty { latest.workloadName = "ComfyUI" }
+        }
+
+        // Update ActivitySignal for non-LLM workloads (or LLM when /slots is unavailable)
+        let shouldDriveNonLLMSignal = !acc.enableLLMModule || latest.publicURL.isEmpty
+        if shouldDriveNonLLMSignal {
+            let prevSignal = latest.activitySignal
+            if let payloadBusy = remote.statusPayload?.isWorkloadBusy {
+                latest.signalSource = .statusFile
+                if payloadBusy {
+                    latest.activitySignal = .busy(observedAt: now)
+                    latest.lastActiveAt = now
+                    latest.idleSeconds = 0
+                    latest.warnedForCurrentIdle = false
+                } else {
+                    if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
+                    latest.activitySignal = .idle(observedAt: now)
+                }
+            } else if let cq = remote.comfyQueue {
+                latest.signalSource = .comfyQueue
+                if cq.isBusy {
+                    latest.activitySignal = .busy(observedAt: now)
+                    latest.lastActiveAt = now
+                    latest.idleSeconds = 0
+                    latest.warnedForCurrentIdle = false
+                } else {
+                    if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
+                    latest.activitySignal = .idle(observedAt: now)
+                }
+            } else if acc.enableHardwareIdleFallback {
+                latest.signalSource = .hardwareDualLowLoad
+                let hwSig = IdleWatchdogEvaluator.evaluateHardwareActivity(
+                    gpuUtilPercent: remote.gpuUtil,
+                    cpuUtilPercent: remote.cpuUtil,
+                    now: now
+                )
+                if hwSig.isBusy {
+                    latest.activitySignal = hwSig
+                    latest.lastActiveAt = now
+                    latest.idleSeconds = 0
+                    latest.warnedForCurrentIdle = false
+                } else {
+                    if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
+                    latest.activitySignal = hwSig
+                }
+            }
+        }
+
+        runtimeByAccount[accountId] = latest
+    }
+
+    /// Polite 60s hardware/status probe for running non-LLM accounts so dual-low-load watchdog stays fresh
+    /// without hitting `colab usage` / `colab sessions` more often than the configured background interval.
+    public func pollRunningMultimodalTelemetry() async {
+        for acc in settings.accounts {
+            let snap = state(for: acc.id)
+            guard snap.phase.isRunning, !acc.enableLLMModule else { continue }
+            guard !refreshingAccounts.contains(acc.id) else { continue }
+            let startGen = snap.generation
+            if let remote = await ColabCLIEngine.fetchRemoteTelemetry(profile: acc) {
+                guard isStillValid(accountId: acc.id, expectedGeneration: startGen) else { continue }
+                applyRemoteTelemetry(remote, to: acc.id, account: acc)
+            }
         }
     }
 
@@ -462,6 +572,7 @@ public final class WorkspaceStore: ObservableObject {
             let nextTask = slot.id_task ?? prevTask
             let processing = slot.is_processing ?? false
 
+            cur.signalSource = .llmSlots
             cur.promptTokensUsed = slot.n_prompt_tokens ?? cur.promptTokensUsed
             if let ctx = slot.n_ctx, ctx > 0 { cur.contextLimit = ctx }
 
@@ -836,7 +947,13 @@ public final class WorkspaceStore: ObservableObject {
             runtimeByAccount[accountId] = allocState
         }
 
-        if acc.enableLLMModule {
+        let trimmedScript = acc.driveScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shouldRunNonLLMScript = !acc.enableLLMModule
+            && acc.workloadKind != .general
+            && !trimmedScript.isEmpty
+            && !trimmedScript.hasSuffix("/colab-llm/scripts/start_server.sh")
+
+        if acc.enableLLMModule || shouldRunNonLLMScript {
             var mState = state(for: accountId)
             mState.phase = .starting("挂载 Google Drive…")
             runtimeByAccount[accountId] = mState
@@ -855,7 +972,7 @@ public final class WorkspaceStore: ObservableObject {
             }
 
             var sState = state(for: accountId)
-            sState.phase = .starting("启动模型与公网隧道…")
+            sState.phase = .starting(acc.enableLLMModule ? "启动模型与公网隧道…" : "启动 \(acc.workloadKind.displayName) 服务…")
             runtimeByAccount[accountId] = sState
             onStatusBarNeedsUpdate?()
 
@@ -864,9 +981,9 @@ public final class WorkspaceStore: ObservableObject {
             guard startRes.ok else {
                 var warnState = state(for: accountId)
                 warnState.phase = .running
-                warnState.lastError = "VM 已分配，但 LLM 启动脚本失败：\(startRes.error ?? "")"
+                warnState.lastError = "VM 已分配，但启动脚本失败：\(startRes.error ?? "")"
                 runtimeByAccount[accountId] = warnState
-                showToast("LLM 启动失败，VM 仍在运行可手动关机")
+                showToast("远端启动失败，VM 仍在运行可手动关机")
                 await refreshAccount(accountId, force: true, bypassCooldown: true, silent: true)
                 return
             }
@@ -883,6 +1000,8 @@ public final class WorkspaceStore: ObservableObject {
                     parsed.gpuName = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
                 } else if line.hasPrefix("MODEL=") {
                     parsed.modelFile = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+                } else if line.hasPrefix("WORKLOAD_NAME=") {
+                    parsed.workloadName = String(line.dropFirst(14)).trimmingCharacters(in: .whitespaces)
                 } else if line.hasPrefix("CTX="), let c = Int(line.dropFirst(4).trimmingCharacters(in: .whitespaces)) {
                     parsed.contextLimit = c
                 }
@@ -890,7 +1009,7 @@ public final class WorkspaceStore: ObservableObject {
             parsed.serverHealthy = !parsed.publicURL.isEmpty
             runtimeByAccount[accountId] = parsed
 
-            if let apiKey = await ColabCLIEngine.fetchRemoteAPIKeySafely(profile: acc) {
+            if acc.enableLLMModule, let apiKey = await ColabCLIEngine.fetchRemoteAPIKeySafely(profile: acc) {
                 KeychainVault.saveAPIKey(apiKey, for: acc.id)
             }
         }
@@ -1057,14 +1176,26 @@ public final class WorkspaceStore: ObservableObject {
 
     public func updateAccount(_ updated: AccountProfile) {
         guard let idx = settings.accounts.firstIndex(where: { $0.id == updated.id }) else { return }
+        let old = settings.accounts[idx]
         var normalized = updated
-        normalized.sessionName = InputValidator.sanitizeSessionName(updated.sessionName, fallback: settings.accounts[idx].sessionName)
+        normalized.sessionName = InputValidator.sanitizeSessionName(updated.sessionName, fallback: old.sessionName)
         if !normalized.tier.allowedAccelerators.contains(normalized.preferredAccelerator) {
             normalized.preferredAccelerator = normalized.tier.defaultAccelerator
         }
         if !normalized.tier.supportsHighMem {
             normalized.highMem = false
         }
+        // When workloadKind changes and ports were still at the old workload defaults, migrate smoothly to new defaults
+        if old.workloadKind != normalized.workloadKind {
+            if normalized.remoteServicePort == old.workloadKind.defaultRemotePort {
+                normalized.remoteServicePort = normalized.workloadKind.defaultRemotePort
+            }
+            if normalized.localSSHTunnelPort == old.workloadKind.defaultLocalTunnelPort {
+                normalized.localSSHTunnelPort = normalized.workloadKind.defaultLocalTunnelPort
+            }
+        }
+        normalized.remoteServicePort = max(1024, min(65535, normalized.remoteServicePort))
+        normalized.localSSHTunnelPort = max(1024, min(65535, normalized.localSSHTunnelPort))
         normalized.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: normalized.queueTargets, for: normalized.tier)
         normalized.idleTimeoutMinutes = max(5, min(720, normalized.idleTimeoutMinutes))
         settings.accounts[idx] = normalized
@@ -1121,6 +1252,25 @@ public final class WorkspaceStore: ObservableObject {
             let r = await ColabCLIEngine.openColabWebURL(profile: acc, sessionName: sessionName)
             showToast(r.exitCode == 0 ? "已在浏览器打开 Colab 会话" : "打开网页会话失败")
         }
+    }
+
+    /// Opens the multimodal WebUI / audio preview page (public URL > active local SSH tunnel > Colab web fallback).
+    public func openWorkloadWebUI(accountId: UUID) {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        let st = state(for: accountId)
+        cancelPostAllocateReminder(for: accountId)
+        if !st.publicURL.isEmpty, InputValidator.isValidEndpointURL(st.publicURL), let url = URL(string: st.publicURL) {
+            NSWorkspace.shared.open(url)
+            showToast("已在浏览器打开 \(acc.workloadKind.webUIButtonTitle)")
+            return
+        }
+        if st.sshTunnelActive, let url = URL(string: "http://127.0.0.1:\(acc.localSSHTunnelPort)") {
+            NSWorkspace.shared.open(url)
+            showToast("已通过本地隧道打开 127.0.0.1:\(acc.localSSHTunnelPort)")
+            return
+        }
+        showToast("暂无公网地址，可先开端口隧道；正打开 Colab 网页")
+        openColabInBrowser(accountId: accountId)
     }
 
     public func openPayPage() {
@@ -1252,6 +1402,7 @@ public final class WorkspaceStore: ObservableObject {
         let prefix = ColabCLIEngine.colabPrefixArgs(for: acc).map(ColabCLIEngine.shellEscape).joined(separator: " ")
         let proxyCmd = "colab \(prefix) ssh --proxy-mode -s \(ColabCLIEngine.shellEscape(acc.sessionName))"
 
+        let targetRemotePort = st.detectedServicePort ?? acc.remoteServicePort
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
@@ -1260,7 +1411,7 @@ public final class WorkspaceStore: ObservableObject {
             "-o", "ServerAliveInterval=30",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ProxyCommand=\(proxyCmd)",
-            "-N", "-L", "127.0.0.1:\(acc.localSSHTunnelPort):127.0.0.1:\(acc.remoteLLMPort)",
+            "-N", "-L", "127.0.0.1:\(acc.localSSHTunnelPort):127.0.0.1:\(targetRemotePort)",
             "root@colab-runtime"
         ]
         proc.environment = ColabCLIEngine.baseEnvironment(extra: extraEnv)

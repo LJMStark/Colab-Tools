@@ -95,7 +95,23 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
     public var sessionName: String
     public var preferredAccelerator: AcceleratorOption
     public var highMem: Bool
-    public var enableLLMModule: Bool
+    public var workloadKind: WorkloadKind
+    public var enableHardwareIdleFallback: Bool
+
+    /// Backwards-compatible computed bridge for legacy LLM toggle sites.
+    public var enableLLMModule: Bool {
+        get { workloadKind == .llm }
+        set {
+            if newValue {
+                workloadKind = .llm
+                if remoteServicePort == 8888 || remoteServicePort == 8188 || remoteServicePort == 7860 {
+                    remoteServicePort = WorkloadKind.llm.defaultRemotePort
+                }
+            } else if workloadKind == .llm {
+                workloadKind = .general
+            }
+        }
+    }
 
     // Polite anti-abuse queue preferences (single-layer, minute-scale Equal Jitter, max 5 rounds / 40m)
     public var enablePoliteQueue: Bool
@@ -106,14 +122,30 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
     public var idleTimeoutMinutes: Int
     public var warnBeforeMinutes: Int
 
-    // Optional LLM & CC Switch integration
+    // Workload script, service port & optional LLM / CC Switch integration
     public var driveScriptPath: String
     public var autoSyncCCSwitch: Bool
     public var ccSwitchProviderId: String
     public var ccSwitchProviderName: String
     public var localEnvPath: String
     public var localSSHTunnelPort: Int
-    public var remoteLLMPort: Int
+    public var remoteServicePort: Int
+
+    /// Alias preserved for source compatibility with older references.
+    public var remoteLLMPort: Int {
+        get { remoteServicePort }
+        set { remoteServicePort = newValue }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, displayName, email, colorTag, tier, authMode
+        case sessionName, preferredAccelerator, highMem
+        case workloadKind, enableLLMModule, enableHardwareIdleFallback
+        case enablePoliteQueue, queueTargets
+        case autoShutdownEnabled, idleTimeoutMinutes, warnBeforeMinutes
+        case driveScriptPath, autoSyncCCSwitch, ccSwitchProviderId, ccSwitchProviderName
+        case localEnvPath, localSSHTunnelPort, remoteServicePort, remoteLLMPort
+    }
 
     public init(
         id: UUID = UUID(),
@@ -125,7 +157,9 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         sessionName: String = "llm-coder",
         preferredAccelerator: AcceleratorOption = .autoPro,
         highMem: Bool = false,
+        workloadKind: WorkloadKind? = nil,
         enableLLMModule: Bool = false,
+        enableHardwareIdleFallback: Bool = true,
         enablePoliteQueue: Bool = false,
         queueTargets: [AcceleratorOption]? = nil,
         autoShutdownEnabled: Bool = false,
@@ -136,9 +170,11 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         ccSwitchProviderId: String = "colab-qwen38-uncensored",
         ccSwitchProviderName: String = "Colab Qwen3.8-27B (无审查)",
         localEnvPath: String = "",
-        localSSHTunnelPort: Int = 18080,
-        remoteLLMPort: Int = 18080
+        localSSHTunnelPort: Int? = nil,
+        remoteServicePort: Int? = nil,
+        remoteLLMPort: Int? = nil
     ) {
+        let resolvedKind = workloadKind ?? (enableLLMModule ? .llm : .general)
         self.id = id
         self.displayName = displayName
         self.email = email
@@ -148,7 +184,8 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         self.sessionName = InputValidator.sanitizeSessionName(sessionName)
         self.preferredAccelerator = preferredAccelerator
         self.highMem = highMem
-        self.enableLLMModule = enableLLMModule
+        self.workloadKind = resolvedKind
+        self.enableHardwareIdleFallback = enableHardwareIdleFallback
         self.enablePoliteQueue = enablePoliteQueue
         let defaultQueue = Array(tier.queueableAccelerators.prefix(2))
         self.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: queueTargets ?? defaultQueue, for: tier)
@@ -160,11 +197,13 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         self.ccSwitchProviderId = ccSwitchProviderId
         self.ccSwitchProviderName = ccSwitchProviderName
         self.localEnvPath = localEnvPath
-        self.localSSHTunnelPort = max(1024, min(65535, localSSHTunnelPort))
-        self.remoteLLMPort = max(1024, min(65535, remoteLLMPort))
+        let resolvedRemote = remoteServicePort ?? remoteLLMPort ?? resolvedKind.defaultRemotePort
+        self.remoteServicePort = max(1024, min(65535, resolvedRemote))
+        let resolvedLocal = localSSHTunnelPort ?? resolvedKind.defaultLocalTunnelPort
+        self.localSSHTunnelPort = max(1024, min(65535, resolvedLocal))
     }
 
-    // Backwards-compatible decoding when older config.json lacks `remoteLLMPort`
+    // Backwards-compatible decoding migrating legacy `enableLLMModule` and `remoteLLMPort` seamlessly
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
@@ -176,7 +215,13 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         sessionName = InputValidator.sanitizeSessionName(try c.decode(String.self, forKey: .sessionName))
         preferredAccelerator = try c.decode(AcceleratorOption.self, forKey: .preferredAccelerator)
         highMem = try c.decode(Bool.self, forKey: .highMem)
-        enableLLMModule = try c.decode(Bool.self, forKey: .enableLLMModule)
+        if let decodedKind = try c.decodeIfPresent(WorkloadKind.self, forKey: .workloadKind) {
+            workloadKind = decodedKind
+        } else {
+            let legacyLLM = try c.decodeIfPresent(Bool.self, forKey: .enableLLMModule) ?? false
+            workloadKind = legacyLLM ? .llm : .general
+        }
+        enableHardwareIdleFallback = try c.decodeIfPresent(Bool.self, forKey: .enableHardwareIdleFallback) ?? true
         enablePoliteQueue = try c.decodeIfPresent(Bool.self, forKey: .enablePoliteQueue) ?? false
         let decodedQueue = try c.decodeIfPresent([AcceleratorOption].self, forKey: .queueTargets)
         queueTargets = PoliteQueuePolicy.sanitizedTargets(
@@ -191,8 +236,41 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         ccSwitchProviderId = try c.decode(String.self, forKey: .ccSwitchProviderId)
         ccSwitchProviderName = try c.decode(String.self, forKey: .ccSwitchProviderName)
         localEnvPath = try c.decode(String.self, forKey: .localEnvPath)
-        localSSHTunnelPort = try c.decodeIfPresent(Int.self, forKey: .localSSHTunnelPort) ?? 18080
-        remoteLLMPort = try c.decodeIfPresent(Int.self, forKey: .remoteLLMPort) ?? 18080
+        let decodedRemote = try c.decodeIfPresent(Int.self, forKey: .remoteServicePort)
+            ?? c.decodeIfPresent(Int.self, forKey: .remoteLLMPort)
+            ?? workloadKind.defaultRemotePort
+        remoteServicePort = max(1024, min(65535, decodedRemote))
+        let decodedLocal = try c.decodeIfPresent(Int.self, forKey: .localSSHTunnelPort) ?? workloadKind.defaultLocalTunnelPort
+        localSSHTunnelPort = max(1024, min(65535, decodedLocal))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(displayName, forKey: .displayName)
+        try c.encode(email, forKey: .email)
+        try c.encode(colorTag, forKey: .colorTag)
+        try c.encode(tier, forKey: .tier)
+        try c.encode(authMode, forKey: .authMode)
+        try c.encode(sessionName, forKey: .sessionName)
+        try c.encode(preferredAccelerator, forKey: .preferredAccelerator)
+        try c.encode(highMem, forKey: .highMem)
+        try c.encode(workloadKind, forKey: .workloadKind)
+        try c.encode(workloadKind == .llm, forKey: .enableLLMModule)
+        try c.encode(enableHardwareIdleFallback, forKey: .enableHardwareIdleFallback)
+        try c.encode(enablePoliteQueue, forKey: .enablePoliteQueue)
+        try c.encode(queueTargets, forKey: .queueTargets)
+        try c.encode(autoShutdownEnabled, forKey: .autoShutdownEnabled)
+        try c.encode(idleTimeoutMinutes, forKey: .idleTimeoutMinutes)
+        try c.encode(warnBeforeMinutes, forKey: .warnBeforeMinutes)
+        try c.encode(driveScriptPath, forKey: .driveScriptPath)
+        try c.encode(autoSyncCCSwitch, forKey: .autoSyncCCSwitch)
+        try c.encode(ccSwitchProviderId, forKey: .ccSwitchProviderId)
+        try c.encode(ccSwitchProviderName, forKey: .ccSwitchProviderName)
+        try c.encode(localEnvPath, forKey: .localEnvPath)
+        try c.encode(localSSHTunnelPort, forKey: .localSSHTunnelPort)
+        try c.encode(remoteServicePort, forKey: .remoteServicePort)
+        try c.encode(remoteServicePort, forKey: .remoteLLMPort)
     }
 
     public var isolatedConfigFilePath: String? {
@@ -319,9 +397,11 @@ public struct AccountRuntimeState: Equatable, Sendable {
     public var vramUsedMB: Int = 0
     public var vramTotalMB: Int = 0
     public var gpuUtilPercent: Int = 0
+    public var cpuUtilPercent: Int = 0
+    public var cudaProcessCount: Int = 0
     public var sessionUptimeSeconds: Int = 0
 
-    // Optional LLM server details
+    // Optional LLM / Multimodal workload details
     public var modelFile: String = ""
     public var modelAlias: String = "qwen3.8-27b-uncensored"
     public var contextLimit: Int = 262144
@@ -329,8 +409,21 @@ public struct AccountRuntimeState: Equatable, Sendable {
     public var publicURL: String = ""
     public var serverHealthy: Bool = false
 
-    // Live /slots activity (three-state) & micro-chart telemetry history
+    // Multimodal workload protocol / auto-detected details
+    public var detectedWorkloadKind: WorkloadKind? = nil
+    public var workloadName: String = ""
+    public var workloadMetricLabel: String = ""
+    public var workloadMetricValue: String = ""
+    public var workloadMetricUnit: String = ""
+    public var workloadMetricRatio: Double? = nil
+    public var workloadDetail: String = ""
+    public var queueRunning: Int = 0
+    public var queuePending: Int = 0
+    public var detectedServicePort: Int? = nil
+
+    // Live activity signal (three-state) & micro-chart telemetry history
     public var activitySignal: ActivitySignal = .unknown
+    public var signalSource: ActivitySignalSource = .none
     public var lastTaskID: Int = -1
     public var promptTokensUsed: Int = 0
     public var gpuUtilHistory: [Double] = []

@@ -219,9 +219,13 @@ struct RootPopoverView: View {
                 .padding(.vertical, 2)
                 .background(Color.primary.opacity(0.07), in: Capsule())
         } else if let first = running.first {
-            let label = first.0.enableLLMModule
-                ? "\(first.1.shortGPUName) · \(first.1.contextLimit / 1024)K"
-                : first.1.shortGPUName
+            let effectiveKind = first.0.workloadKind == .general ? (first.1.detectedWorkloadKind ?? .general) : first.0.workloadKind
+            let label: String = {
+                if effectiveKind == .llm {
+                    return "\(first.1.shortGPUName) · \(first.1.contextLimit / 1024)K"
+                }
+                return "\(first.1.shortGPUName) · \(effectiveKind.shortBadge)"
+            }()
             Text(label)
                 .font(.system(size: 10, weight: .medium))
                 .monospacedDigit()

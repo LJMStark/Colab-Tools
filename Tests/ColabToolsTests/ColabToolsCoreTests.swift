@@ -318,5 +318,86 @@ final class ColabToolsCoreTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AccountProfile.self, from: Data(legacyJSON.utf8))
         XCTAssertFalse(decoded.enablePoliteQueue)
         XCTAssertEqual(decoded.queueTargets, [.g4, .h100])
+        XCTAssertEqual(decoded.workloadKind, .llm)
+        XCTAssertTrue(decoded.enableHardwareIdleFallback)
+        XCTAssertEqual(decoded.remoteServicePort, 18080)
+    }
+
+    func testWorkloadStatusJSONAndComfyQueueParsing() throws {
+        let videoJSON = """
+        {
+          "kind": "video",
+          "name": "Wan2.2-14B",
+          "ui_url": "https://wan-demo.trycloudflare.com",
+          "port": 8188,
+          "metric_label": "渲染进度",
+          "metric_value": "18/30",
+          "metric_unit": "steps",
+          "metric_ratio": 0.6,
+          "busy": true,
+          "queue_running": 1,
+          "queue_pending": 2,
+          "detail": "720p · 48fps"
+        }
+        """
+        let payload = try XCTUnwrap(WorkloadStatusParser.parseStatusJSON(videoJSON))
+        XCTAssertEqual(payload.parsedKind, .video)
+        XCTAssertEqual(payload.name, "Wan2.2-14B")
+        XCTAssertEqual(payload.port, 8188)
+        XCTAssertEqual(payload.isWorkloadBusy, true)
+        XCTAssertEqual(payload.queuePending, 2)
+
+        let comfyRaw = #"{"queue_running":[["job-1"]],"queue_pending":[["job-2"],["job-3"]]}"#
+        let comfy = try XCTUnwrap(WorkloadStatusParser.parseComfyQueueJSON(comfyRaw))
+        XCTAssertEqual(comfy.running, 1)
+        XCTAssertEqual(comfy.pending, 2)
+        XCTAssertTrue(comfy.isBusy)
+
+        let comfyIdle = try XCTUnwrap(WorkloadStatusParser.parseComfyQueueJSON(#"{"queue_running":[],"queue_pending":[]}"#))
+        XCTAssertFalse(comfyIdle.isBusy)
+    }
+
+    func testHardwareDualLowLoadPreventsFalseShutdownDuringDownloadOrTranscode() {
+        let now = Date()
+
+        // GPU 0% while CPU 62% (e.g. downloading 20GB video weights or FFmpeg transcoding) MUST be `.busy`
+        let downloading = IdleWatchdogEvaluator.evaluateHardwareActivity(gpuUtilPercent: 0, cpuUtilPercent: 62, now: now)
+        XCTAssertTrue(downloading.isBusy)
+
+        // GPU 18% while CPU 8% MUST be `.busy`
+        let gpuActive = IdleWatchdogEvaluator.evaluateHardwareActivity(gpuUtilPercent: 18, cpuUtilPercent: 8, now: now)
+        XCTAssertTrue(gpuActive.isBusy)
+
+        // Only BOTH GPU < 5% AND CPU < 25% classifies as `.idle`
+        let trulyIdle = IdleWatchdogEvaluator.evaluateHardwareActivity(gpuUtilPercent: 2, cpuUtilPercent: 14, now: now)
+        if case .idle = trulyIdle {} else {
+            XCTFail("Expected .idle when both GPU<5% and CPU<25%")
+        }
+    }
+
+    func testNonLLMHardwareFallbackWatchdogLifecycle() {
+        let now = Date()
+        let freshIdle = ActivitySignal.idle(observedAt: now.addingTimeInterval(-120))
+
+        // Within 210s hardware probe staleness window -> triggers shutdown at timeout
+        XCTAssertEqual(
+            IdleWatchdogEvaluator.evaluate(
+                isRunning: true, enableLLMModule: false, activitySignal: freshIdle,
+                autoShutdownEnabled: true, idleSeconds: 40 * 60, timeoutMinutes: 40,
+                warnBeforeMinutes: 2, alreadyWarned: true, now: now, allowHardwareFallback: true
+            ),
+            .shutdown
+        )
+
+        // Stale > 210s -> safely pauses without shutting down
+        let staleIdle = ActivitySignal.idle(observedAt: now.addingTimeInterval(-260))
+        XCTAssertEqual(
+            IdleWatchdogEvaluator.evaluate(
+                isRunning: true, enableLLMModule: false, activitySignal: staleIdle,
+                autoShutdownEnabled: true, idleSeconds: 50 * 60, timeoutMinutes: 40,
+                warnBeforeMinutes: 2, alreadyWarned: true, now: now, allowHardwareFallback: true
+            ),
+            .pausedNoSignal
+        )
     }
 }

@@ -7,6 +7,19 @@ enum ColabTheme {
     static let sky = Color(red: 0.36, green: 0.60, blue: 0.96)
     static let cyan = Color(red: 0.20, green: 0.78, blue: 0.86)
     static let coral = Color(red: 0.94, green: 0.36, blue: 0.36)
+    static let indigo = Color(red: 0.54, green: 0.56, blue: 0.96)
+    static let rose = Color(red: 0.94, green: 0.42, blue: 0.56)
+
+    static func color(for kind: WorkloadKind) -> Color {
+        switch kind {
+        case .llm: return sky
+        case .video: return indigo
+        case .image: return rose
+        case .audio: return cyan
+        case .music: return amber
+        case .general: return sky
+        }
+    }
 
     static func color(for tag: AccountColorTag) -> Color {
         switch tag {

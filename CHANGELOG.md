@@ -3,6 +3,15 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] - 2026-11-25
+
+### Added
+- **Multimodal Workload System (`WorkloadKind`)**: Replaced the binary LLM toggle with 6 workload profiles (`LLM`, `Video`, `Image`, `Audio / Speech`, `Music`, `Training / General`) with seamless migration for existing configs.
+- **Open Workload Status Protocol & Auto-Detection**: Reads `/tmp/colab-tools-status.json` for custom model names, WebUI URLs, progress ratios, and busy states; automatically probes ComfyUI (`:8188/queue`), Gradio (`:7860`), host CPU utilization, and active CUDA compute processes.
+- **Dual Low-Load Anti-False-Shutdown Watchdog**: Extends idle auto-shutdown beyond LLM `/slots` to all multimodal and training workloads — prioritizing app signals (`status.json` / ComfyUI `/queue`) and falling back to **GPU < 5% AND CPU < 25%** so 20GB model downloads or FFmpeg CPU transcoding are never mistakenly killed.
+- **Dynamic Port Tunneling & WebUI Launcher**: SSH tunnels automatically forward the active workload port (`18080`, `8188`, `7860`, `8888`, or custom) and bottom HUD quick actions adapt to one-click WebUI/preview opening.
+- **Starter Templates & Protocol Spec**: Added `docs/WORKLOAD_PROTOCOL.md` and starter scripts under `scripts/templates/` (`comfyui-video.sh`, `gradio-audio-music.sh`, `training-job.sh`).
+
 ## [0.3.2] - 2026-11-25
 
 ### Added
