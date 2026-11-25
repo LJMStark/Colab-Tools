@@ -1,5 +1,31 @@
+import AppKit
 import ColabToolsCore
 import SwiftUI
+
+/// Unified Apple macOS HIG + CJK-friendly typography scale.
+/// Eliminates sub-11pt Chinese text and aligns main desktop views with macOS 13pt body standards.
+enum ColabTypography {
+    static let pageTitle = Font.system(size: 22, weight: .semibold)
+    static let sectionTitle = Font.system(size: 14, weight: .semibold)
+    static let body = Font.system(size: 13.5, weight: .regular)
+    static let bodyMedium = Font.system(size: 13.5, weight: .medium)
+    static let bodySemibold = Font.system(size: 13.5, weight: .semibold)
+    static let subheadline = Font.system(size: 12, weight: .regular)
+    static let subheadlineMedium = Font.system(size: 12, weight: .medium)
+    static let footnote = Font.system(size: 11.5, weight: .regular)
+    static let footnoteMedium = Font.system(size: 11.5, weight: .medium)
+    static let mono = Font.system(size: 12, design: .monospaced)
+    static let monoSmall = Font.system(size: 11.5, design: .monospaced)
+
+    // Menu bar popover scale (+1–1.5pt over previous cramped 10–11pt sizing)
+    static let popoverTitle = Font.system(size: 14.5, weight: .semibold)
+    static let popoverBody = Font.system(size: 13, weight: .regular)
+    static let popoverBodyMedium = Font.system(size: 13, weight: .medium)
+    static let popoverSub = Font.system(size: 12, weight: .regular)
+    static let popoverSubMedium = Font.system(size: 12, weight: .medium)
+    static let popoverCaption = Font.system(size: 11, weight: .regular)
+    static let popoverCaptionMedium = Font.system(size: 11, weight: .medium)
+}
 
 enum ColabTheme {
     static let amber = Color(red: 0.96, green: 0.65, blue: 0.14)
@@ -79,23 +105,76 @@ enum Formatters {
 // MARK: - Refined macOS Surfaces
 
 extension View {
-    /// Warm, tactile macOS HUD card surface with 14pt continuous corners and crisp hairline rim.
+    /// Tactile macOS HUD / Bento card surface with continuous corners and subtle hairline rim.
     func hudCard(cornerRadius: CGFloat = 14) -> some View {
         self
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .background(Color.primary.opacity(0.052), in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.095), lineWidth: 0.6)
+                    .strokeBorder(Color.primary.opacity(0.095), lineWidth: 0.65)
+            )
+    }
+
+    func bentoCard(cornerRadius: CGFloat = 16) -> some View {
+        self
+            .background(Color.primary.opacity(0.052), in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.095), lineWidth: 0.7)
             )
     }
 
     func hudPill() -> some View {
         self
-            .font(.system(size: 11, weight: .medium))
+            .font(ColabTypography.popoverCaptionMedium)
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3.5)
-            .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .padding(.horizontal, 8.5)
+            .padding(.vertical, 4)
+            .background(Color.primary.opacity(0.068), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+    }
+}
+
+// MARK: - Shared App Icon Loader
+
+struct ColabAppIconView: View {
+    let size: CGFloat
+    var cornerRadius: CGFloat? = nil
+
+    var body: some View {
+        let radius = cornerRadius ?? (size * 0.24)
+        let iconImage: NSImage? = {
+            if let iconPath = Bundle.main.path(forResource: "AppIconPreview", ofType: "png"),
+               let img = NSImage(contentsOfFile: iconPath) {
+                return img
+            }
+            let devAsset = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("assets/AppIcon.png")
+            if let img = NSImage(contentsOfFile: devAsset.path) {
+                return img
+            }
+            return nil
+        }()
+
+        if let img = iconImage {
+            Image(nsImage: img)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        } else {
+            ZStack {
+                LinearGradient(
+                    colors: [ColabTheme.amber, Color(red: 0.92, green: 0.44, blue: 0.12)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                Image(systemName: "cpu.fill")
+                    .font(.system(size: size * 0.48, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        }
     }
 }
 
@@ -104,10 +183,10 @@ extension View {
 struct BigMetricValue: View {
     let number: String
     let unit: String
-    var fontSize: CGFloat = 24
+    var fontSize: CGFloat = 26
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 3) {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
             Text(number)
                 .font(.system(size: fontSize, weight: .semibold, design: .rounded))
                 .monospacedDigit()
@@ -116,7 +195,7 @@ struct BigMetricValue: View {
                 .minimumScaleFactor(0.75)
             if !unit.isEmpty {
                 Text(unit)
-                    .font(.system(size: max(11, fontSize * 0.5), weight: .medium))
+                    .font(.system(size: max(12, fontSize * 0.48), weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -132,44 +211,46 @@ struct CardBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 10.5, weight: .medium))
+            .font(ColabTypography.footnoteMedium)
             .monospacedDigit()
             .foregroundStyle(tint ?? .secondary)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2.5)
-            .background((tint ?? Color.primary).opacity(tint == nil ? 0.065 : 0.14), in: RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background((tint ?? Color.primary).opacity(tint == nil ? 0.068 : 0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 
-// MARK: - Micro Visualizations (Refined & Subtle, Zero Visual Clutter)
+// MARK: - Micro Visualizations (Mole-Inspired Warm Clarity)
 
-/// Glowing horizon line progress bar (inspired by refined system memory cards).
+/// Glowing horizon line progress bar (inspired by Mole memory card).
 struct HorizonBar: View {
     let progress: Double
     let tint: Color
+    var height: CGFloat = 7
 
     var body: some View {
         GeometryReader { geo in
             let clamped = min(1.0, max(0.0, progress))
-            let w = max(clamped > 0 ? 6 : 0, geo.size.width * clamped)
+            let w = max(clamped > 0 ? 8 : 0, geo.size.width * clamped)
             ZStack(alignment: .leading) {
                 Capsule()
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(height: 6)
+                    .fill(Color.primary.opacity(0.085))
+                    .frame(height: height)
                 Capsule()
                     .fill(
                         LinearGradient(
-                            colors: [tint.opacity(0.78), tint],
+                            colors: [tint.opacity(0.76), tint],
                             startPoint: .leading,
                             endPoint: .trailing
                         )
                     )
-                    .frame(width: w, height: 6)
-                    .shadow(color: tint.opacity(0.32), radius: 4, y: 1)
+                    .frame(width: w, height: height)
+                    .shadow(color: tint.opacity(0.32), radius: 5, y: 1)
             }
         }
-        .frame(height: 8)
+        .frame(height: height + 2)
     }
 }
 
@@ -178,20 +259,21 @@ struct MicroSegmentsBar: View {
     let progress: Double
     let tint: Color
     var segments: Int = 10
+    var maxHeight: CGFloat = 20
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 3.5) {
+        HStack(alignment: .bottom, spacing: 4) {
             ForEach(0..<segments, id: \.self) { idx in
                 let threshold = Double(idx + 1) / Double(segments)
                 let filled = progress >= threshold - 0.05
                 let heightRatio = 0.42 + 0.58 * (Double(idx + 1) / Double(segments))
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(filled ? tint.opacity(0.9) : Color.primary.opacity(0.09))
+                RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                    .fill(filled ? tint.opacity(0.92) : Color.primary.opacity(0.09))
                     .frame(maxWidth: .infinity)
-                    .frame(height: 16 * (filled ? heightRatio : 0.32))
+                    .frame(height: maxHeight * (filled ? heightRatio : 0.32))
             }
         }
-        .frame(height: 18, alignment: .bottom)
+        .frame(height: maxHeight + 2, alignment: .bottom)
     }
 }
 
@@ -199,6 +281,7 @@ struct MicroSegmentsBar: View {
 struct MicroSparkline: View {
     let points: [Double]
     let tint: Color
+    var chartHeight: CGFloat = 24
 
     var body: some View {
         GeometryReader { geo in
@@ -227,15 +310,154 @@ struct MicroSparkline: View {
             ZStack {
                 fillPath.fill(
                     LinearGradient(
-                        colors: [tint.opacity(0.22), tint.opacity(0.0)],
+                        colors: [tint.opacity(0.24), tint.opacity(0.0)],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 )
-                path.stroke(tint.opacity(0.92), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                path.stroke(tint.opacity(0.92), style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
             }
         }
-        .frame(height: 20)
+        .frame(height: chartHeight)
+    }
+}
+
+/// Compact circular progress ring (inspired by Mole battery card).
+struct RingGauge: View {
+    let progress: Double
+    let tint: Color
+    let icon: String
+    var size: CGFloat = 44
+
+    var body: some View {
+        let clamped = min(1.0, max(0.0, progress))
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.10), lineWidth: 4.5)
+            Circle()
+                .trim(from: 0, to: clamped)
+                .stroke(tint, style: StrokeStyle(lineWidth: 4.5, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            Image(systemName: icon)
+                .font(.system(size: size * 0.34, weight: .semibold))
+                .foregroundStyle(tint)
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// Restrained warm status orb for the hero health/CU Bento card.
+struct StatusAuraOrb: View {
+    let phase: InstancePhase
+    var size: CGFloat = 48
+
+    private var orbColors: [Color] {
+        switch phase {
+        case .running:
+            return [ColabTheme.emerald.opacity(0.95), ColabTheme.cyan.opacity(0.75)]
+        case .queuing, .starting, .stopping:
+            return [ColabTheme.amber, Color(red: 0.92, green: 0.45, blue: 0.14)]
+        case .error:
+            return [ColabTheme.coral, Color(red: 0.80, green: 0.22, blue: 0.28)]
+        case .offline:
+            return [Color.primary.opacity(0.24), Color.primary.opacity(0.10)]
+        }
+    }
+
+    private var symbolName: String {
+        switch phase {
+        case .running: return "bolt.fill"
+        case .queuing: return "clock.arrow.circlepath"
+        case .starting, .stopping: return "arrow.triangle.2.circlepath"
+        case .error: return "exclamationmark"
+        case .offline: return "moon.fill"
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    RadialGradient(
+                        colors: [orbColors[0].opacity(0.32), orbColors[1].opacity(0.0)],
+                        center: .center,
+                        startRadius: size * 0.15,
+                        endRadius: size * 0.65
+                    )
+                )
+                .frame(width: size * 1.25, height: size * 1.25)
+
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: orbColors,
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .frame(width: size, height: size)
+                .overlay(
+                    Circle().strokeBorder(.white.opacity(0.22), lineWidth: 0.8)
+                )
+                .shadow(color: orbColors[0].opacity(0.28), radius: 8, y: 2)
+
+            Image(systemName: symbolName)
+                .font(.system(size: size * 0.40, weight: .semibold))
+                .foregroundStyle(phase == .offline ? Color.primary.opacity(0.65) : .white)
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// Mole-inspired floating centered pill navigation bar for the main desktop window.
+struct FloatingCapsuleNavBar: View {
+    @Binding var selection: WorkspaceStore.MainSection
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ColabAppIconView(size: 28, cornerRadius: 14)
+                .padding(.leading, 4)
+                .padding(.trailing, 4)
+
+            ForEach(WorkspaceStore.MainSection.allCases) { sec in
+                let isSelected = selection == sec
+                Button {
+                    withAnimation(.snappy(duration: 0.18)) {
+                        selection = sec
+                    }
+                } label: {
+                    Text(sec.rawValue)
+                        .font(.system(size: 13.5, weight: isSelected ? .semibold : .medium))
+                        .foregroundStyle(
+                            isSelected
+                                ? (colorScheme == .dark ? Color(red: 0.12, green: 0.11, blue: 0.10) : Color.white)
+                                : Color.primary.opacity(0.76)
+                        )
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 7)
+                        .background {
+                            if isSelected {
+                                Capsule()
+                                    .fill(colorScheme == .dark ? Color.white.opacity(0.95) : Color(red: 0.16, green: 0.17, blue: 0.20))
+                                    .shadow(color: .black.opacity(0.14), radius: 4, y: 1)
+                            }
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 5)
+        .background(
+            Capsule()
+                .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.06))
+        )
+        .overlay(
+            Capsule()
+                .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.7)
+        )
     }
 }
 
@@ -249,12 +471,12 @@ struct TileHeader: View {
     var badgeTint: Color? = nil
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 6) {
             Image(systemName: icon)
-                .font(.system(size: 11.5, weight: .medium))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(iconTint)
             Text(title)
-                .font(.system(size: 12, weight: .medium))
+                .font(ColabTypography.popoverSubMedium)
                 .foregroundStyle(.secondary)
             Spacer()
             if !badgeText.isEmpty {
@@ -273,26 +495,26 @@ struct QuickActionButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Image(systemName: icon)
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(.system(size: 12, weight: .medium))
                 Text(title)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 7)
-            .padding(.horizontal, 4)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 6)
             .background(
-                active ? ColabTheme.amber.opacity(0.16) : Color.primary.opacity(disabled ? 0.025 : 0.06),
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                active ? ColabTheme.amber.opacity(0.17) : Color.primary.opacity(disabled ? 0.04 : 0.065),
+                in: RoundedRectangle(cornerRadius: 8.5, style: .continuous)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(active ? ColabTheme.amber.opacity(0.45) : Color.primary.opacity(disabled ? 0.04 : 0.1), lineWidth: 0.5)
+                RoundedRectangle(cornerRadius: 8.5, style: .continuous)
+                    .strokeBorder(active ? ColabTheme.amber.opacity(0.45) : Color.primary.opacity(disabled ? 0.08 : 0.11), lineWidth: 0.6)
             )
-            .foregroundStyle(disabled ? .tertiary : .primary)
+            .foregroundStyle(disabled ? Color.secondary.opacity(0.75) : Color.primary)
         }
         .buttonStyle(.plain)
         .disabled(disabled)

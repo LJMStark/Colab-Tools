@@ -11,12 +11,12 @@ private struct PanelContentHeightKey: PreferenceKey {
 }
 
 struct RootPopoverView: View {
-    static let panelWidth: CGFloat = 396
+    static let panelWidth: CGFloat = 420
 
     @ObservedObject var store: WorkspaceStore
     var isPreviewMode: Bool = false
 
-    @State private var measuredContentHeight: CGFloat = 710
+    @State private var measuredContentHeight: CGFloat = 760
 
     private var maxScrollHeight: CGFloat {
         let visibleH = NSScreen.main?.visibleFrame.height ?? 920
@@ -80,17 +80,17 @@ struct RootPopoverView: View {
             }
 
             if let toast = store.toastMessage {
-                HStack(spacing: 6) {
+                HStack(spacing: 7) {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 13))
                         .foregroundStyle(ColabTheme.emerald)
                     Text(toast)
-                        .font(.system(size: 11.5))
+                        .font(ColabTypography.popoverSubMedium)
                         .lineLimit(1)
                     Spacer()
                 }
                 .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+                .padding(.vertical, 9)
                 .background(.ultraThinMaterial)
                 .overlay(alignment: .top) { Divider().opacity(0.35) }
                 .transition(.opacity)
@@ -112,13 +112,13 @@ struct RootPopoverView: View {
 
     // MARK: - Header
     private var headerBar: some View {
-        HStack(spacing: 7) {
-            HStack(spacing: 6) {
+        HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 Circle()
                     .fill(globalDotColor)
-                    .frame(width: 8, height: 8)
+                    .frame(width: 8.5, height: 8.5)
                 Text("Colab Tools")
-                    .font(.system(size: 13.5, weight: .semibold))
+                    .font(ColabTypography.popoverTitle)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
                 headerStatusPill
@@ -126,7 +126,16 @@ struct RootPopoverView: View {
 
             Spacer(minLength: 4)
 
-            HStack(spacing: 11) {
+            HStack(spacing: 12) {
+                Button {
+                    store.openMainWindow(section: .status, onboarding: false)
+                } label: {
+                    Image(systemName: "macwindow")
+                        .font(.system(size: 13.5, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .help("打开大屏主控制台 (⌘0)")
+
                 Button {
                     if store.showingAddAccount {
                         withAnimation(.snappy(duration: 0.18)) { store.showingAddAccount = false }
@@ -135,7 +144,7 @@ struct RootPopoverView: View {
                     }
                 } label: {
                     Image(systemName: store.showingAddAccount ? "xmark" : "person.badge.plus")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 13.5, weight: .medium))
                 }
                 .buttonStyle(.borderless)
                 .help("添加新的 Colab 订阅账号")
@@ -150,23 +159,23 @@ struct RootPopoverView: View {
                     }
                 } label: {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 13.5, weight: .medium))
                 }
                 .buttonStyle(.borderless)
                 .help("立即同步官方 CLI 状态（5 秒防抖）")
 
                 Button {
-                    store.openSettings(section: .general)
+                    store.openMainWindow(section: .settings, onboarding: false)
                 } label: {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 13.5, weight: .medium))
                 }
                 .buttonStyle(.borderless)
-                .help("打开独立偏好设置窗口 (⌘,)")
+                .help("打开偏好设置 (⌘,)")
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
     }
 
     private var globalDotColor: Color {
@@ -190,22 +199,22 @@ struct RootPopoverView: View {
         }.first
         if let q = queuingItem, running.isEmpty {
             Text("排队 \(q.0)/\(q.1)")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .monospacedDigit()
                 .foregroundStyle(ColabTheme.amber)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 6.5)
-                .padding(.vertical, 2)
+                .padding(.horizontal, 7.5)
+                .padding(.vertical, 2.5)
                 .background(ColabTheme.amber.opacity(0.14), in: Capsule())
         } else if running.count >= 2 {
             Text("\(running.count) 运行中")
-                .font(.system(size: 10, weight: .medium))
+                .font(ColabTypography.popoverCaptionMedium)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 6.5)
-                .padding(.vertical, 2)
+                .padding(.horizontal, 7.5)
+                .padding(.vertical, 2.5)
                 .background(Color.primary.opacity(0.07), in: Capsule())
         } else if let first = running.first {
             let effectiveKind = first.0.workloadKind == .general ? (first.1.detectedWorkloadKind ?? .general) : first.0.workloadKind
@@ -216,24 +225,24 @@ struct RootPopoverView: View {
                 return "\(first.1.shortGPUName) · \(effectiveKind.shortBadge)"
             }()
             Text(label)
-                .font(.system(size: 10, weight: .medium))
+                .font(ColabTypography.popoverCaptionMedium)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 6.5)
-                .padding(.vertical, 2)
+                .padding(.horizontal, 7.5)
+                .padding(.vertical, 2.5)
                 .background(Color.primary.opacity(0.07), in: Capsule())
         } else if let acc = store.selectedAccount {
             let bal = store.state(for: acc.id).cuBalance
             Text("\(Formatters.cu(bal)) CU")
-                .font(.system(size: 10, weight: .medium))
+                .font(ColabTypography.popoverCaptionMedium)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 6.5)
-                .padding(.vertical, 2)
+                .padding(.horizontal, 7.5)
+                .padding(.vertical, 2.5)
                 .background(Color.primary.opacity(0.06), in: Capsule())
         }
     }
@@ -241,22 +250,22 @@ struct RootPopoverView: View {
     // MARK: - Multi-Account Pill Switcher (Hidden when single account for clean minimalism)
     private var multiAccountRail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 5) {
+            HStack(spacing: 6) {
                 Button {
                     withAnimation(.snappy(duration: 0.18)) {
                         store.selectedViewMode = .overview
                     }
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: "square.grid.2x2")
-                            .font(.system(size: 10))
+                            .font(.system(size: 11))
                         Text("总览")
-                            .font(.system(size: 11, weight: store.selectedViewMode == .overview ? .semibold : .regular))
+                            .font(.system(size: 12, weight: store.selectedViewMode == .overview ? .semibold : .regular))
                     }
-                    .padding(.horizontal, 7.5)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
                     .background(
-                        store.selectedViewMode == .overview ? Color.primary.opacity(0.13) : Color.primary.opacity(0.04),
+                        store.selectedViewMode == .overview ? Color.primary.opacity(0.13) : Color.primary.opacity(0.045),
                         in: Capsule()
                     )
                 }
@@ -271,22 +280,22 @@ struct RootPopoverView: View {
                             store.selectedViewMode = .singleAccount
                         }
                     } label: {
-                        HStack(spacing: 4.5) {
+                        HStack(spacing: 5) {
                             Circle()
                                 .fill(st.phase.isRunning ? Color(nsColor: .systemGreen) : ColabTheme.color(for: acc.colorTag))
-                                .frame(width: 6.5, height: 6.5)
+                                .frame(width: 7, height: 7)
                             Text(acc.displayName)
-                                .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
                                 .lineLimit(1)
                             Text("\(Formatters.cu(st.cuBalance))")
-                                .font(.system(size: 10))
+                                .font(ColabTypography.popoverCaption)
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        .padding(.horizontal, 7.5)
-                        .padding(.vertical, 4)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
                         .background(
-                            isSelected ? Color.primary.opacity(0.13) : Color.primary.opacity(0.04),
+                            isSelected ? Color.primary.opacity(0.13) : Color.primary.opacity(0.045),
                             in: Capsule()
                         )
                     }
@@ -294,89 +303,105 @@ struct RootPopoverView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 7)
+            .padding(.vertical, 8)
         }
     }
 
     // MARK: - Onboarding / Empty States
     private var missingCLICard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("未检测到官方 google-colab-cli", systemImage: "exclamationmark.triangle")
-                .font(.system(size: 12.5, weight: .semibold))
-            Text("Colab Tools 100% 基于 Google 官方 CLI 工作。请先在终端安装：")
-                .font(.system(size: 11))
+        VStack(alignment: .leading, spacing: 10) {
+            Label("未检测到官方 google-colab-cli", systemImage: "exclamationmark.triangle.fill")
+                .font(ColabTypography.sectionTitle)
+                .foregroundStyle(ColabTheme.amber)
+            Text("Colab Tools 基于 Google 官方 CLI 工作。点击下方按钮打开环境体检向导，可一键为你自动安装并绑定账号。")
+                .font(ColabTypography.popoverSub)
                 .foregroundStyle(.secondary)
-            Text("uv tool install google-colab-cli")
-                .font(.system(size: 11, design: .monospaced))
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
-            Button("复制安装命令") {
-                store.copyToClipboard("uv tool install google-colab-cli", label: "安装命令")
+            HStack(spacing: 8) {
+                Button("打开一键安装向导") {
+                    store.reopenOnboarding()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ColabTheme.amber)
+
+                Button("复制安装命令") {
+                    store.copyToClipboard(store.envReport.recommendedMethod.manualShellCommand, label: "安装命令")
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
         }
-        .padding(14)
+        .padding(16)
         .hudCard()
     }
 
     private var emptyAccountOnboardingCard: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
             Image(systemName: "person.crop.circle.badge.plus")
-                .font(.system(size: 30, weight: .light))
+                .font(.system(size: 32, weight: .light))
                 .foregroundStyle(.secondary)
             Text("尚未绑定 Google Colab 账号")
-                .font(.system(size: 13.5, weight: .semibold))
-            Text("点击下方按钮通过官方 Google OAuth2 完成授权，即可实时查看点数、一键启停 GPU/TPU 并开启自动空闲关机。")
-                .font(.system(size: 11.5))
+                .font(.system(size: 15, weight: .semibold))
+            Text("通过官方 Google OAuth2 完成授权，即可实时查看点数、一键启停 GPU/TPU 并开启自动空闲关机。")
+                .font(ColabTypography.popoverSub)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("绑定第一个账号") {
-                store.openAddAccountFlow()
+            HStack(spacing: 8) {
+                Button("打开开箱引导") {
+                    store.reopenOnboarding()
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("直接绑定账号") {
+                    store.openAddAccountFlow()
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
         }
         .frame(maxWidth: .infinity)
-        .padding(18)
+        .padding(20)
         .hudCard()
     }
 
     // MARK: - Footer
     private var footerBar: some View {
-        HStack {
+        HStack(spacing: 8) {
             if let acc = store.selectedAccount, let ts = store.state(for: acc.id).lastUsageFetchAt {
                 Text("同步于 \(ts.formatted(date: .omitted, time: .standard))")
-                    .font(.system(size: 10))
+                    .font(ColabTypography.popoverCaption)
                     .monospacedDigit()
                     .foregroundStyle(.tertiary)
             } else {
-                Text("100% 官方 Colab CLI 驱动")
-                    .font(.system(size: 10))
+                Text("官方 Colab CLI 驱动")
+                    .font(ColabTypography.popoverCaption)
                     .foregroundStyle(.tertiary)
             }
             Spacer()
-            Button("偏好设置…") {
-                store.openSettings(section: .general)
+            Button("主控制台") {
+                store.openMainWindow(section: .status, onboarding: false)
             }
-            .font(.system(size: 11))
+            .font(ColabTypography.popoverSub)
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
 
-            Text("·")
-                .font(.system(size: 10))
-                .foregroundStyle(.quaternary)
+            Text("·").font(.system(size: 11)).foregroundStyle(.quaternary)
+
+            Button("设置…") {
+                store.openMainWindow(section: .settings, onboarding: false)
+            }
+            .font(ColabTypography.popoverSub)
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+
+            Text("·").font(.system(size: 11)).foregroundStyle(.quaternary)
 
             Button("退出") {
                 store.cleanup()
                 NSApplication.shared.terminate(nil)
             }
-            .font(.system(size: 11))
+            .font(ColabTypography.popoverSub)
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
     }
 }

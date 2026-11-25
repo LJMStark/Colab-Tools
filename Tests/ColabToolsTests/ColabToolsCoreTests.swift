@@ -789,4 +789,121 @@ final class ColabToolsCoreTests: XCTestCase {
         )
         XCTAssertTrue(secretEnv.contains("sk-real-secret-token"))
     }
+
+    func testEnvironmentDoctorMethodSelectionAndVersionParsing() {
+        XCTAssertEqual(
+            EnvironmentDoctor.chooseInstallMethod(uvPath: "/opt/homebrew/bin/uv", pipxPath: "/usr/local/bin/pipx", brewPath: "/opt/homebrew/bin/brew"),
+            .uvTool
+        )
+        XCTAssertEqual(
+            EnvironmentDoctor.chooseInstallMethod(uvPath: nil, pipxPath: "/opt/homebrew/bin/pipx", brewPath: "/opt/homebrew/bin/brew"),
+            .pipx
+        )
+        XCTAssertEqual(
+            EnvironmentDoctor.chooseInstallMethod(uvPath: nil, pipxPath: nil, brewPath: "/opt/homebrew/bin/brew"),
+            .homebrewThenUv
+        )
+        XCTAssertEqual(
+            EnvironmentDoctor.chooseInstallMethod(uvPath: nil, pipxPath: nil, brewPath: nil),
+            .officialUvScript
+        )
+        XCTAssertTrue(CLIInstallMethod.officialUvScript.requiresRemoteScriptConsent)
+        XCTAssertFalse(CLIInstallMethod.uvTool.requiresRemoteScriptConsent)
+
+        XCTAssertEqual(EnvironmentDoctor.parseVersionString(from: "Version: 0.8.0\n"), "0.8.0")
+        XCTAssertEqual(EnvironmentDoctor.parseVersionString(from: "google-colab-cli 0.8.2\n"), "0.8.2")
+        XCTAssertEqual(EnvironmentDoctor.parseVersionString(from: "colab version 0.8.1-beta1"), "0.8.1-beta1")
+        XCTAssertNil(EnvironmentDoctor.parseVersionString(from: "No such option: --version\n"))
+        XCTAssertNil(EnvironmentDoctor.parseVersionString(from: "   \n  "))
+    }
+
+    func testEnvironmentDoctorProcessGroupCancellationKillsChildTreeCleanly() async {
+        // Spawn a shell that forks a long-running background child holding stdout open;
+        // verify timeout cleanly kills the entire process group and returns promptly without hanging.
+        let started = Date()
+        let result = await EnvironmentDoctor.runCancellableProcessGroupCommand(
+            command: "sleep 30 & echo spawned; wait",
+            timeoutSeconds: 0.4,
+            onLine: { _ in }
+        )
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertTrue(result.timedOut)
+        XCTAssertLessThan(elapsed, 4.0, "Process-group cleanup must return promptly without waiting for child sleep 30")
+
+        // Also test explicit Swift Task cancellation kills descendant tree cleanly
+        let cancelStarted = Date()
+        let task = Task {
+            await EnvironmentDoctor.runCancellableProcessGroupCommand(
+                command: "sleep 30 & echo child_running; wait",
+                timeoutSeconds: 20,
+                onLine: { _ in }
+            )
+        }
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        task.cancel()
+        let cancelResult = await task.value
+        let cancelElapsed = Date().timeIntervalSince(cancelStarted)
+        XCTAssertEqual(cancelResult.exitCode, -2)
+        XCTAssertLessThan(cancelElapsed, 4.0, "Task cancellation must kill entire process group promptly")
+    }
+
+    func testLegacyAppSettingsOnboardingMigrationSkipsExistingAccountUsers() throws {
+        // Legacy config WITH accounts and WITHOUT hasCompletedOnboarding -> auto true
+        let withAccJSON = """
+        {
+          "accounts": [
+            {
+              "id": "33333333-3333-3333-3333-333333333333",
+              "displayName": "Existing",
+              "email": "old@example.com",
+              "colorTag": "#F59E0B",
+              "tier": "colab_pro",
+              "authMode": "system_oauth2",
+              "sessionName": "llm-coder",
+              "preferredAccelerator": "AUTO_PRO",
+              "highMem": false,
+              "enableLLMModule": false,
+              "autoShutdownEnabled": false,
+              "idleTimeoutMinutes": 40,
+              "warnBeforeMinutes": 2,
+              "driveScriptPath": "",
+              "autoSyncCCSwitch": false,
+              "ccSwitchProviderId": "id",
+              "ccSwitchProviderName": "name",
+              "localEnvPath": ""
+            }
+          ]
+        }
+        """
+        let existingSettings = try JSONDecoder().decode(AppSettings.self, from: Data(withAccJSON.utf8))
+        XCTAssertTrue(existingSettings.hasCompletedOnboarding)
+
+        // Fresh empty config WITHOUT hasCompletedOnboarding -> false (shows onboarding)
+        let emptySettings = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+        XCTAssertFalse(emptySettings.hasCompletedOnboarding)
+    }
+
+    func testOfflineEstimatedHoursUsesConfiguredTargetNotCPUFloor() {
+        var acc = AccountProfile(
+            displayName: "Ultra",
+            tier: .aiUltra,
+            preferredAccelerator: .autoBest
+        )
+        var rt = AccountRuntimeState()
+        rt.phase = .offline
+        rt.cuBalance = 2362.2
+
+        // Auto preset offline must use L4 baseline (2.33 CU/h -> ~1014h), never CPU 0.1 CU/h (23622h)
+        let autoEst = rt.estimatedHoursRemaining(for: acc)
+        XCTAssertNotNil(autoEst)
+        XCTAssertEqual(autoEst?.basisLabel, "L4")
+        XCTAssertEqual(Int((autoEst?.hours ?? 0).rounded()), 1014)
+
+        // When polite queue targets G4 first, offline estimate uses G4 (7.0 CU/h -> ~337h)
+        acc.enablePoliteQueue = true
+        acc.queueTargets = [.g4, .h100]
+        let queueEst = rt.estimatedHoursRemaining(for: acc)
+        XCTAssertEqual(queueEst?.basisLabel, "G4")
+        XCTAssertEqual(Int((queueEst?.hours ?? 0).rounded()), 337)
+    }
 }

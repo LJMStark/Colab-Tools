@@ -4,9 +4,9 @@
 
 # Colab Tools
 
-**面向 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣**
+**面向 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 控制台与菜单栏伴侣**
 
-实时监控多订阅 Compute Units 点数 · 可视化合规抢卡、两阶段降级与错峰预约 · 独立原生 macOS 设置窗口 · 全生态 AI 客户端无缝接入
+Mole 式大屏 Bento 实时仪表盘 · 开箱环境体检与一键安装官方 CLI · 可视化抢卡与错峰预约 · 全生态 AI 客户端无缝接入
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [下载最新版](https://github.com/LJMStark/Colab-Tools/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](SECURITY.md)
 
@@ -21,23 +21,29 @@
 
 <table>
   <tr>
+    <td align="center" colspan="2">
+      <img src="docs/images/preview-main-status.png" alt="Colab Tools 大屏主控制台状态页" width="840" /><br />
+      <sub><b>Mole 式大屏主控制台（<code>⌘0</code>）</b> · 顶部悬浮胶囊导航 + 4×2 Bento 算力状态卡片 + 底部多账号活跃会话总览</sub>
+    </td>
+  </tr>
+  <tr>
     <td align="center" width="50%">
-      <img src="docs/images/preview-dashboard.png" alt="Colab Tools 单账号监控 HUD" width="360" /><br />
-      <sub><b>半精简菜单栏 HUD</b> · 显存/GPU 微图表、策略摘要与 <code>⚙</code> 直达设置窗</sub>
+      <img src="docs/images/preview-onboarding.png" alt="开箱环境体检与一键安装引导" width="420" /><br />
+      <sub><b>开箱环境体检与一键装 CLI</b> · 自动检测 <code>google-colab-cli</code> / <code>uv</code> / <code>pipx</code> / <code>brew</code>，实时日志安装并引导绑号</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-multi-account.png" alt="Colab Tools 多账号并行总览" width="360" /><br />
-      <sub><b>多账号并行总览</b> · 独立钥匙串隔离、聚合点数统计与一键全停止损</sub>
+      <img src="docs/images/preview-settings-integrations.png" alt="全生态接入工具中心" width="420" /><br />
+      <sub><b>接入工具中心</b> · 自动探测 CC Switch / OpenCode / Codex CLI / Claude Code + 双协议一键复制</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
       <img src="docs/images/preview-settings-queue.png" alt="算力与抢卡工作台" width="420" /><br />
-      <sub><b>算力与抢卡工作台（<code>⌘,</code>）</b> · 可视化顺位排序、两阶段保底降级、错峰预约与本机热力图</sub>
+      <sub><b>算力与抢卡工作台</b> · 可视化顺位排序、两阶段保底降级、错峰预约与本机热力图</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-settings-integrations.png" alt="全生态接入工具中心" width="420" /><br />
-      <sub><b>接入工具中心</b> · 自动探测 CC Switch / OpenCode / Codex CLI / Claude Code + 双协议一键复制</sub>
+      <img src="docs/images/preview-dashboard.png" alt="Colab Tools 菜单栏 HUD" width="320" /><br />
+      <sub><b>常驻菜单栏伴侣 HUD（420pt）</b> · 关掉大窗即回归顶部静默常驻，随时查看微图表与一键止损</sub>
     </td>
   </tr>
 </table>
@@ -50,11 +56,12 @@
 
 | 模块 | 能力说明 |
 | :--- | :--- |
-| **独立原生设置 App + 精简 HUD** | 纯原生 Swift 6 + SwiftUI + AppKit（`~2.5 MB`，不占 Dock）。菜单栏弹窗只留高频状态与启停，低频复杂配置全部迁入标准 macOS 左侧边栏设置窗口（`⌘,`），支持开机自启、普通项说人话、极客项藏进「高级」。 |
+| **大屏主控制台 + 菜单栏双形态** | 纯原生 Swift 6 + SwiftUI + AppKit（`~2.5 MB`，零 Electron）。打开大屏主窗（`⌘0` / `⌘1–⌘5`）自动呈现 Mole 式居中悬浮胶囊导航与 4×2 Bento 状态卡片（打开时自动现身 Dock 便于 `⌘Tab`，关闭即恢复静默菜单栏常驻）；全量遵循 Apple macOS HIG + 中文舒适字号规范（正文 `13–13.5pt`）。 |
+| **开箱体检与一键装 `google-colab-cli`** | 首次启动自动检测官方 `google-colab-cli`、本机包管理器（`uv` / `pipx` / `Homebrew`）与 Google 授权状态；缺环境时提供透明、可取消、带实时输出日志的一键自动安装及手动命令复制，并引导 3 步完成账号绑定与上手。 |
 | **可视化抢卡、两阶段降级与错峰预约** | 2 列硬件卡片自由勾选与 `↑/↓` 调序（`G4 / H100 / A100 / L4 / T4 / TPU v6e / v5e`）；支持**前 N 轮专冲高配卡、第 N+1 轮起加入保底卡**；支持**清晨低峰单次/每日定时预约**与纯本地 **6 时段命中率热力图**；底层严守单层重试、Equal Jitter 低频间隔（上限 5 轮 / 40 分钟）与 `412/429` 自动硬熔断。 |
 | **全生态客户端接入中心** | 自动探测本机已安装工具并置顶。原生安全写入（写前自动备份、绝不改官方默认、OpenCode/Codex 不写明文 Key）：**[CC Switch](https://github.com/farion1231/cc-switch)**、**OpenCode**（`opencode.json`）与 **Codex CLI**（`config.toml`）；一键安全拉起 **Claude Code**；并为 Cherry Studio、Cline、Roo Code、Cursor、Claude Code Router、`ccm` 等提供 **OpenAI (`/v1`) + Anthropic 双协议一键复制**。 |
 | **全模态负载与双低载防误杀** | 覆盖 `LLM 大模型`、`视频生成`、`图像生成`、`音频语音`、`音乐生成`、`训练通用` 六类场景；自动探测 `/tmp/colab-tools-status.json` 与 ComfyUI `:8188/queue`，支持动态端口 SSH 隧道；空闲关机优先读应用信号，兜底需同时满足 **`GPU < 5%` 且 `CPU < 25%`**，下载权重或转码绝不误关。 |
-| **多账号隔离与停机二次核验** | 单账号清爽无干扰，2+ 账号自动展开横向切换与「并行总览」，标注外部/孤儿 `[?]` 幽灵计费会话；`colab stop` 后独立复查服务端确认释放，避免漏关计费。 |
+| **多账号隔离与停机二次核验** | 单账号清爽无干扰，2+ 账号在菜单栏与主控制台同步展示多账号聚合视图，标注外部/孤儿 `[?]` 幽灵计费会话；`colab stop` 后独立复查服务端确认释放，避免漏关计费。 |
 
 ---
 
@@ -62,15 +69,15 @@
 
 ### 前提条件
 - **系统与架构**：macOS 14.0+（预编译 Release 为 Apple Silicon `arm64`，Intel Mac 请从源码编译）
-- **官方 Google Colab CLI**（已测试 `0.8.x`）：
+- **官方 Google Colab CLI**（已测试 `0.8.x` — **首次打开 Colab Tools 会自动检测并支持一键引导安装**，也可手动执行）：
   ```bash
   uv tool install google-colab-cli
   colab --auth=oauth2 whoami
   ```
 
 ### 方式一：直接下载预编译包
-1. 前往 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 `Colab-Tools-v0.3.5-macOS-arm64.zip`。
-2. 解压后将 **`Colab Tools.app`** 拖入 `/Applications` 并打开（首次启动会自动识别你已登录的官方 `colab` CLI 账号）。
+1. 前往 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 `Colab-Tools-v0.3.6-macOS-arm64.zip`。
+2. 解压后将 **`Colab Tools.app`** 拖入 `/Applications` 并打开（首次启动会自动体检环境，缺 `colab` CLI 可在界面一键安装，已有登录账号自动识别）。
 
 > 若 macOS Gatekeeper 提示未公证，右键应用选择「打开」，或执行 `xattr -cr "/Applications/Colab Tools.app"`。
 

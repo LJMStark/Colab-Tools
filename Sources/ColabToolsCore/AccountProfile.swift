@@ -366,6 +366,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var backgroundRefreshSeconds: Int = 180
     public var lowBalanceWarningCU: Double = 20.0
     public var enableNotifications: Bool = true
+    /// Tracks whether the user has finished (or dismissed) the first-launch onboarding wizard.
+    public var hasCompletedOnboarding: Bool = false
     /// Persisted anti-abuse circuit-breaker cooldown deadlines keyed by account identity (survives app restarts).
     public var circuitBreakUntilByAccount: [String: Date] = [:]
 
@@ -383,6 +385,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
         backgroundRefreshSeconds = try c.decodeIfPresent(Int.self, forKey: .backgroundRefreshSeconds) ?? 180
         lowBalanceWarningCU = try c.decodeIfPresent(Double.self, forKey: .lowBalanceWarningCU) ?? 20.0
         enableNotifications = try c.decodeIfPresent(Bool.self, forKey: .enableNotifications) ?? true
+        // Existing users upgrading from earlier versions who already have accounts skip onboarding automatically
+        if let decodedOnboard = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) {
+            hasCompletedOnboarding = decodedOnboard
+        } else {
+            hasCompletedOnboarding = !accounts.isEmpty
+        }
         circuitBreakUntilByAccount = try c.decodeIfPresent([String: Date].self, forKey: .circuitBreakUntilByAccount) ?? [:]
     }
 
@@ -608,6 +616,43 @@ public struct AccountRuntimeState: Equatable, Sendable {
             : AcceleratorOption.estimatedHourlyCU(forHardware: gpuName.isEmpty ? activeHardware : gpuName)
         guard rate > 0 else { return nil }
         return cuBalance / rate
+    }
+
+    /// Smarter estimate that uses live runtime rate when running, and falls back to the account's
+    /// configured target GPU (or L4 baseline for auto presets) when offline so standby never divides by CPU 0.1 CU/h.
+    public func estimatedHoursRemaining(for account: AccountProfile) -> (hours: Double, basisLabel: String)? {
+        guard cuBalance > 0 else { return nil }
+        if phase.isRunning {
+            let liveRate = cuRatePerHour > 0
+                ? cuRatePerHour
+                : AcceleratorOption.estimatedHourlyCU(forHardware: gpuName.isEmpty ? activeHardware : gpuName)
+            guard liveRate > 0 else { return nil }
+            return (cuBalance / liveRate, shortGPUName)
+        }
+        let refOption: AcceleratorOption = {
+            if account.enablePoliteQueue,
+               let first = PoliteQueuePolicy.sanitizedTargets(selected: account.queueTargets, for: account.tier).first {
+                return first
+            }
+            return account.preferredAccelerator
+        }()
+        let basisHardware: String = {
+            switch refOption {
+            case .g4: return "G4"
+            case .h100: return "H100"
+            case .a100: return "A100"
+            case .l4: return "L4"
+            case .t4: return "T4"
+            case .tpuV6e1: return "TPU v6e"
+            case .tpuV5e1: return "TPU v5e"
+            case .cpu: return "CPU"
+            case .autoBest, .autoPro:
+                return account.tier == .free ? "T4" : "L4"
+            }
+        }()
+        let rate = AcceleratorOption.estimatedHourlyCU(forHardware: basisHardware)
+        guard rate > 0 else { return nil }
+        return (cuBalance / rate, basisHardware)
     }
 
     public func remainingCapSeconds(for tier: SubscriptionTier) -> Int {

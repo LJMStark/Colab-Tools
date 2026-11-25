@@ -17,7 +17,7 @@ struct ColabToolsEntry {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
-    private var settingsWindowController: SettingsWindowController?
+    private var mainWindowController: MainWindowController?
     private var store: WorkspaceStore?
     private var eventMonitor: Any?
 
@@ -30,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let s = WorkspaceStore()
         store = s
-        settingsWindowController = SettingsWindowController(store: s)
+        mainWindowController = MainWindowController(store: s)
         s.onStatusBarNeedsUpdate = { [weak self] in
             self?.updateStatusItem()
         }
@@ -38,8 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.onPopoverPinChanged = { [weak self] pinned in
             self?.popover?.behavior = pinned ? .applicationDefined : .transient
         }
-        s.onOpenSettingsWindow = { [weak self] section in
-            self?.openSettingsWindow(section: section)
+        s.onOpenMainWindow = { [weak self] section, onboarding in
+            self?.openMainWindow(section: section, onboarding: onboarding)
         }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -141,6 +141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         menu.addItem(.separator())
+        menu.addItem(withTitle: "打开主控制台…", action: #selector(menuOpenMainStatus), keyEquivalent: "0")
+        menu.addItem(withTitle: "环境体检与开箱向导…", action: #selector(menuOpenOnboarding), keyEquivalent: "")
         menu.addItem(withTitle: "偏好设置…", action: #selector(menuOpenSettings), keyEquivalent: ",")
         menu.addItem(withTitle: "管理订阅 / 购点 (colab pay)", action: #selector(menuPay), keyEquivalent: "")
         menu.addItem(withTitle: "退出 Colab Tools", action: #selector(menuQuit), keyEquivalent: "q")
@@ -188,13 +190,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         store.openColabInBrowser(accountId: acc.id)
     }
 
-    @objc private func menuOpenSettings() { openSettingsWindow(section: .general) }
+    @objc private func menuOpenMainStatus() { openMainWindow(section: .status, onboarding: false) }
+    @objc private func menuOpenCompute() { openMainWindow(section: .compute, onboarding: false) }
+    @objc private func menuOpenIntegrations() { openMainWindow(section: .integrations, onboarding: false) }
+    @objc private func menuOpenAccounts() { openMainWindow(section: .accounts, onboarding: false) }
+    @objc private func menuOpenSettings() { openMainWindow(section: .settings, onboarding: false) }
+    @objc private func menuOpenOnboarding() { store?.reopenOnboarding() }
     @objc private func menuPay() { store?.openPayPage() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
 
-    private func openSettingsWindow(section: WorkspaceStore.SettingsSection) {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            openMainWindow(section: .status, onboarding: false)
+        }
+        return true
+    }
+
+    private func openMainWindow(section: WorkspaceStore.MainSection, onboarding: Bool) {
         popover?.performClose(nil)
-        settingsWindowController?.show(section: section)
+        mainWindowController?.show(section: section, onboarding: onboarding)
     }
 
     private func setupMainMenu() {
@@ -203,6 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu(title: "Colab Tools")
+        let mainItem = NSMenuItem(title: "打开主控制台…", action: #selector(menuOpenMainStatus), keyEquivalent: "0")
+        mainItem.target = self
+        appMenu.addItem(mainItem)
         let prefsItem = NSMenuItem(title: "偏好设置…", action: #selector(menuOpenSettings), keyEquivalent: ",")
         prefsItem.target = self
         appMenu.addItem(prefsItem)
@@ -211,6 +228,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         quitItem.target = self
         appMenu.addItem(quitItem)
         appMenuItem.submenu = appMenu
+
+        let viewMenuItem = NSMenuItem()
+        mainMenu.addItem(viewMenuItem)
+        let viewMenu = NSMenu(title: "视图")
+        for (idx, item) in [
+            ("状态大屏", #selector(menuOpenMainStatus)),
+            ("算力与抢卡", #selector(menuOpenCompute)),
+            ("接入工具", #selector(menuOpenIntegrations)),
+            ("账号管理", #selector(menuOpenAccounts)),
+            ("设置", #selector(menuOpenSettings))
+        ].enumerated() {
+            let mi = NSMenuItem(title: item.0, action: item.1, keyEquivalent: "\(idx + 1)")
+            mi.target = self
+            viewMenu.addItem(mi)
+        }
+        viewMenuItem.submenu = viewMenu
 
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)

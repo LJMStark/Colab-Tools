@@ -3,6 +3,19 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.6] - 2026-11-25
+
+### Added
+- **Mole-Style Desktop Main Console (`⌘0` / `⌘1–⌘5` / `⌘,`)**: Upgraded the standalone Settings window into a full responsive macOS desktop console (`1160 × 760 pt`, min `980 × 660 pt`) with a centered floating capsule navigation bar (`Status`, `Compute & Queue`, `Integrations`, `Accounts`, `Settings`) and dynamic Dock visibility (appears in Dock while open for `⌘Tab`, automatically returns to quiet menu-bar-only accessory mode when closed).
+- **4×2 Bento Status Dashboard & Live Session Table**: At-a-glance status screen inside the main window featuring CU balance + status aura orb, 10-segment VRAM meter, GPU utilization sparkline, context/workload horizon bar, session runtime ring gauge (with smart target-GPU standby estimation), interactive `15m / 40m / 60m` idle watchdog selector, queue/schedule summary, one-click sync & quick actions, plus a bottom live table covering all accounts, active runtimes, extra-session billing warnings, and full-session stop-all.
+- **First-Launch Environment Doctor & 3-Step Onboarding Wizard (`EnvironmentDoctor`)**:
+  - Automatically checks `google-colab-cli` via official `colab version` (distinguishing healthy vs. broken binaries), local package managers (`uv`, `pipx`, `Homebrew`, `python3`), and Google Colab account authorization on first launch (silently skipped for upgraded users who already have bound accounts, and re-openable anytime under **Settings → Environment**).
+  - Supports transparent, cancellable one-click `google-colab-cli` installation (`uv tool install` → `pipx install` → `brew install` → explicit-consent official Astral `uv` installer) with POSIX process-group cleanup (`POSIX_SPAWN_SETPGROUP`), live log streaming, post-install verification, and a copy-command manual fallback.
+- **4 New Core Unit Test Suites (29/29 total passing)**: Added regression tests for `EnvironmentDoctor` package-manager selection, `colab version` parsing, POSIX process-group cancellation/timeout child-tree cleanup, target-GPU offline runtime estimation, and legacy `config.json` onboarding migration.
+
+### Changed
+- **Apple macOS HIG + CJK Typography Overhaul (`ColabTypography`)**: Systematically scaled up typography across the main console and menu bar popover to follow macOS HIG & Chinese legibility standards (`13–13.5pt` body, `14pt` section headers, `22pt` page titles, `12pt` captions, `>= 11pt` badge floor), restored native `.controlSize(.regular)` in the main window, and widened the menu bar companion popover to `420pt` with a top-bar button to expand the full desktop console.
+
 ## [0.3.5] - 2026-11-25
 
 ### Added

@@ -21,7 +21,15 @@ enum PreviewExporter {
         do {
             try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
-            // 1. Single-account streamlined menu bar popover showcase
+            // 1. Mole-style Main Desktop App: Status Bento Dashboard + Live Sessions Table
+            let mainStatusStore = makeMainDemoStore(section: .status)
+            try renderPanel(
+                MainAppView(store: mainStatusStore, isPreviewMode: true),
+                to: dirURL.appendingPathComponent("preview-main-status.png"),
+                dark: true
+            )
+
+            // 2. Single-account HIG streamlined menu bar popover showcase
             let singleStore = makeDemoStore(multiAccount: false)
             try renderPanel(
                 RootPopoverView(store: singleStore, isPreviewMode: true),
@@ -29,7 +37,7 @@ enum PreviewExporter {
                 dark: true
             )
 
-            // 2. Multi-account overview showcase
+            // 3. Multi-account overview popover showcase
             let multiStore = makeDemoStore(multiAccount: true)
             multiStore.selectedViewMode = .overview
             try renderPanel(
@@ -38,91 +46,58 @@ enum PreviewExporter {
                 dark: true
             )
 
-            // 3. Standalone Settings App: Compute & Queue Workbench showcase
-            let queueSettingsStore = makeSettingsDemoStore(section: .compute)
+            // 4. Main App: Compute & Queue Workbench showcase
+            let queueStore = makeMainDemoStore(section: .compute)
             try renderPanel(
-                SettingsAppView(store: queueSettingsStore, isPreviewMode: true),
+                MainAppView(store: queueStore, isPreviewMode: true),
                 to: dirURL.appendingPathComponent("preview-settings-queue.png"),
                 dark: true
             )
 
-            // 4. Standalone Settings App: Integrations Hub showcase
-            let integrationsStore = makeSettingsDemoStore(section: .integrations)
+            // 5. Main App: Multi-Client Integrations Hub showcase
+            let integrationsStore = makeMainDemoStore(section: .integrations)
             try renderPanel(
-                SettingsAppView(store: integrationsStore, isPreviewMode: true),
+                MainAppView(store: integrationsStore, isPreviewMode: true),
                 to: dirURL.appendingPathComponent("preview-settings-integrations.png"),
                 dark: true
             )
 
-            // 5. Optional extra visual QA checks (Light & Dark across popover and all settings tabs)
+            // 6. First-Launch Onboarding & Environment Doctor showcase
+            let onboardStore = makeOnboardingDemoStore()
+            try renderPanel(
+                MainAppView(store: onboardStore, isPreviewMode: true),
+                to: dirURL.appendingPathComponent("preview-onboarding.png"),
+                dark: true
+            )
+
+            // Optional QA suite (Light mode + Settings Doctor)
             if let qaDir = ProcessInfo.processInfo.environment["COLABTOOLS_RENDER_QA"], !qaDir.isEmpty {
                 let qaURL = URL(fileURLWithPath: qaDir, isDirectory: true)
                 try FileManager.default.createDirectory(at: qaURL, withIntermediateDirectories: true)
 
-                let lightDashStore = makeDemoStore(multiAccount: false)
                 try renderPanel(
-                    RootPopoverView(store: lightDashStore, isPreviewMode: false),
+                    MainAppView(store: makeMainDemoStore(section: .status), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-main-status-light.png"),
+                    dark: false
+                )
+                try renderPanel(
+                    MainAppView(store: makeOnboardingDemoStore(), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-onboarding-light.png"),
+                    dark: false
+                )
+                try renderPanel(
+                    MainAppView(store: makeMainDemoStore(section: .settings), isPreviewMode: true),
+                    to: qaURL.appendingPathComponent("qa-main-settings-dark.png"),
+                    dark: true
+                )
+                try renderPanel(
+                    RootPopoverView(store: makeDemoStore(multiAccount: false), isPreviewMode: false),
                     to: qaURL.appendingPathComponent("qa-dashboard-light.png"),
                     dark: false
                 )
-
-                let queueStore = makeDemoStore(multiAccount: false)
-                if var acc = queueStore.settings.accounts.first {
-                    acc.enablePoliteQueue = true
-                    acc.queueTargets = [.g4, .h100]
-                    acc.queueFallbackEnabled = true
-                    acc.queueFallbackAfterRounds = 2
-                    acc.queueFallbackTarget = .l4
-                    acc.scheduledStartEnabled = true
-                    acc.scheduledStartHour = 7
-                    acc.scheduledStartMinute = 0
-                    queueStore.settings.accounts = [acc]
-                    var qst = queueStore.state(for: acc.id)
-                    qst.phase = .queuing(
-                        attempt: 2,
-                        maxAttempts: PoliteQueuePolicy.maxAttempts,
-                        nextRetryAt: Date().addingTimeInterval(258),
-                        targetsSummary: "G4 → H100"
-                    )
-                    qst.vramUsedMB = 0
-                    qst.vramTotalMB = 0
-                    qst.gpuUtilPercent = 0
-                    qst.serverHealthy = false
-                    qst.publicURL = ""
-                    qst.ccSwitchSynced = false
-                    qst.openCodeSynced = false
-                    qst.sessions = []
-                    queueStore.runtimeByAccount[acc.id] = qst
-                }
                 try renderPanel(
-                    RootPopoverView(store: queueStore, isPreviewMode: false),
-                    to: qaURL.appendingPathComponent("qa-queue-active-dark.png"),
-                    dark: true
-                )
-
-                try renderPanel(
-                    SettingsAppView(store: makeSettingsDemoStore(section: .compute), isPreviewMode: true),
-                    to: qaURL.appendingPathComponent("qa-settings-queue-light.png"),
-                    dark: false
-                )
-                try renderPanel(
-                    SettingsAppView(store: makeSettingsDemoStore(section: .integrations), isPreviewMode: true),
-                    to: qaURL.appendingPathComponent("qa-settings-integrations-light.png"),
-                    dark: false
-                )
-                try renderPanel(
-                    SettingsAppView(store: makeSettingsDemoStore(section: .general), isPreviewMode: true),
-                    to: qaURL.appendingPathComponent("qa-settings-general-dark.png"),
-                    dark: true
-                )
-                try renderPanel(
-                    SettingsAppView(store: makeSettingsDemoStore(section: .advanced), isPreviewMode: true),
-                    to: qaURL.appendingPathComponent("qa-settings-advanced-dark.png"),
-                    dark: true
-                )
-                try renderPanel(
-                    SettingsAppView(store: makeSettingsDemoStore(section: .about), isPreviewMode: true),
-                    to: qaURL.appendingPathComponent("qa-settings-about-dark.png"),
+                    MainAppView(store: makeNarrowIdleLongNameDemoStore(), isPreviewMode: true, previewWidth: 980),
+                    to: qaURL.appendingPathComponent("qa-main-status-narrow-idle.png"),
                     dark: true
                 )
             }
@@ -133,9 +108,71 @@ enum PreviewExporter {
         }
     }
 
-    private static func makeSettingsDemoStore(section: WorkspaceStore.SettingsSection) -> WorkspaceStore {
+    private static func makeOnboardingDemoStore() -> WorkspaceStore {
+        let store = WorkspaceStore(skipAutoBootstrap: true)
+        store.cliInstalled = false
+        store.showingOnboarding = true
+        store.envReport = EnvironmentCheckReport(
+            colabInstalled: false,
+            colabPath: nil,
+            colabVersion: nil,
+            uvPath: "/opt/homebrew/bin/uv",
+            pipxPath: nil,
+            brewPath: "/opt/homebrew/bin/brew",
+            python3Path: "/usr/bin/python3",
+            recommendedMethod: .uvTool
+        )
+        return store
+    }
+
+    /// Regression scenario mirroring a 980pt minimum-width window with an offline high-CU account and a long username.
+    private static func makeNarrowIdleLongNameDemoStore() -> WorkspaceStore {
+        let store = WorkspaceStore(skipAutoBootstrap: true)
+        store.cliInstalled = true
+        store.showingOnboarding = false
+        store.selectedMainSection = .status
+        let acc = AccountProfile(
+            displayName: "demolongusername9876",
+            email: "demolongusername9876@example.com",
+            colorTag: .amber,
+            tier: .aiUltra,
+            authMode: .systemDefaultOAuth2,
+            sessionName: "llm-coder",
+            preferredAccelerator: .autoBest,
+            highMem: false,
+            workloadKind: .llm,
+            enableLLMModule: true,
+            autoShutdownEnabled: true,
+            idleTimeoutMinutes: 40
+        )
+        var settings = AppSettings()
+        settings.accounts = [acc]
+        settings.selectedAccountId = acc.id
+        settings.hasCompletedOnboarding = true
+        store.settings = settings
+        var rt = AccountRuntimeState()
+        rt.phase = .offline
+        rt.cuBalance = 2362.2
+        rt.lastUsageFetchAt = Date()
+        store.runtimeByAccount[acc.id] = rt
+        return store
+    }
+
+    private static func makeMainDemoStore(section: WorkspaceStore.MainSection) -> WorkspaceStore {
         let store = makeDemoStore(multiAccount: true)
-        store.selectedSettingsSection = section
+        store.selectedMainSection = section
+        store.showingOnboarding = false
+        store.cliInstalled = true
+        store.envReport = EnvironmentCheckReport(
+            colabInstalled: true,
+            colabPath: "~/.local/bin/colab",
+            colabVersion: "0.8.2",
+            uvPath: "/opt/homebrew/bin/uv",
+            pipxPath: nil,
+            brewPath: "/opt/homebrew/bin/brew",
+            python3Path: "/usr/bin/python3",
+            recommendedMethod: .uvTool
+        )
         if var acc = store.settings.accounts.first {
             acc.enablePoliteQueue = true
             acc.queueTargets = [.g4, .h100]
@@ -151,14 +188,14 @@ enum PreviewExporter {
             acc.autoSyncCodex = false
             store.settings.accounts[0] = acc
             if var st = store.runtimeByAccount[acc.id] {
-                st.phase = .offline
-                st.ccSwitchSynced = true
-                st.openCodeSynced = true
-                // Keep a live demo publicURL on integrations showcase so Sync buttons look active
-                if section == .integrations {
+                if section == .compute {
+                    st.phase = .offline
+                } else {
                     st.phase = .running
                     st.publicURL = "https://demo-colab-node.trycloudflare.com"
                 }
+                st.ccSwitchSynced = true
+                st.openCodeSynced = true
                 store.runtimeByAccount[acc.id] = st
             }
         }
@@ -267,6 +304,7 @@ enum PreviewExporter {
                 authMode: .isolatedKeychainADC,
                 sessionName: "train-a100",
                 preferredAccelerator: .a100,
+                highMem: true,
                 enableLLMModule: false,
                 autoShutdownEnabled: false
             )
@@ -301,6 +339,7 @@ enum PreviewExporter {
             var st3 = AccountRuntimeState()
             st3.phase = .offline
             st3.cuBalance = 0
+            st3.lastUsageFetchAt = Date()
 
             store.settings.accounts.append(contentsOf: [acc2, acc3])
             store.runtimeByAccount[id2] = st2

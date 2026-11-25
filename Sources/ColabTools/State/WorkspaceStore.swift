@@ -15,13 +15,21 @@ public final class WorkspaceStore: ObservableObject {
     }
     @Published public var runtimeByAccount: [UUID: AccountRuntimeState] = [:]
     @Published public var selectedViewMode: WorkspaceViewMode = .singleAccount
-    @Published public var selectedSettingsSection: SettingsSection = .general
+    @Published public var selectedMainSection: MainSection = .status
+    @Published public var showingOnboarding: Bool = false
     @Published public var showingAddAccount: Bool = false {
         didSet {
             onPopoverPinChanged?(showingAddAccount)
         }
     }
     @Published public var cliInstalled: Bool = true
+    @Published public var envReport: EnvironmentCheckReport = EnvironmentCheckReport()
+    @Published public var isCheckingEnvironment: Bool = false
+    @Published public var isInstallingCLI: Bool = false
+    @Published public var isCancellingCLIInstall: Bool = false
+    @Published public var isImportingSystemAccount: Bool = false
+    @Published public var cliInstallLogs: [String] = []
+    @Published public var cliInstallError: String? = nil
     @Published public var clientDetection: ClientDetectionSnapshot = ClientDetectionSnapshot()
     @Published public var insights: AllocationInsights = AllocationInsights()
     @Published public var toastMessage: String? = nil
@@ -33,24 +41,22 @@ public final class WorkspaceStore: ObservableObject {
         case singleAccount
     }
 
-    public enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
-        case general = "通用"
-        case compute = "算力与抢卡"
+    public enum MainSection: String, CaseIterable, Identifiable, Hashable {
+        case status = "状态"
+        case compute = "算力抢卡"
         case integrations = "接入工具"
-        case accounts = "账号管理"
-        case advanced = "高级"
-        case about = "关于"
+        case accounts = "账号"
+        case settings = "设置"
 
         public var id: String { rawValue }
 
         public var iconName: String {
             switch self {
-            case .general: return "gearshape"
+            case .status: return "gauge.with.dots.needle.67percent"
             case .compute: return "cpu"
             case .integrations: return "puzzlepiece.extension"
             case .accounts: return "person.2"
-            case .advanced: return "slider.horizontal.3"
-            case .about: return "info.circle"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -62,7 +68,7 @@ public final class WorkspaceStore: ObservableObject {
 
     public var onStatusBarNeedsUpdate: (() -> Void)?
     public var onPopoverPinChanged: ((Bool) -> Void)?
-    public var onOpenSettingsWindow: ((SettingsSection) -> Void)?
+    public var onOpenMainWindow: ((MainSection, Bool) -> Void)?
 
     private var tickTimer: Timer?
     private var slotTimer: Timer?
@@ -77,6 +83,8 @@ public final class WorkspaceStore: ObservableObject {
     private var reminderBoundEndpoint: [UUID: String] = [:]
     private var refreshingAccounts: Set<UUID> = []
     private var toastTask: Task<Void, Never>?
+    private var cliInstallTask: Task<Void, Never>?
+    private var activeCLIInstallToken: UUID?
 
     private var persistSettingsChanges: Bool = true
 
@@ -147,6 +155,8 @@ public final class WorkspaceStore: ObservableObject {
         for (_, t) in postAllocateReminderTasks { t.cancel() }
         postAllocateReminderTasks.removeAll()
         reminderBoundEndpoint.removeAll()
+        cliInstallTask?.cancel()
+        cliInstallTask = nil
         activeQueueAccountId = nil
         activeQueueToken = nil
         for id in Array(sshTunnelProcesses.keys) {
@@ -154,7 +164,7 @@ public final class WorkspaceStore: ObservableObject {
         }
     }
 
-    // MARK: - Unified Navigation Helpers
+    // MARK: - Unified Navigation & Onboarding Helpers
 
     public func openAddAccountFlow() {
         withAnimation(.snappy(duration: 0.18)) {
@@ -162,10 +172,133 @@ public final class WorkspaceStore: ObservableObject {
         }
     }
 
-    public func openSettings(section: SettingsSection = .general) {
-        selectedSettingsSection = section
+    public func openMainWindow(section: MainSection = .status, onboarding: Bool = false) {
+        selectedMainSection = section
+        showingOnboarding = onboarding
         refreshClientDetection()
-        onOpenSettingsWindow?(section)
+        onOpenMainWindow?(section, onboarding)
+    }
+
+    public func reopenOnboarding() {
+        openMainWindow(section: .status, onboarding: true)
+        Task { await refreshEnvironmentCheck() }
+    }
+
+    public func completeOnboarding() {
+        settings.hasCompletedOnboarding = true
+        withAnimation(.snappy(duration: 0.18)) {
+            showingOnboarding = false
+            selectedMainSection = .status
+        }
+    }
+
+    public func refreshEnvironmentCheck() async {
+        guard !isCheckingEnvironment else { return }
+        isCheckingEnvironment = true
+        defer { isCheckingEnvironment = false }
+        let report = await EnvironmentDoctor.inspect()
+        envReport = report
+        cliInstalled = report.colabInstalled
+        onStatusBarNeedsUpdate?()
+    }
+
+    public func installColabCLIAutomatically() {
+        guard !isInstallingCLI && !isCancellingCLIInstall else { return }
+        let method = envReport.recommendedMethod
+        let token = UUID()
+        activeCLIInstallToken = token
+        isInstallingCLI = true
+        isCancellingCLIInstall = false
+        cliInstallError = nil
+        cliInstallLogs = ["正在准备安装：\(method.displayTitle)…"]
+
+        cliInstallTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await EnvironmentDoctor.installColabCLI(method: method) { [weak self] line in
+                Task { @MainActor [weak self] in
+                    guard let self, self.activeCLIInstallToken == token else { return }
+                    self.cliInstallLogs.append(line)
+                    if self.cliInstallLogs.count > 300 {
+                        self.cliInstallLogs.removeFirst(self.cliInstallLogs.count - 300)
+                    }
+                }
+            }
+            guard self.activeCLIInstallToken == token else { return }
+            self.isInstallingCLI = false
+            self.isCancellingCLIInstall = false
+            self.cliInstallTask = nil
+            self.activeCLIInstallToken = nil
+            self.envReport = result.report
+            self.cliInstalled = result.report.colabInstalled
+            if result.succeeded {
+                self.cliInstallError = nil
+                self.showToast(result.message)
+                if self.settings.accounts.isEmpty {
+                    _ = await self.tryImportSystemDefaultAccount()
+                }
+            } else {
+                self.cliInstallError = result.message
+                self.showToast(result.message)
+            }
+            self.onStatusBarNeedsUpdate?()
+        }
+    }
+
+    public func cancelCLIInstall() {
+        guard isInstallingCLI, !isCancellingCLIInstall else { return }
+        isCancellingCLIInstall = true
+        cliInstallLogs.append("[正在终止安装进程组，请稍候…]")
+        cliInstallTask?.cancel()
+    }
+
+    @discardableResult
+    public func tryImportSystemDefaultAccount() async -> Bool {
+        guard cliInstalled, !isImportingSystemAccount else { return false }
+        isImportingSystemAccount = true
+        defer { isImportingSystemAccount = false }
+
+        let probe = AccountProfile(
+            displayName: "默认账号",
+            email: "",
+            colorTag: .amber,
+            tier: .colabPro,
+            authMode: .systemDefaultOAuth2,
+            enableLLMModule: false,
+            autoShutdownEnabled: false
+        )
+        guard let who = await ColabCLIEngine.whoami(profile: probe) else { return false }
+        let normalizedEmail = who.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let existing = settings.accounts.first(where: { $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedEmail }) {
+            settings.selectedAccountId = existing.id
+            await refreshAccount(existing.id, force: true, bypassCooldown: true, silent: true)
+            return true
+        }
+        let res = await ColabCLIEngine.fetchUsageAndSessions(profile: probe)
+        // Re-check deduplication right before append in case settings changed while awaiting network/CLI
+        if let existing = settings.accounts.first(where: {
+            $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedEmail ||
+            ($0.authMode == .systemDefaultOAuth2 && $0.email.isEmpty)
+        }) {
+            settings.selectedAccountId = existing.id
+            await refreshAccount(existing.id, force: true, bypassCooldown: true, silent: true)
+            return true
+        }
+        let balance = res.usage?.balance ?? 0
+        let suggestedTier = SubscriptionTier.suggested(forBalance: balance)
+        var detected = probe
+        detected.email = who.email
+        detected.displayName = who.email.split(separator: "@").first.map(String.init) ?? "主账号"
+        detected.tier = suggestedTier
+        detected.preferredAccelerator = suggestedTier.defaultAccelerator
+        if let existingSession = res.sessions?.first(where: { !$0.isOrphan }) {
+            detected.sessionName = InputValidator.sanitizeSessionName(existingSession.name)
+        }
+        settings.accounts.append(detected)
+        settings.selectedAccountId = detected.id
+        runtimeByAccount[detected.id] = AccountRuntimeState()
+        await refreshAccount(detected.id, force: true, bypassCooldown: true, silent: true)
+        showToast("已导入默认账号：\(detected.displayName)")
+        return true
     }
 
     // MARK: - Computed Workspace Aggregates
@@ -201,6 +334,61 @@ public final class WorkspaceStore: ObservableObject {
         }
     }
 
+    /// Total number of non-orphan active sessions across all accounts (primary + extra named sessions).
+    public var totalManagedRunningSessionCount: Int {
+        settings.accounts.reduce(0) { total, acc in
+            let st = state(for: acc.id)
+            var names = Set(st.sessions.filter { !$0.isOrphan }.map(\.name))
+            if st.phase.isRunning { names.insert(acc.sessionName) }
+            return total + names.count
+        }
+    }
+
+    /// Total number of external orphan `[?]` sessions that cannot be stopped via CLI.
+    public var totalOrphanSessionCount: Int {
+        settings.accounts.reduce(0) { total, acc in
+            total + state(for: acc.id).sessions.filter(\.isOrphan).count
+        }
+    }
+
+    /// Stops every managed session across all accounts (primary + extra named sessions)
+    /// and explicitly reports any remaining unstopped or browser-only orphan sessions.
+    public func stopAllManagedSessions() async {
+        var targets: [(UUID, String)] = []
+        for acc in settings.accounts {
+            let st = state(for: acc.id)
+            var seen: Set<String> = []
+            if st.phase.isRunning {
+                seen.insert(acc.sessionName)
+                targets.append((acc.id, acc.sessionName))
+            }
+            for sess in st.sessions where !sess.isOrphan && !seen.contains(sess.name) {
+                seen.insert(sess.name)
+                targets.append((acc.id, sess.name))
+            }
+        }
+        guard !targets.isEmpty else {
+            let orphans = totalOrphanSessionCount
+            if orphans > 0 {
+                showToast("存在 \(orphans) 个外部孤儿会话 [?] 无法通过 CLI 关闭，请前往 Colab 网页释放")
+            }
+            return
+        }
+        for (accId, sessionName) in targets {
+            await stopAccountSession(accId, specificSession: sessionName, reason: "全部关机止损")
+        }
+        let stillManaged = totalManagedRunningSessionCount
+        let orphans = totalOrphanSessionCount
+        if stillManaged > 0 || orphans > 0 {
+            var parts: [String] = []
+            if stillManaged > 0 { parts.append("\(stillManaged) 个会话未能确认停止") }
+            if orphans > 0 { parts.append("\(orphans) 个外部孤儿会话 [?] 需前往网页关闭") }
+            showToast("止损提示：" + parts.joined(separator: "，"))
+        } else {
+            showToast("已停止全部 \(targets.count) 个受管会话")
+        }
+    }
+
     public func watchdogStatus(for account: AccountProfile) -> WatchdogAction {
         let st = state(for: account.id)
         let allowFallback = account.enableHardwareIdleFallback || st.signalSource == .statusFile || st.signalSource == .comfyQueue
@@ -220,38 +408,21 @@ public final class WorkspaceStore: ObservableObject {
     // MARK: - Bootstrap & Timers
 
     private func bootstrapInitialAccounts() async {
-        cliInstalled = await ColabCLIEngine.isColabCLIInstalled()
+        await refreshEnvironmentCheck()
         guard cliInstalled else {
             onStatusBarNeedsUpdate?()
+            // Automatically surface the guided main window for users missing google-colab-cli
+            openMainWindow(section: .status, onboarding: true)
             return
         }
 
         if settings.accounts.isEmpty {
-            let probe = AccountProfile(
-                displayName: "默认账号",
-                email: "",
-                colorTag: .amber,
-                tier: .colabPro,
-                authMode: .systemDefaultOAuth2,
-                enableLLMModule: false,
-                autoShutdownEnabled: false
-            )
-            if let who = await ColabCLIEngine.whoami(profile: probe) {
-                let res = await ColabCLIEngine.fetchUsageAndSessions(profile: probe)
-                let balance = res.usage?.balance ?? 0
-                let suggestedTier = SubscriptionTier.suggested(forBalance: balance)
-                var detected = probe
-                detected.email = who.email
-                detected.displayName = who.email.split(separator: "@").first.map(String.init) ?? "主账号"
-                detected.tier = suggestedTier
-                detected.preferredAccelerator = suggestedTier.defaultAccelerator
-                if let existingSession = res.sessions?.first(where: { !$0.isOrphan }) {
-                    detected.sessionName = InputValidator.sanitizeSessionName(existingSession.name)
-                }
-                settings.accounts.append(detected)
-                settings.selectedAccountId = detected.id
-                runtimeByAccount[detected.id] = AccountRuntimeState()
-                await refreshAccount(detected.id, force: true, bypassCooldown: true, silent: true)
+            let imported = await tryImportSystemDefaultAccount()
+            if !imported && !settings.hasCompletedOnboarding {
+                openMainWindow(section: .status, onboarding: true)
+            } else if imported && !settings.hasCompletedOnboarding {
+                // First-time user who already has CLI login: still show the welcome window cleanly on first launch
+                openMainWindow(section: .status, onboarding: true)
             }
         } else {
             await refreshAllAccounts(force: true, silent: true)

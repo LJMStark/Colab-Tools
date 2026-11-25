@@ -73,16 +73,16 @@ struct AccountDetailView: View {
                         .symbolRenderingMode(.hierarchical)
 
                     Text(Formatters.cu(rt.cuBalance))
-                        .font(.system(size: 29, weight: .bold, design: .rounded))
+                        .font(.system(size: 31, weight: .bold, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(.primary)
 
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(heroStatusWord)
-                            .font(.system(size: 13.5, weight: .semibold))
+                            .font(.system(size: 14.5, weight: .semibold))
                             .foregroundStyle(rt.phase.isRunning ? .primary : .secondary)
                         Text("CU 点数")
-                            .font(.system(size: 10.5))
+                            .font(ColabTypography.popoverCaption)
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -147,9 +147,9 @@ struct AccountDetailView: View {
             if let err = rt.lastError, !err.isEmpty {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                     Text(err)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .lineLimit(2)
                     Spacer()
                 }
@@ -190,7 +190,7 @@ struct AccountDetailView: View {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
                 Text("处理中")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
@@ -201,7 +201,7 @@ struct AccountDetailView: View {
                 store.cancelQueue(for: account.id)
             } label: {
                 Label("取消排队", systemImage: "xmark.circle")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(ColabTheme.coral)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
@@ -217,7 +217,7 @@ struct AccountDetailView: View {
                 Task { await store.stopAccountSession(account.id) }
             } label: {
                 Label("关机止损", systemImage: "power")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(ColabTheme.coral)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
@@ -234,7 +234,7 @@ struct AccountDetailView: View {
                 Task { await store.startAccountSession(account.id) }
             } label: {
                 Label(account.enablePoliteQueue ? "排队启动" : "一键启动", systemImage: account.enablePoliteQueue ? "clock.arrow.circlepath" : "play.fill")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(queueBlocked ? Color.secondary : Color(nsColor: .windowBackgroundColor))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 7)
@@ -257,11 +257,11 @@ struct AccountDetailView: View {
                 .foregroundStyle(ColabTheme.amber)
             VStack(alignment: .leading, spacing: 2) {
                 Text("合规排队中 · 第 \(attempt)/\(maxAttempts) 轮（\(summary)）")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                 Text("\(countdownText) · 遇 412/429 自动熔断")
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 11.5))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -281,10 +281,10 @@ struct AccountDetailView: View {
         let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
         return HStack(spacing: 7) {
             Image(systemName: "hand.raised.fill")
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .foregroundStyle(ColabTheme.coral)
             Text("已触发防风控硬熔断保护，排队功能冷却剩余约 \(remMin) 分钟。")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.primary.opacity(0.88))
             Spacer()
         }
@@ -300,10 +300,10 @@ struct AccountDetailView: View {
     private var externalSessionBanner: some View {
         HStack(spacing: 7) {
             Image(systemName: "exclamationmark.shield.fill")
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .foregroundStyle(ColabTheme.amber)
             Text("检测到 \(orphanSessions.count) 个非主控/外部运行中会话，请注意避免遗忘计费。")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.primary.opacity(0.88))
             Spacer()
         }
@@ -355,7 +355,7 @@ struct AccountDetailView: View {
                     ? String(format: "%.1f GB / %.1f GB", Double(rt.vramUsedMB) / 1024.0, Double(rt.vramTotalMB) / 1024.0)
                     : "等待 GPU 分配"
             )
-            .font(.system(size: 11))
+            .font(.system(size: 12))
             .monospacedDigit()
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -388,7 +388,7 @@ struct AccountDetailView: View {
             )
 
             Text(rt.phase.isRunning ? (rt.isProcessing ? "推理高负载 · \(rateStr)" : "待命低负载 · \(rateStr)") : "当前未计费")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -427,7 +427,7 @@ struct AccountDetailView: View {
                         ? "已用 \(pct)% · \(rt.kvQuant) KV · #\(max(0, rt.lastTaskID))"
                         : "自动压缩窗口已对齐"
                 )
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -458,7 +458,7 @@ struct AccountDetailView: View {
                         ? "CPU \(rt.cpuUtilPercent)% · CUDA \(rt.cudaProcessCount) 进程"
                         : rt.workloadDetail
                 )
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -489,7 +489,7 @@ struct AccountDetailView: View {
                         ? "运行 \(rt.queueRunning) · 排队 \(rt.queuePending) · CPU \(rt.cpuUtilPercent)%"
                         : "支持 ComfyUI / 状态协议"
                 )
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -520,7 +520,7 @@ struct AccountDetailView: View {
                         ? "CUDA \(rt.cudaProcessCount) 进程 · \(rt.serverHealthy ? "服务在线" : "端口 :\(activeServicePort)")"
                         : "\(kind.displayName) · 端口 :\(activeServicePort)"
                 )
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -538,10 +538,10 @@ struct AccountDetailView: View {
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 5) {
                 Image(systemName: "timer")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(account.autoShutdownEnabled ? ColabTheme.cyan : .secondary)
                 Text("空闲关机")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Toggle("", isOn: Binding(
@@ -576,14 +576,14 @@ struct AccountDetailView: View {
                     Button("续命") {
                         store.resetIdleTimer(for: account.id)
                     }
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                 }
             }
 
             Text(watchdogCaption(status: wdStatus))
-                .font(.system(size: 10.5))
+                .font(.system(size: 11.5))
                 .foregroundStyle(wdStatus == .pausedNoSignal ? ColabTheme.amber : .secondary)
                 .lineLimit(1)
 
@@ -598,7 +598,7 @@ struct AccountDetailView: View {
                         store.updateAccount(copy)
                     } label: {
                         Text("\(mins)m")
-                            .font(.system(size: 10.5, weight: selected ? .semibold : .medium))
+                            .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
                             .monospacedDigit()
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 3.5)
@@ -635,14 +635,14 @@ struct AccountDetailView: View {
             HStack {
                 HStack(spacing: 5) {
                     Image(systemName: "bolt.batteryblock.fill")
-                        .font(.system(size: 12))
+                        .font(.system(size: 13))
                         .foregroundStyle(ColabTheme.emerald)
                     Text("算力续航")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.secondary)
                     if rt.phase.isRunning {
                         Text("单次上限 \(account.tier.maxSessionHours)h")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -656,8 +656,8 @@ struct AccountDetailView: View {
 
             HStack(alignment: .center, spacing: 10) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    if let hrs = rt.estimatedHoursRemaining(for: account.tier) {
-                        BigMetricValue(number: String(format: "%.0f", hrs), unit: "小时可用", fontSize: 22)
+                    if let est = rt.estimatedHoursRemaining(for: account) {
+                        BigMetricValue(number: String(format: "%.0f", est.hours), unit: "小时", fontSize: 22)
                     } else {
                         BigMetricValue(number: account.tier == .free ? "免费池" : "—", unit: "", fontSize: 20)
                     }
@@ -686,7 +686,7 @@ struct AccountDetailView: View {
                     }
                     .labelsHidden()
                     .controlSize(.small)
-                    .frame(maxWidth: 185)
+                    .frame(maxWidth: 235)
                     .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
                 }
             }
@@ -708,10 +708,10 @@ struct AccountDetailView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: effectiveKind.iconName)
-                            .font(.system(size: 10))
+                            .font(.system(size: 12))
                             .foregroundStyle(ColabTheme.color(for: effectiveKind))
                         Text(account.workloadKind.displayName)
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(.system(size: 12.5, weight: .medium))
                         Image(systemName: "chevron.up.chevron.down")
                             .font(.system(size: 8))
                             .opacity(0.65)
@@ -734,7 +734,7 @@ struct AccountDetailView: View {
                             store.updateAccount(copy)
                         }
                     ))
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .controlSize(.mini)
                     .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
@@ -748,7 +748,7 @@ struct AccountDetailView: View {
                         store.updateAccount(copy)
                     }
                 ))
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(account.enablePoliteQueue ? ColabTheme.amber : .secondary)
                 .controlSize(.mini)
                 .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
@@ -765,7 +765,7 @@ struct AccountDetailView: View {
                             ? " · \(account.queueFallbackAfterRounds)轮保底 \(account.queueFallbackTarget.shortChipLabel)"
                             : ""
                         Text("顺位 \(PoliteQueuePolicy.targetsSummary(cleanTargets))\(fallbackSuffix)")
-                            .font(.system(size: 10.5))
+                            .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -775,7 +775,7 @@ struct AccountDetailView: View {
                             Image(systemName: "alarm")
                                 .font(.system(size: 9.5))
                             Text(String(format: "%02d:%02d", account.scheduledStartHour, account.scheduledStartMinute))
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.system(size: 11, weight: .medium))
                                 .monospacedDigit()
                         }
                         .foregroundStyle(ColabTheme.emerald)
@@ -785,21 +785,21 @@ struct AccountDetailView: View {
                     }
                     Spacer(minLength: 4)
                     Button {
-                        store.openSettings(section: .compute)
+                        store.openMainWindow(section: .compute, onboarding: false)
                     } label: {
                         HStack(spacing: 3) {
                             Text("配置")
-                                .font(.system(size: 10.5, weight: .medium))
+                                .font(ColabTypography.popoverCaptionMedium)
                             Image(systemName: "chevron.right")
-                                .font(.system(size: 8.5, weight: .semibold))
+                                .font(.system(size: 9.5, weight: .semibold))
                         }
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    .help("打开「算力与抢卡」工作台配置顺位、降级与错峰预约")
+                    .help("打开「算力抢卡」工作台配置顺位、降级与错峰预约")
                 }
             }
         }
@@ -812,15 +812,15 @@ struct AccountDetailView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("活跃会话与端点")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Text("配置")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.tertiary)
                     .frame(width: 82, alignment: .trailing)
                 Text("操作")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.tertiary)
                     .frame(width: 66, alignment: .trailing)
             }
@@ -828,7 +828,7 @@ struct AccountDetailView: View {
             if rt.sessions.isEmpty {
                 HStack {
                     Text("当前无运行中 Colab 实例")
-                        .font(.system(size: 12))
+                        .font(.system(size: 13))
                         .foregroundStyle(.tertiary)
                     Spacer()
                 }
@@ -840,11 +840,11 @@ struct AccountDetailView: View {
                             .fill(sess.isOrphan ? ColabTheme.amber : ColabTheme.emerald)
                             .frame(width: 6.5, height: 6.5)
                         Text(sess.isOrphan ? "外部会话 [?]" : sess.name)
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.system(size: 13, weight: .medium))
                             .lineLimit(1)
                         Spacer()
                         Text("\(sess.hardware) · \(sess.shape == "Standard" ? "Std" : sess.shape)")
-                            .font(.system(size: 11.5))
+                            .font(.system(size: 12.5))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                             .frame(width: 82, alignment: .trailing)
@@ -854,7 +854,7 @@ struct AccountDetailView: View {
                                 Button {
                                     store.openColabInBrowser(accountId: account.id, sessionName: sess.name)
                                 } label: {
-                                    Image(systemName: "safari").font(.system(size: 11.5))
+                                    Image(systemName: "safari").font(.system(size: 12.5))
                                 }
                                 .buttonStyle(.borderless)
                                 .help("浏览器打开 (colab url --open)")
@@ -862,7 +862,7 @@ struct AccountDetailView: View {
                                 Button {
                                     store.openRemoteSSHShell(accountId: account.id, sessionName: sess.name)
                                 } label: {
-                                    Image(systemName: "terminal").font(.system(size: 11.5))
+                                    Image(systemName: "terminal").font(.system(size: 12.5))
                                 }
                                 .buttonStyle(.borderless)
                                 .help("打开 SSH 终端")
@@ -870,7 +870,7 @@ struct AccountDetailView: View {
                                 Button {
                                     Task { await store.stopAccountSession(account.id, specificSession: sess.name) }
                                 } label: {
-                                    Image(systemName: "stop.circle").font(.system(size: 11.5)).foregroundStyle(ColabTheme.coral)
+                                    Image(systemName: "stop.circle").font(.system(size: 12.5)).foregroundStyle(ColabTheme.coral)
                                 }
                                 .buttonStyle(.borderless)
                                 .help("停止此会话")
@@ -887,11 +887,11 @@ struct AccountDetailView: View {
 
                 HStack(spacing: 6) {
                     Text("模型")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
                     Text(rt.shortModelName)
-                        .font(.system(size: 11.5, design: .monospaced))
+                        .font(.system(size: 12.5, design: .monospaced))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
@@ -902,11 +902,11 @@ struct AccountDetailView: View {
 
                 HStack(spacing: 6) {
                     Text("HTTPS")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
                     Text(rt.publicURL.isEmpty ? "未启动" : rt.publicURL)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(rt.publicURL.isEmpty ? .tertiary : .primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -914,7 +914,7 @@ struct AccountDetailView: View {
                     Button {
                         store.copyToClipboard(rt.publicURL, label: "公网 HTTPS 地址")
                     } label: {
-                        Image(systemName: "doc.on.doc").font(.system(size: 11.5))
+                        Image(systemName: "doc.on.doc").font(.system(size: 12.5))
                     }
                     .buttonStyle(.borderless)
                     .disabled(rt.publicURL.isEmpty)
@@ -923,11 +923,11 @@ struct AccountDetailView: View {
 
                 HStack(spacing: 6) {
                     Text("接入")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
                     Text(enabledIntegrationsSummary)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer()
@@ -935,7 +935,7 @@ struct AccountDetailView: View {
                     let badgeText = syncSt.allSynced ? "已就绪 · 官方安全" : (syncSt.anySynced ? "部分同步" : "配置工具…")
                     let badgeTint: Color? = syncSt.allSynced ? ColabTheme.emerald : (syncSt.anySynced ? ColabTheme.amber : nil)
                     Button {
-                        store.openSettings(section: .integrations)
+                        store.openMainWindow(section: .integrations, onboarding: false)
                     } label: {
                         CardBadge(text: badgeText, tint: badgeTint)
                     }
@@ -946,11 +946,11 @@ struct AccountDetailView: View {
 
                 HStack(spacing: 6) {
                     Text("负载")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
                     Text(rt.workloadName.isEmpty ? effectiveKind.displayName : rt.workloadName)
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(.system(size: 12.5, weight: .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
@@ -977,11 +977,11 @@ struct AccountDetailView: View {
 
                 HStack(spacing: 6) {
                     Text("端点")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
                     Text(endpointText)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(copyableEndpoint.isEmpty ? .tertiary : .primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -989,7 +989,7 @@ struct AccountDetailView: View {
                     Button {
                         store.copyToClipboard(copyableEndpoint, label: "服务访问地址")
                     } label: {
-                        Image(systemName: "doc.on.doc").font(.system(size: 11.5))
+                        Image(systemName: "doc.on.doc").font(.system(size: 12.5))
                     }
                     .buttonStyle(.borderless)
                     .disabled(copyableEndpoint.isEmpty)
@@ -998,11 +998,11 @@ struct AccountDetailView: View {
 
                 HStack(spacing: 6) {
                     Text("守护")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
                     Text(rt.signalSource == .none ? (account.enableHardwareIdleFallback ? "GPU+CPU 双低载" : "仅手动关机") : rt.signalSource.shortLabel)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .lineLimit(1)
                     Spacer()
                     CardBadge(text: "CPU \(rt.cpuUtilPercent)% · CUDA \(rt.cudaProcessCount)")
@@ -1028,7 +1028,7 @@ struct AccountDetailView: View {
                         if syncSt.hasTargets {
                             store.syncAllEnabledClients(accountId: account.id, silent: false)
                         } else {
-                            store.openSettings(section: .integrations)
+                            store.openMainWindow(section: .integrations, onboarding: false)
                         }
                     }
 
@@ -1121,7 +1121,7 @@ private struct FooterStatCell: View {
                 .monospacedDigit()
                 .lineLimit(1)
             Text(label)
-                .font(.system(size: 10.5))
+                .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
