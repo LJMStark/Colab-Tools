@@ -23,6 +23,8 @@ public final class WorkspaceStore: ObservableObject {
     }
     @Published public var cliInstalled: Bool = true
     @Published public var toastMessage: String? = nil
+    @Published public var activeQueueAccountId: UUID? = nil
+    @Published public var queueTickVersion: Int = 0
 
     public enum WorkspaceViewMode: Equatable {
         case overview
@@ -45,6 +47,8 @@ public final class WorkspaceStore: ObservableObject {
     private var sshTunnelProcesses: [UUID: Process] = [:]
     private var sshTunnelADCFiles: [UUID: URL] = [:]
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
+    private var queueTasks: [UUID: Task<Void, Never>] = [:]
+    private var postAllocateReminderTasks: [UUID: Task<Void, Never>] = [:]
     private var refreshingAccounts: Set<UUID> = []
     private var toastTask: Task<Void, Never>?
 
@@ -79,6 +83,11 @@ public final class WorkspaceStore: ObservableObject {
         backgroundTimer = nil
         for (_, t) in activeTasks { t.cancel() }
         activeTasks.removeAll()
+        for (_, t) in queueTasks { t.cancel() }
+        queueTasks.removeAll()
+        for (_, t) in postAllocateReminderTasks { t.cancel() }
+        postAllocateReminderTasks.removeAll()
+        activeQueueAccountId = nil
         for id in Array(sshTunnelProcesses.keys) {
             stopSSHTunnel(for: id)
         }
@@ -211,9 +220,25 @@ public final class WorkspaceStore: ObservableObject {
 
     private func handleSecondTick() {
         var needsStatusUpdate = false
+        var anyQueueOrCooldown = false
         let now = Date()
         for acc in settings.accounts {
-            guard var st = runtimeByAccount[acc.id], st.phase.isRunning else { continue }
+            guard var st = runtimeByAccount[acc.id] else { continue }
+            if let until = st.queueCircuitBreakUntil {
+                if until <= now {
+                    st.queueCircuitBreakUntil = nil
+                    runtimeByAccount[acc.id] = st
+                    anyQueueOrCooldown = true
+                } else {
+                    anyQueueOrCooldown = true
+                }
+            }
+            if st.phase.isQueuing {
+                anyQueueOrCooldown = true
+                needsStatusUpdate = true
+                continue
+            }
+            guard st.phase.isRunning else { continue }
             needsStatusUpdate = true
 
             if st.sessionUptimeSeconds > 0 {
@@ -274,6 +299,9 @@ public final class WorkspaceStore: ObservableObject {
                 continue
             }
             runtimeByAccount[acc.id] = st
+        }
+        if anyQueueOrCooldown {
+            queueTickVersion &+= 1
         }
         if needsStatusUpdate {
             onStatusBarNeedsUpdate?()
@@ -345,6 +373,10 @@ public final class WorkspaceStore: ObservableObject {
         // Strictly match the configured primary sessionName (never masquerade another session as primary)
         if let primary = sessions.first(where: { $0.name == acc.sessionName && !$0.isOrphan }) {
             let wasOffline = !cur.phase.isRunning
+            if cur.phase.isQueuing {
+                queueTasks.removeValue(forKey: accountId)?.cancel()
+                if activeQueueAccountId == accountId { activeQueueAccountId = nil }
+            }
             cur.phase = .running
             cur.activeEndpoint = primary.endpoint
             cur.activeHardware = primary.hardware
@@ -383,7 +415,9 @@ public final class WorkspaceStore: ObservableObject {
             await pollSlots(for: accountId)
             if !silent { showToast("\(acc.displayName) 状态已刷新") }
         } else {
-            cur.phase = .offline
+            if !cur.phase.isQueuing {
+                cur.phase = .offline
+            }
             cur.activeEndpoint = ""
             cur.activeHardware = ""
             cur.gpuName = ""
@@ -474,10 +508,85 @@ public final class WorkspaceStore: ObservableObject {
         return true
     }
 
+    public func toggleQueueTarget(_ option: AcceleratorOption, for accountId: UUID) {
+        guard var acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        guard acc.tier.queueableAccelerators.contains(option) else { return }
+        var set = Set(acc.queueTargets)
+        if set.contains(option) {
+            if set.count <= 1 {
+                showToast("至少保留 1 个排队目标")
+                return
+            }
+            set.remove(option)
+        } else {
+            set.insert(option)
+        }
+        acc.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: Array(set), for: acc.tier)
+        updateAccount(acc)
+    }
+
+    public func cancelQueue(for accountId: UUID, silent: Bool = false) {
+        queueTasks.removeValue(forKey: accountId)?.cancel()
+        if activeQueueAccountId == accountId {
+            activeQueueAccountId = nil
+        }
+        var st = state(for: accountId)
+        if st.phase.isQueuing || st.phase.isBusy {
+            st.generation += 1
+            st.phase = .offline
+            runtimeByAccount[accountId] = st
+        }
+        onStatusBarNeedsUpdate?()
+        if !silent { showToast("已取消算力排队") }
+    }
+
+    private func cancelPostAllocateReminder(for accountId: UUID) {
+        postAllocateReminderTasks.removeValue(forKey: accountId)?.cancel()
+        var st = state(for: accountId)
+        if st.nonLLMReminderPending {
+            st.nonLLMReminderPending = false
+            runtimeByAccount[accountId] = st
+        }
+    }
+
+    private func scheduleNonLLMPostAllocateReminder(for acc: AccountProfile, hardwareLabel: String, hourlyRate: Double) {
+        cancelPostAllocateReminder(for: acc.id)
+        var st = state(for: acc.id)
+        st.nonLLMReminderPending = true
+        runtimeByAccount[acc.id] = st
+
+        let accountId = acc.id
+        let displayName = acc.displayName
+        postAllocateReminderTasks[accountId] = Task { @MainActor [weak self] in
+            let waitNs = UInt64(PoliteQueuePolicy.nonLLMPostAllocateReminderSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: waitNs)
+            guard !Task.isCancelled, let self else { return }
+            var cur = self.state(for: accountId)
+            cur.nonLLMReminderPending = false
+            self.runtimeByAccount[accountId] = cur
+            self.postAllocateReminderTasks.removeValue(forKey: accountId)
+            guard cur.phase.isRunning else { return }
+            let rate = cur.cuRatePerHour > 0 ? cur.cuRatePerHour : hourlyRate
+            ColabCLIEngine.sendNotification(
+                title: "Colab Tools 防遗忘提醒 · \(displayName)",
+                body: "\(hardwareLabel)（约 \(String(format: "%.1f", rate)) CU/hr）排队分配已满 10 分钟，若暂未使用请及时关机止损。"
+            )
+        }
+    }
+
     public func startAccountSession(_ accountId: UUID) async {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        if acc.enablePoliteQueue {
+            startPoliteQueueSession(accountId)
+            return
+        }
+        await runSingleStartSession(accountId)
+    }
+
+    private func runSingleStartSession(_ accountId: UUID) async {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
         var st = state(for: accountId)
-        guard !st.phase.isBusy else { return }
+        guard !st.phase.isBusy && !st.phase.isQueuing else { return }
 
         guard await verifySystemDefaultIdentityIfNeeded(for: acc) else { return }
 
@@ -507,8 +616,9 @@ public final class WorkspaceStore: ObservableObject {
         runtimeByAccount[accountId] = cur
 
         let alreadyExists = sessions.contains(where: { $0.name == acc.sessionName && !$0.isOrphan })
+        var allocatedHW: String? = nil
         if !alreadyExists {
-            let result = await ColabCLIEngine.provisionSession(profile: acc) { [weak self] step in
+            let outcome = await ColabCLIEngine.provisionSession(profile: acc) { [weak self] step in
                 Task { @MainActor [weak self] in
                     guard let self, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
                     var c = self.state(for: accountId)
@@ -518,17 +628,211 @@ public final class WorkspaceStore: ObservableObject {
                 }
             }
             guard isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
-            guard let allocated = result.allocated else {
+            switch outcome {
+            case .allocated(let hw):
+                allocatedHW = hw
+            case .capacityUnavailable503(let msg), .unsupportedTier400(let msg):
                 var errState = state(for: accountId)
-                errState.phase = .error(result.lastError ?? "算力申请失败")
-                errState.lastError = result.lastError
+                errState.phase = .error(msg)
+                errState.lastError = msg
                 runtimeByAccount[accountId] = errState
-                showToast(result.lastError ?? "算力申请失败")
+                showToast(msg)
+                onStatusBarNeedsUpdate?()
+                return
+            case .circuitBroken(let code, let msg):
+                var errState = state(for: accountId)
+                errState.phase = .error(msg)
+                errState.lastError = msg
+                if code == "429" || code == "412" || code == "ABUSE_BLOCK" {
+                    errState.queueCircuitBreakUntil = Date().addingTimeInterval(PoliteQueuePolicy.circuitBreakerCooldownSeconds)
+                }
+                runtimeByAccount[accountId] = errState
+                showToast(msg)
                 onStatusBarNeedsUpdate?()
                 return
             }
+        }
+
+        await finalizeStartedSession(
+            accountId: accountId,
+            runGen: runGen,
+            allocatedHardware: allocatedHW,
+            fromQueue: false
+        )
+    }
+
+    public func startPoliteQueueSession(_ accountId: UUID) {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        let st = state(for: accountId)
+        guard !st.phase.isBusy && !st.phase.isRunning && !st.phase.isQueuing else { return }
+
+        // Global single-account mutex to strictly prevent multi-account polling / abuse
+        if let activeId = activeQueueAccountId, activeId != accountId {
+            let otherName = settings.accounts.first(where: { $0.id == activeId })?.displayName ?? "另一账号"
+            showToast("「\(otherName)」正在排队，防风控限制同时仅允许单账号排队")
+            return
+        }
+
+        // Enforce mandatory circuit-breaker cooldown after 412 / 429 / 403 / abuse signal
+        if let until = st.queueCircuitBreakUntil, until > Date() {
+            let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
+            showToast("触发防风控硬熔断，冷却剩余约 \(remMin) 分钟后再试")
+            return
+        }
+
+        let cleanTargets = PoliteQueuePolicy.sanitizedTargets(selected: acc.queueTargets, for: acc.tier)
+        let summary = PoliteQueuePolicy.targetsSummary(cleanTargets)
+        let probeTargets = cleanTargets.flatMap(\.probeTargets)
+
+        var nextSt = st
+        nextSt.generation += 1
+        let runGen = nextSt.generation
+        nextSt.lastError = nil
+        nextSt.phase = .queuing(attempt: 1, maxAttempts: PoliteQueuePolicy.maxAttempts, nextRetryAt: nil, targetsSummary: summary)
+        runtimeByAccount[accountId] = nextSt
+        activeQueueAccountId = accountId
+        onStatusBarNeedsUpdate?()
+
+        let startedAt = Date()
+        queueTasks[accountId] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.queueTasks.removeValue(forKey: accountId)
+                if self.activeQueueAccountId == accountId {
+                    self.activeQueueAccountId = nil
+                }
+                self.onStatusBarNeedsUpdate?()
+            }
+
+            guard await self.verifySystemDefaultIdentityIfNeeded(for: acc) else {
+                var c = self.state(for: accountId)
+                if c.phase.isQueuing { c.phase = .offline }
+                self.runtimeByAccount[accountId] = c
+                return
+            }
+
+            for attempt in 1...PoliteQueuePolicy.maxAttempts {
+                guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+                guard let latestAcc = self.settings.accounts.first(where: { $0.id == accountId }) else { return }
+
+                // Pre-flight read-only check before every attempt to avoid duplicate assignments or orphan contention
+                var checking = self.state(for: accountId)
+                checking.phase = .queuing(attempt: attempt, maxAttempts: PoliteQueuePolicy.maxAttempts, nextRetryAt: nil, targetsSummary: summary)
+                self.runtimeByAccount[accountId] = checking
+                self.onStatusBarNeedsUpdate?()
+
+                let check = await ColabCLIEngine.fetchUsageAndSessions(profile: latestAcc)
+                guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+                guard check.ok, let usage = check.usage, let sessions = check.sessions else {
+                    var errSt = self.state(for: accountId)
+                    errSt.phase = .error("排队前核验会话失败，已中止以防重复计费")
+                    errSt.lastError = check.error
+                    self.runtimeByAccount[accountId] = errSt
+                    self.showToast("无法核验现有会话，排队已中止")
+                    return
+                }
+
+                var updated = self.state(for: accountId)
+                updated.cuBalance = usage.balance
+                updated.sessions = sessions
+                self.runtimeByAccount[accountId] = updated
+
+                if sessions.contains(where: { $0.name == latestAcc.sessionName && !$0.isOrphan }) {
+                    await self.finalizeStartedSession(
+                        accountId: accountId,
+                        runGen: runGen,
+                        allocatedHardware: nil,
+                        fromQueue: true
+                    )
+                    return
+                }
+
+                let outcome = await ColabCLIEngine.provisionSession(
+                    profile: latestAcc,
+                    overrideTargets: probeTargets,
+                    interTargetDelaySeconds: { PoliteQueuePolicy.interTargetDelaySeconds() }
+                ) { _ in }
+
+                guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+
+                switch outcome {
+                case .allocated(let hw):
+                    await self.finalizeStartedSession(
+                        accountId: accountId,
+                        runGen: runGen,
+                        allocatedHardware: hw,
+                        fromQueue: true
+                    )
+                    return
+
+                case .circuitBroken(let code, let msg):
+                    if code == "CANCELLED" { return }
+                    var broken = self.state(for: accountId)
+                    broken.phase = .error(msg)
+                    broken.lastError = msg
+                    broken.queueCircuitBreakUntil = Date().addingTimeInterval(PoliteQueuePolicy.circuitBreakerCooldownSeconds)
+                    self.runtimeByAccount[accountId] = broken
+                    ColabCLIEngine.sendNotification(
+                        title: "Colab Tools 排队熔断 · \(latestAcc.displayName)",
+                        body: msg
+                    )
+                    self.showToast(msg)
+                    return
+
+                case .unsupportedTier400(let msg):
+                    var unsupported = self.state(for: accountId)
+                    unsupported.phase = .error(msg)
+                    unsupported.lastError = msg
+                    self.runtimeByAccount[accountId] = unsupported
+                    self.showToast(msg)
+                    return
+
+                case .capacityUnavailable503(let msg):
+                    guard let delay = PoliteQueuePolicy.nextDelay(
+                        completedAttempts: attempt,
+                        startedAt: startedAt,
+                        now: Date()
+                    ) else {
+                        var done = self.state(for: accountId)
+                        done.phase = .offline
+                        done.lastError = "已完成 \(attempt) 轮合规排队（上限 40 分钟），\(summary) 仍暂无库存，已自动停止"
+                        self.runtimeByAccount[accountId] = done
+                        ColabCLIEngine.sendNotification(
+                            title: "Colab Tools 排队结束 · \(latestAcc.displayName)",
+                            body: "\(summary) 暂未释放库存，已按防风控上限自动停止排队。"
+                        )
+                        self.showToast("已达安全排队上限，自动停止")
+                        return
+                    }
+
+                    let nextAt = Date().addingTimeInterval(delay)
+                    var waiting = self.state(for: accountId)
+                    waiting.lastError = msg
+                    waiting.phase = .queuing(
+                        attempt: attempt,
+                        maxAttempts: PoliteQueuePolicy.maxAttempts,
+                        nextRetryAt: nextAt,
+                        targetsSummary: summary
+                    )
+                    self.runtimeByAccount[accountId] = waiting
+                    self.onStatusBarNeedsUpdate?()
+
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            }
+        }
+    }
+
+    private func finalizeStartedSession(
+        accountId: UUID,
+        runGen: Int,
+        allocatedHardware: String?,
+        fromQueue: Bool
+    ) async {
+        guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        if let hw = allocatedHardware {
             var allocState = state(for: accountId)
-            allocState.activeHardware = allocated
+            allocState.activeHardware = hw
             runtimeByAccount[accountId] = allocState
         }
 
@@ -541,7 +845,6 @@ public final class WorkspaceStore: ObservableObject {
             let mounted = await ColabCLIEngine.ensureDriveMounted(profile: acc)
             guard isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
             guard mounted else {
-                // Keep session visible as running (since VM is already allocated & billing!) so user can stop it cleanly
                 var warnState = state(for: accountId)
                 warnState.phase = .running
                 warnState.lastError = "VM 已分配但 Drive 挂载失败（请注意及时关机止损）"
@@ -587,7 +890,6 @@ public final class WorkspaceStore: ObservableObject {
             parsed.serverHealthy = !parsed.publicURL.isEmpty
             runtimeByAccount[accountId] = parsed
 
-            // Retrieve API key safely via `colab download` instead of stdout history
             if let apiKey = await ColabCLIEngine.fetchRemoteAPIKeySafely(profile: acc) {
                 KeychainVault.saveAPIKey(apiKey, for: acc.id)
             }
@@ -595,6 +897,7 @@ public final class WorkspaceStore: ObservableObject {
 
         var doneState = state(for: accountId)
         doneState.phase = .running
+        doneState.lastError = nil
         doneState.lastActiveAt = Date()
         doneState.idleSeconds = 0
         doneState.warnedForCurrentIdle = false
@@ -608,16 +911,29 @@ public final class WorkspaceStore: ObservableObject {
             syncToCCSwitch(accountId: accountId, silent: true)
         }
 
+        let rate = latest.cuRatePerHour > 0
+            ? latest.cuRatePerHour
+            : AcceleratorOption.estimatedHourlyCU(forHardware: latest.shortGPUName)
+        let rateText = String(format: "%.1f CU/hr", rate)
+
         ColabCLIEngine.sendNotification(
-            title: "Colab Tools 已就绪 · \(acc.displayName)",
-            body: "\(latest.shortGPUName) 已上线"
+            title: fromQueue ? "Colab Tools 排到卡啦 · \(acc.displayName)" : "Colab Tools 已就绪 · \(acc.displayName)",
+            body: "\(latest.shortGPUName) 已上线（约 \(rateText)）"
         )
         showToast("\(acc.displayName) · \(latest.shortGPUName) 已上线")
+
+        if fromQueue && !acc.enableLLMModule {
+            scheduleNonLLMPostAllocateReminder(for: acc, hardwareLabel: latest.shortGPUName, hourlyRate: rate)
+        }
     }
 
     /// Strictly verifies server-side session removal after `colab stop` before claiming billing has stopped.
     public func stopAccountSession(_ accountId: UUID, specificSession: String? = nil, reason: String? = nil) async {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        cancelPostAllocateReminder(for: accountId)
+        if state(for: accountId).phase.isQueuing {
+            cancelQueue(for: accountId, silent: true)
+        }
         guard await verifySystemDefaultIdentityIfNeeded(for: acc) else { return }
 
         let targetName = specificSession ?? acc.sessionName
@@ -713,6 +1029,8 @@ public final class WorkspaceStore: ObservableObject {
 
     public func removeAccount(_ accountId: UUID) {
         activeTasks.removeValue(forKey: accountId)?.cancel()
+        cancelQueue(for: accountId, silent: true)
+        cancelPostAllocateReminder(for: accountId)
         stopSSHTunnel(for: accountId)
         if let acc = settings.accounts.first(where: { $0.id == accountId }) {
             if acc.authMode == .isolatedKeychainADC {
@@ -747,6 +1065,7 @@ public final class WorkspaceStore: ObservableObject {
         if !normalized.tier.supportsHighMem {
             normalized.highMem = false
         }
+        normalized.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: normalized.queueTargets, for: normalized.tier)
         normalized.idleTimeoutMinutes = max(5, min(720, normalized.idleTimeoutMinutes))
         settings.accounts[idx] = normalized
     }
@@ -797,6 +1116,7 @@ public final class WorkspaceStore: ObservableObject {
 
     public func openColabInBrowser(accountId: UUID, sessionName: String? = nil) {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        cancelPostAllocateReminder(for: accountId)
         Task {
             let r = await ColabCLIEngine.openColabWebURL(profile: acc, sessionName: sessionName)
             showToast(r.exitCode == 0 ? "已在浏览器打开 Colab 会话" : "打开网页会话失败")
@@ -811,6 +1131,7 @@ public final class WorkspaceStore: ObservableObject {
     /// Uses an owner-only (`0700`) self-cleaning wrapper script so ADC credentials are bound properly and wiped on exit.
     public func openRemoteSSHShell(accountId: UUID, sessionName: String? = nil) {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        cancelPostAllocateReminder(for: accountId)
         let target = sessionName ?? acc.sessionName
         guard InputValidator.isValidSessionName(target) else {
             showToast("会话名不合法")

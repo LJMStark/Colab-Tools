@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DISPLAY_NAME="Colab Tools"
 EXECUTABLE_NAME="ColabTools"
-VERSION="0.3.1"
+VERSION="0.3.2"
 BUILD_DIR="$ROOT_DIR/build"
 APP_BUNDLE="$BUILD_DIR/${APP_DISPLAY_NAME}.app"
 INSTALL_FLAG=0
@@ -64,9 +64,6 @@ fi
 if [ -f "$ICON_SRC" ]; then
   sips -z 256 256 "$ICON_SRC" --out "$STAGING_BUNDLE/Contents/Resources/AppIconPreview.png" >/dev/null
 fi
-if [ -f "$ROOT_DIR/assets/wechat-qr.png" ]; then
-  cp "$ROOT_DIR/assets/wechat-qr.png" "$STAGING_BUNDLE/Contents/Resources/wechat-qr.png"
-fi
 
 cat > "$STAGING_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -92,7 +89,7 @@ cat > "$STAGING_BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key>
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>4</string>
+  <string>5</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>

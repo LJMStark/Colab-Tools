@@ -232,7 +232,7 @@ struct AboutTabView: View {
 
                 Text("Colab Tools")
                     .font(.system(size: 16, weight: .semibold))
-                Text("v0.3.1 · MIT Open Source")
+                Text("v0.3.2 · MIT Open Source")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Text("面向全体 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣。100% 基于官方 google-colab-cli，支持多订阅并行隔离管理、点数监控、自定义空闲自动关机与 Claude Code / CC Switch 无感联动。")
@@ -251,33 +251,7 @@ struct AboutTabView: View {
 
                 AboutLinkRow(title: "GitHub 开源主页", subtitle: "github.com/LJMStark/Colab-Tools", url: "https://github.com/LJMStark/Colab-Tools")
                 AboutLinkRow(title: "作者 X (Twitter)", subtitle: "x.com/starkljm", url: "https://x.com/starkljm")
-                AboutLinkRow(title: "联系作者", subtitle: "X DM: @starkljm（二维码失效可私信入群）", url: "https://x.com/starkljm")
-
-                if let qrPath = Bundle.main.path(forResource: "wechat-qr", ofType: "png"),
-                   let img = NSImage(contentsOfFile: qrPath) {
-                    VStack(spacing: 6) {
-                        Divider().opacity(0.35)
-                        Text("扫码加入微信交流群")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                        Image(nsImage: img)
-                            .resizable()
-                            .interpolation(.none)
-                            .scaledToFit()
-                            .frame(width: 144, height: 144)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 4)
-                } else {
-                    HStack(spacing: 6) {
-                        Image(systemName: "qrcode").foregroundStyle(.secondary)
-                        Text("放入 assets/wechat-qr.png 后自动展示交流群二维码")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.top, 2)
-                }
+                AboutLinkRow(title: "联系作者", subtitle: "X DM: @starkljm", url: "https://x.com/starkljm")
             }
             .padding(12)
             .hudCard()

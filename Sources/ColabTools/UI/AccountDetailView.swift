@@ -14,8 +14,15 @@ struct AccountDetailView: View {
     }
 
     var body: some View {
+        let _ = store.queueTickVersion
         VStack(spacing: 9) {
             heroHeaderSection
+
+            if case .queuing(let attempt, let maxAttempts, let nextRetryAt, let summary) = rt.phase {
+                activeQueueBanner(attempt: attempt, maxAttempts: maxAttempts, nextRetryAt: nextRetryAt, summary: summary)
+            } else if let until = rt.queueCircuitBreakUntil, until > Date() {
+                circuitBreakerBanner(until: until)
+            }
 
             if !orphanSessions.isEmpty {
                 externalSessionBanner
@@ -133,6 +140,7 @@ struct AccountDetailView: View {
         switch rt.phase {
         case .running: return rt.isProcessing ? "bolt.circle.fill" : "sun.max.fill"
         case .starting, .stopping: return "arrow.triangle.2.circlepath.circle.fill"
+        case .queuing: return "clock.arrow.circlepath"
         case .error: return "exclamationmark.triangle.fill"
         case .offline: return "moon.zzz.fill"
         }
@@ -142,6 +150,7 @@ struct AccountDetailView: View {
         switch rt.phase {
         case .running: return rt.isProcessing ? "推理中" : "运行良好"
         case .starting(let s): return s
+        case .queuing(let attempt, let maxAttempts, _, _): return "排队 \(attempt)/\(maxAttempts)"
         case .stopping: return "关机中…"
         case .error: return "需检查"
         case .offline: return "已关闭"
@@ -150,6 +159,7 @@ struct AccountDetailView: View {
 
     @ViewBuilder
     private var powerActionButton: some View {
+        let isCoolingDown = (rt.queueCircuitBreakUntil ?? .distantPast) > Date()
         if rt.phase.isBusy {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
@@ -160,6 +170,22 @@ struct AccountDetailView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        } else if rt.phase.isQueuing {
+            Button {
+                store.cancelQueue(for: account.id)
+            } label: {
+                Label("取消排队", systemImage: "xmark.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(ColabTheme.coral)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(ColabTheme.coral.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(ColabTheme.coral.opacity(0.32), lineWidth: 0.75)
+                    )
+            }
+            .buttonStyle(.plain)
         } else if rt.phase.isRunning {
             Button {
                 Task { await store.stopAccountSession(account.id) }
@@ -177,18 +203,72 @@ struct AccountDetailView: View {
             }
             .buttonStyle(.plain)
         } else {
+            let queueBlocked = account.enablePoliteQueue && isCoolingDown
             Button {
                 Task { await store.startAccountSession(account.id) }
             } label: {
-                Label("一键启动", systemImage: "play.fill")
+                Label(account.enablePoliteQueue ? "排队启动" : "一键启动", systemImage: account.enablePoliteQueue ? "clock.arrow.circlepath" : "play.fill")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color(nsColor: .windowBackgroundColor))
+                    .foregroundStyle(queueBlocked ? Color.secondary : Color(nsColor: .windowBackgroundColor))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 7)
-                    .background(Color.primary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .background(queueBlocked ? Color.primary.opacity(0.08) : Color.primary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
             .buttonStyle(.plain)
+            .disabled(queueBlocked)
         }
+    }
+
+    private func activeQueueBanner(attempt: Int, maxAttempts: Int, nextRetryAt: Date?, summary: String) -> some View {
+        let countdownText: String = {
+            guard let nextRetryAt else { return "正在探测目标库存…" }
+            let rem = max(0, Int(ceil(nextRetryAt.timeIntervalSinceNow)))
+            return String(format: "距下次探测 %02d:%02d", rem / 60, rem % 60)
+        }()
+        return HStack(spacing: 8) {
+            Image(systemName: "clock.badge.checkmark")
+                .font(.system(size: 13))
+                .foregroundStyle(ColabTheme.amber)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("合规排队中 · 第 \(attempt)/\(maxAttempts) 轮（\(summary)）")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text("\(countdownText) · 遇 412/429 自动熔断")
+                    .font(.system(size: 10.5))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(ColabTheme.amber.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(ColabTheme.amber.opacity(0.28), lineWidth: 0.6)
+        )
+    }
+
+    private func circuitBreakerBanner(until: Date) -> some View {
+        let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
+        return HStack(spacing: 7) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(ColabTheme.coral)
+            Text("已触发防风控硬熔断保护，排队功能冷却剩余约 \(remMin) 分钟。")
+                .font(.system(size: 11))
+                .foregroundStyle(.primary.opacity(0.88))
+            Spacer()
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(ColabTheme.coral.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(ColabTheme.coral.opacity(0.28), lineWidth: 0.6)
+        )
     }
 
     private var externalSessionBanner: some View {
@@ -266,7 +346,9 @@ struct AccountDetailView: View {
                 icon: "cpu",
                 iconTint: ColabTheme.amber,
                 title: "GPU",
-                badgeText: rt.phase.isRunning ? rt.shortGPUName : account.preferredAccelerator.rawValue
+                badgeText: rt.phase.isRunning
+                    ? rt.shortGPUName
+                    : (account.enablePoliteQueue ? "排队等待" : account.preferredAccelerator.shortChipLabel)
             )
 
             BigMetricValue(
@@ -478,27 +560,35 @@ struct AccountDetailView: View {
 
                 Spacer()
 
-                Picker("", selection: Binding(
-                    get: { account.preferredAccelerator },
-                    set: { newVal in
-                        var copy = account
-                        copy.preferredAccelerator = newVal
-                        store.updateAccount(copy)
+                if account.enablePoliteQueue && !rt.phase.isRunning {
+                    let cleanTargets = PoliteQueuePolicy.sanitizedTargets(selected: account.queueTargets, for: account.tier)
+                    CardBadge(
+                        text: "顺位 \(PoliteQueuePolicy.targetsSummary(cleanTargets))",
+                        tint: ColabTheme.amber
+                    )
+                } else {
+                    Picker("", selection: Binding(
+                        get: { account.preferredAccelerator },
+                        set: { newVal in
+                            var copy = account
+                            copy.preferredAccelerator = newVal
+                            store.updateAccount(copy)
+                        }
+                    )) {
+                        ForEach(account.tier.allowedAccelerators) { opt in
+                            Text(opt.label).tag(opt)
+                        }
                     }
-                )) {
-                    ForEach(account.tier.allowedAccelerators) { opt in
-                        Text(opt.label).tag(opt)
-                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .frame(maxWidth: 185)
+                    .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
                 }
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(maxWidth: 185)
-                .disabled(rt.phase.isRunning || rt.phase.isBusy)
             }
 
-            HStack(spacing: 14) {
+            HStack(spacing: 10) {
                 if account.tier.supportsHighMem {
-                    Toggle("高内存 (--high-mem)", isOn: Binding(
+                    Toggle("高内存", isOn: Binding(
                         get: { account.highMem },
                         set: { v in
                             var copy = account
@@ -509,10 +599,10 @@ struct AccountDetailView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .controlSize(.mini)
-                    .disabled(rt.phase.isRunning || rt.phase.isBusy)
+                    .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
                 }
 
-                Toggle("LLM 推理与 Claude 接入", isOn: Binding(
+                Toggle("LLM 接入", isOn: Binding(
                     get: { account.enableLLMModule },
                     set: { v in
                         var copy = account
@@ -523,12 +613,65 @@ struct AccountDetailView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .controlSize(.mini)
-                .disabled(rt.phase.isBusy)
+                .disabled(rt.phase.isBusy || rt.phase.isQueuing)
 
-                Spacer()
+                Toggle("缺卡排队", isOn: Binding(
+                    get: { account.enablePoliteQueue },
+                    set: { v in
+                        var copy = account
+                        copy.enablePoliteQueue = v
+                        store.updateAccount(copy)
+                    }
+                ))
+                .font(.system(size: 11))
+                .foregroundStyle(account.enablePoliteQueue ? ColabTheme.amber : .secondary)
+                .controlSize(.mini)
+                .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
+
+                Spacer(minLength: 0)
+            }
+
+            if account.enablePoliteQueue {
+                Divider().opacity(0.32)
+                VStack(alignment: .leading, spacing: 6) {
+                    let allowed = account.tier.queueableAccelerators
+                    let selectedSet = Set(PoliteQueuePolicy.sanitizedTargets(selected: account.queueTargets, for: account.tier))
+                    HStack(spacing: 5) {
+                        ForEach(allowed) { opt in
+                            let isOn = selectedSet.contains(opt)
+                            Button {
+                                store.toggleQueueTarget(opt, for: account.id)
+                            } label: {
+                                Text(opt.shortChipLabel)
+                                    .font(.system(size: 10.5, weight: isOn ? .semibold : .medium))
+                                    .monospacedDigit()
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3.5)
+                                    .background(
+                                        isOn ? ColabTheme.amber.opacity(0.20) : Color.primary.opacity(0.055),
+                                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .strokeBorder(isOn ? ColabTheme.amber.opacity(0.50) : Color.primary.opacity(0.08), lineWidth: 0.6)
+                                    )
+                                    .foregroundStyle(isOn ? .primary : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(rt.phase.isRunning || rt.phase.isBusy || rt.phase.isQueuing)
+                        }
+                        Spacer(minLength: 0)
+                    }
+
+                    Text("可单选死磕或多选按高到低顺位等待 · 最多 5 轮/40m · 遇 412/429 自动熔断")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
         }
-        .padding(12)
+        .padding(11)
         .hudCard()
     }
 

@@ -54,6 +54,45 @@ enum PreviewExporter {
                 to: qaURL.appendingPathComponent("qa-dashboard-live-light.png"),
                 dark: false
             )
+
+            // Queue active state (Light & Dark) + About page without QR
+            let queueStore = makeDemoStore(multiAccount: false)
+            if var acc = queueStore.settings.accounts.first {
+                acc.enablePoliteQueue = true
+                acc.queueTargets = [.g4, .h100]
+                queueStore.settings.accounts = [acc]
+                var qst = queueStore.state(for: acc.id)
+                qst.phase = .queuing(
+                    attempt: 2,
+                    maxAttempts: PoliteQueuePolicy.maxAttempts,
+                    nextRetryAt: Date().addingTimeInterval(258),
+                    targetsSummary: "G4 → H100"
+                )
+                qst.vramUsedMB = 0
+                qst.vramTotalMB = 0
+                qst.gpuUtilPercent = 0
+                qst.serverHealthy = false
+                qst.sessions = []
+                queueStore.runtimeByAccount[acc.id] = qst
+            }
+            renderPanel(
+                RootPopoverView(store: queueStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-queue-active-dark.png"),
+                dark: true
+            )
+            renderPanel(
+                RootPopoverView(store: queueStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-queue-active-light.png"),
+                dark: false
+            )
+
+            let aboutStore = makeDemoStore(multiAccount: false)
+            aboutStore.selectedTab = .about
+            renderPanel(
+                RootPopoverView(store: aboutStore, isPreviewMode: false),
+                to: qaURL.appendingPathComponent("qa-about-noqr-dark.png"),
+                dark: true
+            )
         }
         return true
     }

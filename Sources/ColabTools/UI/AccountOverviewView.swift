@@ -73,7 +73,9 @@ struct AccountOverviewView: View {
                         }
                     } onTogglePower: {
                         Task {
-                            if st.phase.isRunning {
+                            if st.phase.isQueuing {
+                                store.cancelQueue(for: acc.id)
+                            } else if st.phase.isRunning {
                                 await store.stopAccountSession(acc.id)
                             } else {
                                 await store.startAccountSession(acc.id)
@@ -108,7 +110,7 @@ private struct AccountParallelRow: View {
     var body: some View {
         HStack(spacing: 9) {
             Circle()
-                .fill(state.phase.isRunning ? ColabTheme.emerald : ColabTheme.color(for: account.colorTag))
+                .fill(state.phase.isRunning ? ColabTheme.emerald : (state.phase.isQueuing ? ColabTheme.amber : ColabTheme.color(for: account.colorTag)))
                 .frame(width: 8, height: 8)
 
             Button(action: onInspect) {
@@ -120,14 +122,10 @@ private struct AccountParallelRow: View {
                             .lineLimit(1)
                         CardBadge(text: account.tier.shortBadge)
                     }
-                    Text(
-                        state.phase.isRunning
-                            ? "\(state.shortGPUName) · \(String(format: "%.1f/%.0fG", Double(state.vramUsedMB)/1024.0, Double(state.vramTotalMB)/1024.0))"
-                            : (state.phase.isBusy ? "操作中…" : (account.email.isEmpty ? "待机" : account.email))
-                    )
+                    Text(rowSubtitle)
                     .font(.system(size: 11))
                     .monospacedDigit()
-                    .foregroundStyle(state.phase.isRunning ? ColabTheme.emerald : .secondary)
+                    .foregroundStyle(state.phase.isRunning ? ColabTheme.emerald : (state.phase.isQueuing ? ColabTheme.amber : .secondary))
                     .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -145,12 +143,12 @@ private struct AccountParallelRow: View {
                     ProgressView().controlSize(.small)
                 } else {
                     Button(action: onTogglePower) {
-                        Image(systemName: state.phase.isRunning ? "power" : "play.fill")
+                        Image(systemName: state.phase.isQueuing ? "xmark" : (state.phase.isRunning ? "power" : "play.fill"))
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(state.phase.isRunning ? ColabTheme.coral : Color.primary)
+                            .foregroundStyle((state.phase.isRunning || state.phase.isQueuing) ? ColabTheme.coral : Color.primary)
                             .frame(width: 28, height: 24)
                             .background(
-                                state.phase.isRunning ? ColabTheme.coral.opacity(0.12) : Color.primary.opacity(0.08),
+                                (state.phase.isRunning || state.phase.isQueuing) ? ColabTheme.coral.opacity(0.12) : Color.primary.opacity(0.08),
                                 in: RoundedRectangle(cornerRadius: 6.5, style: .continuous)
                             )
                     }
@@ -162,5 +160,16 @@ private struct AccountParallelRow: View {
             }
             .frame(width: 46, alignment: .trailing)
         }
+    }
+
+    private var rowSubtitle: String {
+        if case .queuing(let a, let m, _, let summary) = state.phase {
+            return "排队 \(a)/\(m) · \(summary)"
+        }
+        if state.phase.isRunning {
+            return "\(state.shortGPUName) · \(String(format: "%.1f/%.0fG", Double(state.vramUsedMB)/1024.0, Double(state.vramTotalMB)/1024.0))"
+        }
+        if state.phase.isBusy { return "操作中…" }
+        return account.email.isEmpty ? "待机" : account.email
     }
 }

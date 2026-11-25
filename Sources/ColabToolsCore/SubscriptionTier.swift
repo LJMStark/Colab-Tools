@@ -66,6 +66,18 @@ public enum SubscriptionTier: String, CaseIterable, Codable, Identifiable, Senda
         }
     }
 
+    /// Individual hardware targets eligible for polite queuing under this subscription tier, ordered high-to-low.
+    public var queueableAccelerators: [AcceleratorOption] {
+        switch self {
+        case .aiUltra, .colabProPlus:
+            return [.g4, .h100, .a100, .l4, .t4, .tpuV6e1, .tpuV5e1]
+        case .aiPro, .colabPro, .payAsYouGo:
+            return [.a100, .l4, .t4, .tpuV5e1]
+        case .free:
+            return [.t4]
+        }
+    }
+
     public var defaultAccelerator: AcceleratorOption {
         switch self {
         case .aiUltra, .colabProPlus: return .autoBest
@@ -110,6 +122,21 @@ public enum AcceleratorOption: String, CaseIterable, Codable, Identifiable, Send
         case .tpuV6e1: return "TPU · v6e-1"
         case .tpuV5e1: return "TPU · v5e-1"
         case .cpu: return "CPU 标准环境"
+        }
+    }
+
+    public var shortChipLabel: String {
+        switch self {
+        case .autoBest: return "自动高配"
+        case .autoPro: return "自动优选"
+        case .g4: return "G4"
+        case .h100: return "H100"
+        case .a100: return "A100"
+        case .l4: return "L4"
+        case .t4: return "T4"
+        case .tpuV6e1: return "v6e-1"
+        case .tpuV5e1: return "v5e-1"
+        case .cpu: return "CPU"
         }
     }
 

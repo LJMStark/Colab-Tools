@@ -97,6 +97,10 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
     public var highMem: Bool
     public var enableLLMModule: Bool
 
+    // Polite anti-abuse queue preferences (single-layer, minute-scale Equal Jitter, max 5 rounds / 40m)
+    public var enablePoliteQueue: Bool
+    public var queueTargets: [AcceleratorOption]
+
     // Idle shutdown watchdog settings (customizable per account)
     public var autoShutdownEnabled: Bool
     public var idleTimeoutMinutes: Int
@@ -122,6 +126,8 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         preferredAccelerator: AcceleratorOption = .autoPro,
         highMem: Bool = false,
         enableLLMModule: Bool = false,
+        enablePoliteQueue: Bool = false,
+        queueTargets: [AcceleratorOption]? = nil,
         autoShutdownEnabled: Bool = false,
         idleTimeoutMinutes: Int = 40,
         warnBeforeMinutes: Int = 2,
@@ -143,6 +149,9 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         self.preferredAccelerator = preferredAccelerator
         self.highMem = highMem
         self.enableLLMModule = enableLLMModule
+        self.enablePoliteQueue = enablePoliteQueue
+        let defaultQueue = Array(tier.queueableAccelerators.prefix(2))
+        self.queueTargets = PoliteQueuePolicy.sanitizedTargets(selected: queueTargets ?? defaultQueue, for: tier)
         self.autoShutdownEnabled = autoShutdownEnabled
         self.idleTimeoutMinutes = max(5, min(720, idleTimeoutMinutes))
         self.warnBeforeMinutes = max(0, min(15, warnBeforeMinutes))
@@ -168,6 +177,12 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         preferredAccelerator = try c.decode(AcceleratorOption.self, forKey: .preferredAccelerator)
         highMem = try c.decode(Bool.self, forKey: .highMem)
         enableLLMModule = try c.decode(Bool.self, forKey: .enableLLMModule)
+        enablePoliteQueue = try c.decodeIfPresent(Bool.self, forKey: .enablePoliteQueue) ?? false
+        let decodedQueue = try c.decodeIfPresent([AcceleratorOption].self, forKey: .queueTargets)
+        queueTargets = PoliteQueuePolicy.sanitizedTargets(
+            selected: decodedQueue ?? Array(tier.queueableAccelerators.prefix(2)),
+            for: tier
+        )
         autoShutdownEnabled = try c.decode(Bool.self, forKey: .autoShutdownEnabled)
         idleTimeoutMinutes = max(5, min(720, try c.decode(Int.self, forKey: .idleTimeoutMinutes)))
         warnBeforeMinutes = max(0, min(15, try c.decode(Int.self, forKey: .warnBeforeMinutes)))
@@ -228,12 +243,18 @@ public struct AppSettings: Codable, Equatable, Sendable {
 public enum InstancePhase: Equatable, Sendable {
     case offline
     case starting(String)
+    case queuing(attempt: Int, maxAttempts: Int, nextRetryAt: Date?, targetsSummary: String)
     case running
     case stopping
     case error(String)
 
     public var isRunning: Bool {
         if case .running = self { return true }
+        return false
+    }
+
+    public var isQueuing: Bool {
+        if case .queuing = self { return true }
         return false
     }
 
@@ -331,6 +352,8 @@ public struct AccountRuntimeState: Equatable, Sendable {
     public var lastUsageFetchAt: Date? = nil
     public var ccSwitchSynced: Bool = false
     public var sshTunnelActive: Bool = false
+    public var queueCircuitBreakUntil: Date? = nil
+    public var nonLLMReminderPending: Bool = false
     public var lastError: String? = nil
 
     public init() {}

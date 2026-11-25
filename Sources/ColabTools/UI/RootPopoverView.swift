@@ -183,7 +183,10 @@ struct RootPopoverView: View {
     private var globalDotColor: Color {
         let running = store.runningAccounts.count
         if running > 0 { return Color(nsColor: .systemGreen) }
-        if store.settings.accounts.contains(where: { store.state(for: $0.id).phase.isBusy }) {
+        if store.settings.accounts.contains(where: {
+            let ph = store.state(for: $0.id).phase
+            return ph.isBusy || ph.isQueuing
+        }) {
             return ColabTheme.amber
         }
         return Color(nsColor: .tertiaryLabelColor)
@@ -192,7 +195,21 @@ struct RootPopoverView: View {
     @ViewBuilder
     private var headerStatusPill: some View {
         let running = store.runningAccounts
-        if running.count >= 2 {
+        let queuingItem = store.settings.accounts.compactMap { acc -> (Int, Int)? in
+            if case .queuing(let a, let m, _, _) = store.state(for: acc.id).phase { return (a, m) }
+            return nil
+        }.first
+        if let q = queuingItem, running.isEmpty {
+            Text("排队 \(q.0)/\(q.1)")
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(ColabTheme.amber)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 6.5)
+                .padding(.vertical, 2)
+                .background(ColabTheme.amber.opacity(0.14), in: Capsule())
+        } else if running.count >= 2 {
             Text("\(running.count) 运行中")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)

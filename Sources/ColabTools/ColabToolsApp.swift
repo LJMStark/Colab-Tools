@@ -110,8 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 menu.addItem(withTitle: "重置空闲计时 (\(acc.displayName))", action: #selector(menuResetIdle), keyEquivalent: "")
                 menu.addItem(withTitle: "在浏览器打开 Colab", action: #selector(menuOpenWeb), keyEquivalent: "")
                 menu.addItem(withTitle: "关机止损 (\(acc.displayName))", action: #selector(menuStopCurrent), keyEquivalent: "")
+            } else if st.phase.isQueuing {
+                menu.addItem(withTitle: "取消算力排队 (\(acc.displayName))", action: #selector(menuCancelQueue), keyEquivalent: "")
             } else {
-                menu.addItem(withTitle: "一键启动 (\(acc.displayName))", action: #selector(menuStartCurrent), keyEquivalent: "")
+                menu.addItem(withTitle: acc.enablePoliteQueue ? "排队启动 (\(acc.displayName))" : "一键启动 (\(acc.displayName))", action: #selector(menuStartCurrent), keyEquivalent: "")
             }
         }
 
@@ -142,6 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Task { await store.stopAccountSession(acc.id) }
     }
 
+    @objc private func menuCancelQueue() {
+        guard let store, let acc = store.selectedAccount else { return }
+        store.cancelQueue(for: acc.id)
+    }
+
     @objc private func menuStopAll() {
         guard let store else { return }
         let targets = store.runningAccounts.map(\.0.id)
@@ -170,8 +177,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let running = store.runningAccounts
         let anyProcessing = running.contains(where: { $0.1.isProcessing })
         let anyBusy = store.settings.accounts.contains(where: { store.state(for: $0.id).phase.isBusy })
+        let activeQueueInfo: (Int, Int)? = store.settings.accounts.compactMap { acc in
+            if case .queuing(let a, let m, _, _) = store.state(for: acc.id).phase { return (a, m) }
+            return nil
+        }.first
 
-        button.image = StatusBarIcon.makeTemplateImage(isRunning: !running.isEmpty, isProcessing: anyProcessing)
+        button.image = StatusBarIcon.makeTemplateImage(isRunning: !running.isEmpty, isProcessing: anyProcessing || activeQueueInfo != nil)
         button.imagePosition = .imageLeading
 
         let title: String
@@ -181,6 +192,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .compact:
             if anyBusy {
                 title = " 处理中"
+            } else if let q = activeQueueInfo, running.isEmpty {
+                title = " 排队 \(q.0)/\(q.1)"
             } else if running.count >= 2 {
                 title = String(format: " %d 运行中 · %.1f/h", running.count, store.totalHourlyRateCU)
             } else if let (acc, st) = running.first {
@@ -196,6 +209,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .detailed:
             if anyBusy {
                 title = " 处理中…"
+            } else if let q = activeQueueInfo, running.isEmpty {
+                title = " 排队 \(q.0)/\(q.1)"
             } else if running.count >= 2 {
                 title = String(format: " %d 运行中 · %@ CU", running.count, Formatters.cu(store.totalBalanceCU))
             } else if let (acc, st) = running.first {

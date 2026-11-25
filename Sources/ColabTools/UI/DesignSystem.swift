@@ -22,7 +22,7 @@ enum ColabTheme {
     static func statusColor(for phase: InstancePhase) -> Color {
         switch phase {
         case .running: return emerald
-        case .starting, .stopping: return amber
+        case .starting, .stopping, .queuing: return amber
         case .error: return coral
         case .offline: return Color(nsColor: .tertiaryLabelColor)
         }

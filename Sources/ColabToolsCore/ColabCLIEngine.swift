@@ -516,16 +516,39 @@ public enum ColabCLIEngine {
     }
 
     /// Polite accelerator allocation: ONLY falls back to the next tier on explicit capacity unavailability (503).
-    /// Immediately stops on rate-limit (429), assignment cap (412 / precondition failed), auth errors (401/403), or uncertain timeouts.
+    /// Immediately circuit-breaks on rate-limit (429), assignment cap (412 / precondition failed), auth/abuse errors (401/403), or uncertain timeouts.
     public static func provisionSession(
         profile: AccountProfile,
+        overrideTargets: [AcceleratorOption.ProbeTarget]? = nil,
+        interTargetDelaySeconds: (@Sendable () -> TimeInterval)? = nil,
         onProgress: @escaping @Sendable (String) -> Void
-    ) async -> (allocated: String?, lastError: String?) {
+    ) async -> ProvisionOutcome {
         guard InputValidator.isValidSessionName(profile.sessionName) else {
-            return (nil, "会话名不合法（仅允许字母、数字、._-）")
+            return .circuitBroken(code: "INVALID_SESSION", message: "会话名不合法（仅允许字母、数字、._-）")
         }
-        var lastErr: String? = nil
-        for target in profile.preferredAccelerator.probeTargets {
+        let targets = overrideTargets ?? profile.preferredAccelerator.probeTargets
+        guard !targets.isEmpty else {
+            return .circuitBroken(code: "NO_TARGET", message: "未选择任何目标算力卡")
+        }
+
+        var lastOutcome: ProvisionOutcome = .capacityUnavailable503(message: "当前目标算力无库存 (503)")
+        var sawCapacity503 = false
+
+        for (index, target) in targets.enumerated() {
+            if Task.isCancelled {
+                return .circuitBroken(code: "CANCELLED", message: "已取消申请")
+            }
+            if index > 0, let delayFn = interTargetDelaySeconds {
+                let pause = max(0, delayFn())
+                if pause > 0 {
+                    onProgress("准备尝试 \(target.display)（间隔 \(Int(pause))s）…")
+                    try? await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
+                    if Task.isCancelled {
+                        return .circuitBroken(code: "CANCELLED", message: "已取消申请")
+                    }
+                }
+            }
+
             onProgress("申请 \(target.display)…")
             var args = ["new", "-s", profile.sessionName]
             if let flag = target.flag, let val = target.value {
@@ -536,33 +559,33 @@ public enum ColabCLIEngine {
             }
             let r = await runColab(profile: profile, subcommandArgs: args, timeoutSeconds: 50)
             if r.exitCode == 0 {
-                return (target.display, nil)
+                return .allocated(hardware: target.display)
             }
-            if r.timedOut {
-                return (nil, "申请 \(target.display) 超时，结果不确定，已停止继续申请以防重复计费")
-            }
-            let combined = (r.stderr + "\n" + r.stdout).lowercased()
-            if combined.contains("429") || combined.contains("too many requests") || combined.contains("rate limit") {
-                return (nil, "触发官方限流 (429)，已停止申请，请稍后再试")
-            }
-            if combined.contains("412") || combined.contains("precondition failed") || combined.contains("too many assignments") {
-                return (nil, "活跃会话已达官方上限 (412)，请先关闭已有会话")
-            }
-            if combined.contains("401") || combined.contains("403") || combined.contains("unauthorized") {
-                return (nil, "认证失效或无权限 (401/403)，请重新授权该账号")
-            }
-            if combined.contains("503") || combined.contains("service unavailable") {
-                lastErr = "\(target.display) 当前无可用库存 (503)"
-                continue // Only explicit capacity shortage triggers fallback
-            }
-            if combined.contains("400") || combined.contains("bad request") {
-                lastErr = "当前订阅不支持 \(target.display) (400)"
+            let outcome = PoliteQueuePolicy.classifyFailure(
+                exitCode: r.exitCode,
+                timedOut: r.timedOut,
+                stdout: r.stdout,
+                stderr: r.stderr,
+                targetDisplay: target.display
+            )
+            switch outcome {
+            case .allocated:
+                return outcome
+            case .circuitBroken:
+                // Hard circuit-breaker: stop immediately on 412 / 429 / 401 / 403 / timeout / unknown
+                return outcome
+            case .capacityUnavailable503:
+                sawCapacity503 = true
+                lastOutcome = outcome
+                continue
+            case .unsupportedTier400:
+                if !sawCapacity503 {
+                    lastOutcome = outcome
+                }
                 continue
             }
-            // Unknown error: stop immediately rather than looping
-            return (nil, "\(target.display) 申请异常，已停止继续尝试")
         }
-        return (nil, lastErr)
+        return lastOutcome
     }
 
     public static func stopSession(profile: AccountProfile, sessionName: String? = nil) async -> ShellResult {

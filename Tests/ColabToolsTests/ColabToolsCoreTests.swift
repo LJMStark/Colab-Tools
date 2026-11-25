@@ -236,4 +236,87 @@ final class ColabToolsCoreTests: XCTestCase {
 
         XCTAssertThrowsError(try KeychainVault.normalizeToAuthorizedUserJSON(#"{"foo":"bar"}"#))
     }
+
+    func testPoliteQueueEqualJitterCapsAndTierFiltering() {
+        // 1. Tier filtering strips illegal accelerators and preserves high-to-low order
+        let proFiltered = PoliteQueuePolicy.sanitizedTargets(selected: [.l4, .g4, .h100, .a100], for: .colabPro)
+        XCTAssertEqual(proFiltered, [.a100, .l4])
+
+        let freeFiltered = PoliteQueuePolicy.sanitizedTargets(selected: [.h100, .a100], for: .free)
+        XCTAssertEqual(freeFiltered, [.t4])
+
+        // 2. Equal Jitter stays strictly within [base/2, base] for rounds 1..4
+        let start = Date()
+        let d1Min = PoliteQueuePolicy.nextDelay(completedAttempts: 1, startedAt: start, now: start, unitRandom: 0.0)
+        let d1Max = PoliteQueuePolicy.nextDelay(completedAttempts: 1, startedAt: start, now: start, unitRandom: 1.0)
+        XCTAssertEqual(d1Min, 90)
+        XCTAssertEqual(d1Max, 180)
+
+        let d4Min = PoliteQueuePolicy.nextDelay(completedAttempts: 4, startedAt: start, now: start, unitRandom: 0.0)
+        let d4Max = PoliteQueuePolicy.nextDelay(completedAttempts: 4, startedAt: start, now: start, unitRandom: 1.0)
+        XCTAssertEqual(d4Min, 360)
+        XCTAssertEqual(d4Max, 720)
+
+        // 3. Hard ceiling: round 5 completed -> nil; elapsed near 40m -> nil
+        XCTAssertNil(PoliteQueuePolicy.nextDelay(completedAttempts: 5, startedAt: start, now: start, unitRandom: 0.5))
+        let nearCap = start.addingTimeInterval(39 * 60)
+        XCTAssertNil(PoliteQueuePolicy.nextDelay(completedAttempts: 1, startedAt: start, now: nearCap, unitRandom: 0.5))
+
+        // 4. Inter-target delay lies in [12s, 20s]
+        XCTAssertEqual(PoliteQueuePolicy.interTargetDelaySeconds(unitRandom: 0.0), 12)
+        XCTAssertEqual(PoliteQueuePolicy.interTargetDelaySeconds(unitRandom: 1.0), 20)
+    }
+
+    func testPoliteQueueCircuitBreakerClassification() {
+        // Only explicit 503 allows continuing the queue
+        if case .capacityUnavailable503 = PoliteQueuePolicy.classifyFailure(
+            exitCode: 1, timedOut: false, stdout: "", stderr: "HTTP 503 Service Unavailable", targetDisplay: "H100"
+        ) {} else {
+            XCTFail("Expected 503 capacityUnavailable503")
+        }
+
+        // 412, 429, 403, abuse message, timeout, and unknown errors MUST hard circuit-break
+        for (stderr, timedOut) in [
+            ("412 Precondition Failed: TooManyAssignmentsError", false),
+            ("HTTP 429 Too Many Requests", false),
+            ("403 Forbidden", false),
+            ("This account has been blocked from accessing Colab runtimes due to suspected abusive activity", false),
+            ("", true),
+            ("Unexpected crash", false)
+        ] {
+            if case .circuitBroken = PoliteQueuePolicy.classifyFailure(
+                exitCode: 1, timedOut: timedOut, stdout: "", stderr: stderr, targetDisplay: "G4"
+            ) {} else {
+                XCTFail("Expected circuitBroken for stderr='\(stderr)' timedOut=\(timedOut)")
+            }
+        }
+    }
+
+    func testLegacyAccountProfileDecodesWithoutQueueFields() throws {
+        let legacyJSON = """
+        {
+          "id": "11111111-1111-1111-1111-111111111111",
+          "displayName": "Legacy",
+          "email": "user@example.com",
+          "colorTag": "#F59E0B",
+          "tier": "ai_ultra",
+          "authMode": "system_oauth2",
+          "sessionName": "llm-coder",
+          "preferredAccelerator": "AUTO_BEST",
+          "highMem": false,
+          "enableLLMModule": true,
+          "autoShutdownEnabled": true,
+          "idleTimeoutMinutes": 40,
+          "warnBeforeMinutes": 2,
+          "driveScriptPath": "/content/drive/MyDrive/colab-llm/scripts/start_server.sh",
+          "autoSyncCCSwitch": true,
+          "ccSwitchProviderId": "colab-qwen",
+          "ccSwitchProviderName": "Colab Qwen",
+          "localEnvPath": ""
+        }
+        """
+        let decoded = try JSONDecoder().decode(AccountProfile.self, from: Data(legacyJSON.utf8))
+        XCTAssertFalse(decoded.enablePoliteQueue)
+        XCTAssertEqual(decoded.queueTargets, [.g4, .h100])
+    }
 }
