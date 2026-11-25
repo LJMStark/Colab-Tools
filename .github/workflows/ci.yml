@@ -7,25 +7,64 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  macos:
     runs-on: macos-15
+    env:
+      GOTOOLCHAIN: auto
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify Swift toolchain
-        run: swift --version
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Verify Go toolchain
+        run: go version
 
       - name: Lint shell scripts
         run: |
-          bash -n scripts/build-app.sh
+          bash -n scripts/package.sh
           bash -n scripts/remote/start_server.sh
           for f in scripts/templates/*.sh; do bash -n "$f"; done
 
-      - name: Run unit tests
-        run: swift test --parallel
-
-      - name: Build & verify release bundle
+      - name: Vet and run race-checked tests
         run: |
-          chmod +x scripts/build-app.sh
-          ./scripts/build-app.sh --zip
-          codesign --verify --deep --strict "build/Colab Tools.app"
+          go vet ./...
+          go test -v -race ./...
+
+      - name: Build & verify macOS + Windows bundles (zero CGO)
+        run: |
+          chmod +x scripts/package.sh
+          ./scripts/package.sh --all --zip
+          ls -lh build/Colab-Tools-*.zip
+
+  windows:
+    runs-on: windows-latest
+    env:
+      GOTOOLCHAIN: auto
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Verify Go toolchain
+        run: go version
+
+      - name: Vet and run Windows native unit tests
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Build Windows portable executable (zero CGO)
+        shell: pwsh
+        run: |
+          $env:GOFLAGS = "-trimpath"
+          go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
+          $exe = Get-ChildItem -Path build/win -Recurse -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "No Windows executable produced" }
+          Write-Host "Built: $($exe.FullName) ($($exe.Length) bytes)"

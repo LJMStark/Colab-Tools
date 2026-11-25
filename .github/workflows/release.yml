@@ -11,19 +11,60 @@ permissions:
 jobs:
   release-macos:
     runs-on: macos-15
+    env:
+      GOTOOLCHAIN: auto
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
       - name: Run tests
-        run: swift test
+        run: go test -race ./...
 
-      - name: Build release archive
+      - name: Build macOS release archive
         run: |
-          chmod +x scripts/build-app.sh
-          ./scripts/build-app.sh --zip
+          chmod +x scripts/package.sh
+          ./scripts/package.sh --mac --zip
 
-      - name: Upload to GitHub Release
+      - name: Upload macOS zip to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: build/Colab-Tools-*.zip
+          files: build/Colab-Tools-*-macOS-arm64.zip
+
+  release-windows:
+    runs-on: windows-latest
+    env:
+      GOTOOLCHAIN: auto
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Run Windows tests
+        run: go test ./...
+
+      - name: Build Windows release archive
+        shell: pwsh
+        run: |
+          $env:GOFLAGS = "-trimpath"
+          $ver = (Get-Content mygo.json | ConvertFrom-Json).version
+          go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
+          $exe = Get-ChildItem -Path build/win -Recurse -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "No Windows executable produced" }
+          New-Item -ItemType Directory -Force -Path build/win-stage | Out-Null
+          Copy-Item $exe.FullName "build/win-stage/Colab Tools.exe"
+          Compress-Archive -Path "build/win-stage/Colab Tools.exe" -DestinationPath "build/Colab-Tools-v$ver-Windows-amd64.zip" -Force
+
+      - name: Upload Windows zip to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: build/Colab-Tools-*-Windows-amd64.zip

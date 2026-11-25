@@ -3,6 +3,23 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.7] - 2026-11-25
+
+### Changed
+- **Cross-Platform Pure-Go + GPU UI Architecture (`macOS` + `Windows`)**: Rebuilt **Colab Tools** on top of [`egoist/mygo`](https://github.com/egoist/mygo) (`v0.10.0`, pure Go, `CGO_ENABLED=0`, zero Electron / zero WebView) while preserving the Mole-inspired desktop console (`1160 × 760`), 4×2 Bento vector micro-charts, 420pt system-tray companion popover, and full feature parity across macOS and Windows.
+- **Zero-CGO Cross-Platform Persistence & Security**:
+  - Replaced macOS-only `Security.framework` calls with `mygo.Secrets` (macOS Keychain / Windows Credential Manager), with transparent one-way migration for legacy `v0.3.6` `account:<UUID>` / `apikey:<UUID>` entries and `config.json` Swift reference dates (`scheduledNextFireAt`, `circuitBreakUntilByAccount`, `isolated_adc`).
+  - Replaced C `sqlite3_backup_*` in CC Switch sync with pure-Go `modernc.org/sqlite` + `VACUUM INTO` WAL-safe backups and `BEGIN IMMEDIATE` transactions.
+- **Windows Native-First + Seamless WSL2 CLI Bridge**: Automatically prefers a healthy native `colab.exe` (direct argv invocation without PowerShell quoting bugs) and transparently falls back to `wsl.exe` bridging official `google-colab-cli` inside WSL2 with automatic `C:\...` → `/mnt/c/...` path translation, CRLF normalization, and `taskkill /T /F` process-tree cleanup.
+- **Dual-Platform Packaging & CI/CD**: Replaced `scripts/build-app.sh` with [`scripts/package.sh`](scripts/package.sh) (`mygo build` + `-trimpath` + local-path leakage verification) producing signed `Colab-Tools-v0.3.7-macOS-arm64.zip` and `Colab-Tools-v0.3.7-Windows-amd64.zip`, backed by `macos-15` + `windows-latest` GitHub Actions CI & Release workflows.
+
+### Fixed
+- **State Machine, SSH Forwarding & Watchdog Hardening (Codex Review)**:
+  - Settled transitional `PhaseStarting` / `PhaseStopping` phases cleanly on authoritative server snapshots and independent post-stop `colab sessions` verification (never staying stuck or misreporting unverified stops).
+  - Switched SSH tunneling on both macOS and Windows to local OpenSSH `-N -L` backed by `ProxyCommand="colab ... ssh --proxy-mode -s <session>"` instead of passing `-L` after `colab ssh --`.
+  - Reset idle timer when LLM `/slots` `LatestTaskID` advances between 20s polls, marked signal `.unknown` on probe failures, and only incremented idle seconds while fresh idle evidence is observed.
+  - Moved stale ephemeral ADC file cleanup behind `RequestSingleInstanceLock()`, guarded allocation heatmap UI reads with lock-safe snapshots, scoped polite-queue cancel cleanup by queue token, and hardened `package.sh` local-path auditing against `pipefail` SIGPIPE.
+
 ## [0.3.6] - 2026-11-25
 
 ### Added

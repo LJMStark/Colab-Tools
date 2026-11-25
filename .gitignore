@@ -1,9 +1,9 @@
-.build/
-.swiftpm/
 build/
+dist/
 .DS_Store
-*.xcodeproj
-*.xcworkspace
+*.app
+*.exe
+*.dmg
 .env
 .env.local
 config.json
