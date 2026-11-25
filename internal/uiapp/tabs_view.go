@@ -964,6 +964,11 @@ func (m *MainUI) renderSettingsAdvanced(c *ui.Context, pal Palette) {
 					cp := acc
 					cp.WorkloadKind = k
 					cp.EnableLLMModule = (k == core.WorkloadLLM)
+					if k == core.WorkloadLLM {
+						cp.DeployRecipe = core.RecipeLLMProxy
+					} else if k != core.WorkloadVideo {
+						cp.DeployRecipe = core.RecipeNone
+					}
 					cp.RemoteServicePort = k.DefaultRemotePort()
 					cp.LocalSSHTunnelPort = k.DefaultRemotePort()
 					m.RemotePortDraft = fmt.Sprintf("%d", cp.RemoteServicePort)
@@ -986,8 +991,12 @@ func (m *MainUI) renderSettingsAdvanced(c *ui.Context, pal Palette) {
 			SmallActionButton(c, pal, "保存", nil, false, func() {
 				cp := acc
 				cp.DriveScriptPath = strings.TrimSpace(m.DriveScriptDraft)
+				if cp.DeployRecipe.IsVideoComfy() && cp.DriveScriptPath != "" {
+					// Explicit custom Drive script takes precedence over built-in video recipes
+					cp.DeployRecipe = core.RecipeNone
+				}
 				m.Svc.UpdateAccount(cp)
-				m.Svc.ShowToast("已保存远端脚本路径")
+				m.Svc.ShowToast("已保存远端脚本路径（启动将使用该自定义脚本）")
 			})
 		})
 

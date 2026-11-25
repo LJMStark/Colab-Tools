@@ -102,13 +102,27 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 		rt := p.Svc.StateFor(acc.ID)
 		if rt.Phase.IsRunning() {
 			dotCol = pal.Emerald
-			pill = fmt.Sprintf("%s · %dK", rt.ShortGPUName(), rt.ContextLimit/1024)
+			if acc.EnableLLMModule {
+				pill = fmt.Sprintf("%s · %dK", rt.ShortGPUName(), rt.ContextLimit/1024)
+			} else if acc.DeployRecipe == core.RecipeH3Video {
+				shortV := "H3 Flash"
+				if acc.H3Variant == core.H3VariantOriginal {
+					shortV = "H3 原版"
+				} else if acc.H3Variant == core.H3VariantFlashGGUF {
+					shortV = "H3 GGUF"
+				} else if acc.H3Variant == core.H3VariantCustom {
+					shortV = "H3 自定义"
+				}
+				pill = fmt.Sprintf("%s · %s", rt.ShortGPUName(), shortV)
+			} else {
+				pill = fmt.Sprintf("%s · %s", rt.ShortGPUName(), acc.WorkloadKind.DisplayName())
+			}
 		}
 	}
 
 	ui.Row(c).FillWidth().Padding(12, 16).AlignItems(ui.Center).Gap(8).Children(func() {
-		ui.Box(c).Width(8).Height(8).Radius(4).Background(dotCol)
-		ui.Text(c, "Colab Tools").FontSize(14.5).Bold().TextColor(pal.TextPrimary)
+		ui.Box(c).Width(8).Height(8).Radius(4).Background(dotCol).Shrink(0)
+		ui.Text(c, "Colab Tools").FontSize(14.5).Bold().TextColor(pal.TextPrimary).MaxLines(1)
 		Badge(c, pal, pill, nil)
 		ui.Spacer(c)
 		SmallActionButton(c, pal, "大屏", nil, false, func() {
@@ -217,14 +231,14 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 				p.OnOpenMain(app.SectionStatus)
 			}
 		})
+		p.popoverQuickBtn(c, pal, "一键部署", false, false, func() {
+			if p.OnOpenMain != nil {
+				p.OnOpenMain(app.SectionDeploy)
+			}
+		})
 		p.popoverQuickBtn(c, pal, "抢卡策略", false, false, func() {
 			if p.OnOpenMain != nil {
 				p.OnOpenMain(app.SectionCompute)
-			}
-		})
-		p.popoverQuickBtn(c, pal, "接入工具", false, false, func() {
-			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionIntegrations)
 			}
 		})
 	})
@@ -323,36 +337,47 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 	})
 
 	// Idle Watchdog + Quick Actions card
-	remMin := max(0, acc.IdleTimeoutMinutes-rt.IdleSeconds/60)
+	effMins := core.EffectiveIdleTimeoutMinutes(acc, rt)
+	remMin := max(0, (rt.RemainingIdleSeconds(effMins)+59)/60)
 	guardStatus := "未开启"
 	if acc.AutoShutdownEnabled {
 		if rt.Phase.IsRunning() {
 			guardStatus = fmt.Sprintf("剩余 %d 分钟", remMin)
 		} else {
-			guardStatus = fmt.Sprintf("%d 分钟自动关机", acc.IdleTimeoutMinutes)
+			guardStatus = fmt.Sprintf("%d 分钟自动关机", effMins)
 		}
 	}
 	SectionCard(c, pal, "空闲守护与快捷接入", guardStatus, func() {
 		hasTargets := acc.AutoSyncCCSwitch || acc.AutoSyncOpenCode || acc.AutoSyncCodex
 		allSynced := hasTargets && (!acc.AutoSyncCCSwitch || rt.CCSwitchSynced) && (!acc.AutoSyncOpenCode || rt.OpenCodeSynced) && (!acc.AutoSyncCodex || rt.CodexSynced)
+		isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
 		ui.Column(c).FillWidth().Gap(7).Children(func() {
 			ui.Row(c).FillWidth().Gap(7).Children(func() {
-				syncLbl := "配置接入"
-				if allSynced {
-					syncLbl = "✓ 已同步"
-				} else if rt.PublicURL != "" {
-					syncLbl = "同步工具"
-				}
-				p.popoverQuickBtn(c, pal, syncLbl, allSynced, false, func() {
-					if hasTargets && rt.PublicURL != "" {
-						go p.Svc.SyncAllEnabledClients(acc.ID, false)
-					} else if p.OnOpenMain != nil {
-						p.OnOpenMain(app.SectionIntegrations)
+				if isVideo {
+					p.popoverQuickBtn(c, pal, "打开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
+						go p.Svc.OpenComfyUI(acc.ID)
+					})
+					p.popoverQuickBtn(c, pal, "Drive 成片", false, false, func() {
+						p.Svc.OpenDriveOutputs()
+					})
+				} else {
+					syncLbl := "配置接入"
+					if allSynced {
+						syncLbl = "✓ 已同步"
+					} else if rt.PublicURL != "" {
+						syncLbl = "同步工具"
 					}
-				})
-				p.popoverQuickBtn(c, pal, ">_ Claude", false, !rt.Phase.IsRunning() || rt.PublicURL == "", func() {
-					p.Svc.LaunchClaudeTerminal(acc.ID)
-				})
+					p.popoverQuickBtn(c, pal, syncLbl, allSynced, false, func() {
+						if hasTargets && rt.PublicURL != "" {
+							go p.Svc.SyncAllEnabledClients(acc.ID, false)
+						} else if p.OnOpenMain != nil {
+							p.OnOpenMain(app.SectionIntegrations)
+						}
+					})
+					p.popoverQuickBtn(c, pal, ">_ Claude", false, !rt.Phase.IsRunning() || rt.PublicURL == "", func() {
+						p.Svc.LaunchClaudeTerminal(acc.ID)
+					})
+				}
 			})
 			ui.Row(c).FillWidth().Gap(7).Children(func() {
 				p.popoverQuickBtn(c, pal, "续命", false, !rt.Phase.IsRunning() || !acc.AutoShutdownEnabled, func() {

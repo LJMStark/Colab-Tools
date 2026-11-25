@@ -53,6 +53,7 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 
 	if narrowIdle {
 		acc := core.NewDefaultAccountProfile("demolongusername9876", "demolongusername9876@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+		acc.DeployRecipe = core.RecipeLLMProxy
 		acc.WorkloadKind = core.WorkloadLLM
 		acc.EnableLLMModule = true
 		svc.Settings.Accounts = []core.AccountProfile{acc}
@@ -65,9 +66,18 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 	}
 
 	acc1 := core.NewDefaultAccountProfile("Personal", "personal@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
-	acc1.SessionName = "llm-coder"
-	acc1.WorkloadKind = core.WorkloadLLM
-	acc1.EnableLLMModule = true
+	acc1.SessionName = "h3-studio"
+	acc1.HighMem = true
+	acc1.DeployRecipe = core.RecipeH3Video
+	acc1.H3Variant = core.H3VariantFlash
+	acc1.WorkloadKind = core.WorkloadVideo
+	acc1.EnableLLMModule = false
+	acc1.UseGoogleDrive = true
+	acc1.CacheBaseToDrive = true
+	acc1.AutoOpenComfyUI = true
+	acc1.StopAfterQueueDrained = true
+	acc1.QueueDrainMinutes = 10
+	acc1.IdleTimeoutMinutes = 10
 	acc1.EnablePoliteQueue = true
 	acc1.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccH100}
 	acc1.QueueFallbackEnabled = true
@@ -85,37 +95,48 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 	rt1 := core.NewAccountRuntimeState()
 	rt1.Phase = core.InstancePhase{Kind: core.PhaseRunning}
 	rt1.CUBalance = 2374.8
-	rt1.CURatePerHour = 2.33
+	rt1.CURatePerHour = 8.88
 	rt1.ActiveAssignments = 1
-	rt1.GPUName = "NVIDIA L4"
-	rt1.VRAMUsedMB = 21913
-	rt1.VRAMTotalMB = 23034
-	rt1.GPUUtilPercent = 18
-	rt1.GPUUtilHistory = []float64{12, 16, 38, 62, 40, 22, 14, 18, 52, 68, 34, 18, 16}
-	rt1.SessionUptimeSec = 12*3600 + 46*60
-	rt1.ModelFile = "Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf"
-	rt1.PromptTokens = 58200
-	rt1.LastTaskID = 118
+	rt1.GPUName = "NVIDIA A100-SXM4-80GB"
+	rt1.VRAMUsedMB = 46899
+	rt1.VRAMTotalMB = 81920
+	rt1.GPUUtilPercent = 86
+	rt1.GPUUtilHistory = []float64{42, 68, 84, 92, 88, 76, 85, 91, 89, 82, 88, 86, 84}
+	rt1.SessionUptimeSec = 1*3600 + 18*60
+	rt1.WorkloadName = "H3 Flash 极速版"
+	rt1.WorkloadDetail = "H3 Flash 极速版 · 成片直存 Drive"
+	ratio := 0.67
+	rt1.WorkloadMetricRatio = &ratio
+	rt1.QueueRunning = 1
+	rt1.QueuePending = 3
+	rt1.RenderedVideoCount = 6
 	rt1.ServerHealthy = true
+	rt1.SSHTunnelActive = true
+	port := 8188
+	rt1.ActiveSSHTunnelPort = &port
+	rt1.DetectedServicePort = &port
 	rt1.PublicURL = "https://demo-colab-node.trycloudflare.com"
-	rt1.IdleSeconds = 180
-	rt1.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
-	rt1.SignalSource = core.SignalSourceLLMSlots
+	rt1.IdleSeconds = 0
+	rt1.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
+	rt1.SignalSource = core.SignalSourceComfyQueue
 	rt1.CCSwitchSynced = true
 	rt1.OpenCodeSynced = true
 	rt1.LastUsageFetchAt = &now
 
 	acc2 := core.NewDefaultAccountProfile("Work", "work@example.com", core.TierColabProPlus, core.AuthIsolatedVaultADC)
-	acc2.SessionName = "train-a100"
+	acc2.SessionName = "llm-coder"
+	acc2.DeployRecipe = core.RecipeLLMProxy
+	acc2.WorkloadKind = core.WorkloadLLM
+	acc2.EnableLLMModule = true
 	acc2.ColorTag = core.ColorEmerald
-	acc2.HighMem = true
 	rt2 := core.NewAccountRuntimeState()
 	rt2.Phase = core.InstancePhase{Kind: core.PhaseRunning}
 	rt2.CUBalance = 584.2
-	rt2.CURatePerHour = 12.10
-	rt2.GPUName = "NVIDIA A100"
-	rt2.VRAMUsedMB = 31232
-	rt2.VRAMTotalMB = 40960
+	rt2.CURatePerHour = 2.33
+	rt2.GPUName = "NVIDIA L4"
+	rt2.VRAMUsedMB = 21913
+	rt2.VRAMTotalMB = 23034
+	rt2.ModelFile = "Qwen3.8-27B-Q4_K_XL.gguf"
 	rt2.LastUsageFetchAt = &now
 
 	acc3 := core.NewDefaultAccountProfile("Lab", "lab@example.org", core.TierFree, core.AuthIsolatedVaultADC)
@@ -171,23 +192,35 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	mui.ForceTheme = "dark"
 	tt := ui.NewTester(mui.View, 1160, 760)
 
-	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → H100") {
+	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → H100") || !tt.HasText("开 ComfyUI") {
 		t.Fatalf("missing primary dashboard text: %q", tt.Texts())
 	}
 
-	// Switch watchdog pill to 60m
-	if err := tt.Click("60m"); err != nil {
-		t.Fatalf("click 60m failed: %v", err)
+	// Switch video drain/watchdog pill to 40m
+	if err := tt.Click("40m"); err != nil {
+		t.Fatalf("click 40m failed: %v", err)
 	}
-	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 60 {
-		t.Fatalf("expected 60m after click, got %d", acc.IdleTimeoutMinutes)
+	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 40 || acc.QueueDrainMinutes != 40 {
+		t.Fatalf("expected 40m after click, got idle=%d drain=%d", acc.IdleTimeoutMinutes, acc.QueueDrainMinutes)
 	}
 
-	// Navigate across all 5 capsule tabs cleanly
-	for _, tab := range []string{"算力抢卡", "接入工具", "账号", "设置", "状态"} {
+	// Navigate across all 6 capsule tabs and verify H3 Original / Flash toggle inside Deploy page
+	for _, tab := range []string{"部署", "抢卡", "接入", "账号", "设置", "部署"} {
 		if err := tt.Click(tab); err != nil {
 			t.Fatalf("click tab %s failed: %v", tab, err)
 		}
+	}
+	if !tt.HasText("H3 原版（31B 官方满血）") || !tt.HasText("H3 Flash 极速版（13.7B）") {
+		t.Fatalf("missing H3 variant cards on deploy page: %q", tt.Texts())
+	}
+	if err := tt.Click("H3 原版（31B 官方满血）"); err != nil {
+		t.Fatalf("click H3 original failed: %v", err)
+	}
+	if acc, _ := svc.SelectedAccount(); acc.H3Variant != core.H3VariantOriginal {
+		t.Fatalf("expected H3 original variant, got %q", acc.H3Variant)
+	}
+	if err := tt.Click("状态"); err != nil {
+		t.Fatalf("return to status tab failed: %v", err)
 	}
 
 	// Onboarding wizard renders cleanly
@@ -224,6 +257,7 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	}
 
 	exportMain(app.SectionStatus, false, false, "dark", 1160, 760, "preview-main-status.png")
+	exportMain(app.SectionDeploy, false, false, "dark", 1160, 950, "preview-deploy-h3.png")
 	exportMain(app.SectionCompute, false, false, "dark", 1160, 1230, "preview-settings-queue.png")
 	exportMain(app.SectionIntegrations, false, false, "dark", 1160, 860, "preview-settings-integrations.png")
 	exportMain(app.SectionStatus, true, false, "dark", 1160, 720, "preview-onboarding.png")
@@ -250,6 +284,7 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 			renderPNG(t, mui.View, w, h, filepath.Join(qaDir, filename))
 		}
 		exportQA(app.SectionStatus, false, false, "light", 1160, 760, "qa-main-status-light.png")
+		exportQA(app.SectionDeploy, false, false, "light", 1160, 950, "qa-deploy-h3-light.png")
 		exportQA(app.SectionStatus, true, false, "light", 1160, 720, "qa-onboarding-light.png")
 		exportQA(app.SectionSettings, false, false, "dark", 1160, 740, "qa-main-settings-dark.png")
 		exportQA(app.SectionStatus, false, true, "dark", 980, 680, "qa-main-status-narrow-idle.png")

@@ -3,6 +3,21 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.8] - 2026-11-26
+
+### Added
+- **Zero-Hands Built-in H3 Video Model Deployment (`部署` Tab)**:
+  - Embedded [`scripts/templates/h3-video.sh`](scripts/templates/h3-video.sh) and [`scripts/templates/comfyui-video.sh`](scripts/templates/comfyui-video.sh) directly into the binary (`scripts/templates/embed.go`), uploaded via Base64 over stdin on start so users never need to edit or upload scripts manually.
+  - Default two-card picker for **H3 Original (31B)** and **H3 Flash (13.7B fast)**, plus expandable options for **Flash Lightweight GGUF (24GB L4 friendly)**, **custom HuggingFace repos/files** (strictly validated against injection), or **Drive-only local models** — all sharing the same 21.5 GB base weights (text encoder + video/audio VAE) without redownloading.
+- **Smart Google Drive Workflow (Fast Local NVMe Copy + Real-Time Output Save)**:
+  - Eliminated slow/flaky FUSE symlinks in both `h3-video.sh` and `comfyui-video.sh`: existing Drive models and prebuilt acceleration wheels (`.whl`) are copied sequentially via `rsync -ahW` onto `/content` local NVMe, new weights download directly over datacenter links (`hf_xet` / `hf_transfer`, with optional base cache back to Drive), and every rendered video saves straight to Drive `outputs/` so disconnects never lose work.
+- **Auto-Open ComfyUI via Local Encrypted Tunnel & Fast Queue-Drain Shutdown**:
+  - Automatically establishes a local OpenSSH encrypted tunnel (`127.0.0.1:8188`) via `colab ssh --proxy-mode` and launches the default browser once ComfyUI is ready (optional `cloudflared` link toggle available when cross-device preview is needed).
+  - Status dashboard now displays live deployment progress, ComfyUI running/pending queue counts, rendered clip counts, one-click `开 ComfyUI` / `换 H3 版本` / `Drive 成片` shortcuts, and fast auto-shutdown (`10m / 15m / 40m`) after the video queue drains to zero.
+
+### Changed
+- **Plain-Language Copy Overhaul**: Rewrote onboarding, deployment UI, and bilingual `README.md` / `README.zh-CN.md` in clear, approachable everyday language focused on real video creation and LLM proxy workflows.
+
 ## [0.3.7] - 2026-11-25
 
 ### Changed

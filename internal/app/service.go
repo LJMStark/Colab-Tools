@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"os/exec"
 	"strings"
 	"sync"
@@ -15,23 +16,30 @@ import (
 	"github.com/LJMStark/Colab-Tools/internal/integrations"
 	"github.com/LJMStark/Colab-Tools/internal/runner"
 	"github.com/LJMStark/Colab-Tools/internal/vault"
+	"github.com/LJMStark/Colab-Tools/scripts/templates"
 	"github.com/egoist/mygo"
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.7"
+const AppVersion = "0.3.8"
 
 type MainSection int
 
 const (
 	SectionStatus MainSection = iota
+	SectionDeploy
 	SectionCompute
 	SectionIntegrations
 	SectionAccounts
 	SectionSettings
 )
 
-var MainSectionTitles = []string{"状态", "算力抢卡", "接入工具", "账号", "设置"}
+var MainSectionTitles = []string{"状态", "部署", "抢卡", "接入", "账号", "设置"}
+
+type deployWatchHandle struct {
+	token  string
+	cancel context.CancelFunc
+}
 
 type queueHandle struct {
 	token  string
@@ -69,11 +77,12 @@ type Service struct {
 	cliInstallCancel context.CancelFunc
 	cliInstallToken  string
 
-	refreshing      map[string]bool
-	lastManualFetch time.Time
-	sshTunnels      map[string]*exec.Cmd
-	sshADCPaths     map[string]string
-	pendingOAuth    *colab.OAuthSessionTicket
+	refreshing         map[string]bool
+	lastManualFetch    time.Time
+	sshTunnels         map[string]*exec.Cmd
+	sshADCPaths        map[string]string
+	deployWatchCancels map[string]deployWatchHandle
+	pendingOAuth       *colab.OAuthSessionTicket
 
 	OSRunner *runner.OSRunner
 	Engine   *colab.Engine
@@ -107,10 +116,11 @@ func NewService(skipBootstrap bool) *Service {
 		Insights:       core.NewAllocationInsights(),
 		CLIInstalled:   true,
 		OnboardingStep: 1,
-		queueCancels:   map[string]queueHandle{},
-		refreshing:     map[string]bool{},
-		sshTunnels:     map[string]*exec.Cmd{},
-		sshADCPaths:    map[string]string{},
+		queueCancels:       map[string]queueHandle{},
+		refreshing:         map[string]bool{},
+		sshTunnels:         map[string]*exec.Cmd{},
+		sshADCPaths:        map[string]string{},
+		deployWatchCancels: map[string]deployWatchHandle{},
 		OSRunner:       r,
 		Engine:         colab.NewEngine(r, v),
 		Vault:          v,
@@ -268,6 +278,12 @@ func (s *Service) Shutdown() {
 			h.cancel()
 		}
 	}
+	for id, wh := range s.deployWatchCancels {
+		if wh.cancel != nil {
+			wh.cancel()
+		}
+		delete(s.deployWatchCancels, id)
+	}
 	if s.cliInstallCancel != nil {
 		s.cliInstallCancel()
 	}
@@ -395,6 +411,7 @@ func (s *Service) UpdateSettings(fn func(*core.AppSettings)) {
 
 func (s *Service) RemoveAccount(accountID string) {
 	s.CancelQueue(accountID)
+	s.cancelDeployWatcher(accountID)
 	s.StopSSHTunnel(accountID)
 	_ = s.Vault.DeleteADCCredentials(accountID)
 	_ = s.Vault.DeleteLLMAPIKey(accountID)
@@ -488,7 +505,7 @@ func (s *Service) WatchdogStatusFor(acc core.AccountProfile) core.WatchdogAction
 		ActivitySignal:        rt.ActivitySignal,
 		AutoShutdownEnabled:   acc.AutoShutdownEnabled,
 		IdleSeconds:           rt.IdleSeconds,
-		TimeoutMinutes:        acc.IdleTimeoutMinutes,
+		TimeoutMinutes:        core.EffectiveIdleTimeoutMinutes(acc, rt),
 		WarnBeforeMinutes:     acc.WarnBeforeMinutes,
 		AlreadyWarned:         rt.WarnedForCurrentIdle,
 		Now:                   time.Now(),
@@ -897,11 +914,15 @@ func (s *Service) applyServerSnapshotLocked(
 			rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
 		}
 		if rt.ActiveEndpoint != primary.Endpoint {
-			// Endpoint changed -> invalidate bound LLM URL so key never targets stale host
+			// Endpoint changed -> invalidate bound LLM URL & video deploy/auto-open state
 			rt.PublicURL = ""
 			rt.LLMURLBoundEndpoint = ""
 			rt.DisplayUIURL = ""
 			rt.ServerHealthy = false
+			rt.DeployRunning = false
+			rt.RenderedVideoCount = 0
+			rt.SawQueueBusyThisRun = false
+			rt.AutoOpenedEndpoint = ""
 		}
 		rt.ActiveEndpoint = primary.Endpoint
 		rt.ActiveHardware = primary.Hardware
@@ -922,6 +943,12 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.LLMURLBoundEndpoint = ""
 	rt.DisplayUIURL = ""
 	rt.ServerHealthy = false
+	rt.DeployRunning = false
+	rt.RenderedVideoCount = 0
+	rt.SawQueueBusyThisRun = false
+	rt.AutoOpenedEndpoint = ""
+	rt.QueueRunning = 0
+	rt.QueuePending = 0
 	rt.IdleSeconds = 0
 	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalUnknown}
 	rt.SignalSource = core.SignalSourceNone
@@ -978,8 +1005,10 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		rt.KVQuant = tel.KVQuant
 	}
 	rt.DetectedServicePort = tel.DetectedWebPort
+	rt.DeployRunning = tel.DeployAlive
+	rt.RenderedVideoCount = tel.RenderedVideoCount
 
-	// Evaluate non-LLM signals (status.json with <= 5m freshness -> ComfyUI /queue -> dual low-load hardware fallback)
+	// Evaluate non-LLM signals (active deploy -> status.json with explicit busy -> ComfyUI /queue -> dual low-load fallback)
 	statusFresh := tel.StatusPayload != nil && tel.StatusAgeSeconds != nil && *tel.StatusAgeSeconds <= core.StatusFileMaxAgeSec
 	if statusFresh {
 		if k, ok := tel.StatusPayload.ParsedKind(); ok {
@@ -991,15 +1020,31 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		rt.WorkloadMetricUnit = tel.StatusPayload.MetricUnit
 		rt.WorkloadMetricRatio = tel.StatusPayload.MetricRatio
 		rt.WorkloadDetail = tel.StatusPayload.Detail
+		// Clear stale cloudflared URL when a fresh status file reports no public UI URL
+		if tel.StatusPayload.UIURL == "" {
+			rt.DisplayUIURL = ""
+		}
 	}
 	if tel.ComfyQueue != nil {
 		rt.QueueRunning = tel.ComfyQueue.Running
 		rt.QueuePending = tel.ComfyQueue.Pending
+		if tel.ComfyQueue.IsBusy() {
+			rt.SawQueueBusyThisRun = true
+		}
 	}
 
 	if !acc.EnableLLMModule {
-		if statusFresh {
+		handled := false
+		if tel.DeployAlive {
+			handled = true
+			rt.SignalSource = core.SignalSourceStatusFile
+			rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
+			rt.IdleSeconds = 0
+			rt.WarnedForCurrentIdle = false
+		}
+		if !handled && statusFresh {
 			if busy, ok := tel.StatusPayload.IsWorkloadBusy(); ok {
+				handled = true
 				rt.SignalSource = core.SignalSourceStatusFile
 				if busy {
 					rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
@@ -1009,7 +1054,9 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 					rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
 				}
 			}
-		} else if tel.ComfyQueue != nil {
+		}
+		if !handled && tel.ComfyQueue != nil {
+			handled = true
 			rt.SignalSource = core.SignalSourceComfyQueue
 			if tel.ComfyQueue.IsBusy() {
 				rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
@@ -1018,7 +1065,8 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 			} else {
 				rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
 			}
-		} else if acc.EnableHardwareIdle {
+		}
+		if !handled && acc.EnableHardwareIdle {
 			sig := core.EvaluateHardwareActivity(tel.GPUUtil, tel.CPUUtil, rt.IsTPUHardware(), now)
 			rt.ActivitySignal = sig
 			if sig.Kind != core.SignalUnknown {
@@ -1031,9 +1079,26 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		}
 	}
 
+	shouldAutoOpenComfy := acc.DeployRecipe.IsVideoComfy() &&
+		acc.AutoOpenComfyUI &&
+		tel.ComfyQueue != nil &&
+		!tel.DeployAlive &&
+		rt.AutoOpenedEndpoint != expectedEndpoint
+	if shouldAutoOpenComfy {
+		rt.AutoOpenedEndpoint = expectedEndpoint
+	}
+
 	s.Runtime[acc.ID] = rt
 	s.mu.Unlock()
 	s.notifyUI()
+
+	if shouldAutoOpenComfy {
+		s.cancelDeployWatcher(acc.ID)
+		go func() {
+			s.SendNotification("ComfyUI 已准备好", fmt.Sprintf("%s 的 %s 已启动，正在通过本机加密通道打开画布", acc.DisplayName, acc.H3Variant.DisplayName()), false)
+			s.OpenComfyUI(acc.ID)
+		}()
+	}
 }
 
 func (s *Service) pollRunningLLMSlots() {
@@ -1401,6 +1466,11 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string)
 		}
 	}
 
+	if acc.DeployRecipe.IsVideoComfy() {
+		s.launchVideoDeployFlow(acc)
+		return
+	}
+
 	if acc.EnableLLMModule || (acc.WorkloadKind != core.WorkloadGeneral && strings.TrimSpace(acc.DriveScriptPath) != "") {
 		if s.Engine.EnsureDriveMounted(context.Background(), acc) {
 			ok, _, errMsg := s.Engine.RunDriveStartScript(context.Background(), acc)
@@ -1419,6 +1489,156 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string)
 			}
 		}
 	}
+}
+
+// ApplyDeployRecipe updates an account's one-click deploy preset and aligns ports/workload flags cleanly.
+func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	acc.DeployRecipe = recipe
+	switch recipe {
+	case core.RecipeH3Video, core.RecipeComfyUIGeneral:
+		acc.WorkloadKind = core.WorkloadVideo
+		acc.EnableLLMModule = false
+		acc.RemoteServicePort = 8188
+		acc.LocalSSHTunnelPort = 8188
+	case core.RecipeLLMProxy:
+		acc.WorkloadKind = core.WorkloadLLM
+		acc.EnableLLMModule = true
+		acc.RemoteServicePort = 18080
+		acc.LocalSSHTunnelPort = 18080
+	default:
+		acc.WorkloadKind = core.WorkloadGeneral
+		acc.EnableLLMModule = false
+	}
+	s.UpdateAccount(acc)
+}
+
+// DeployNow starts a machine (and deploys after allocation) if offline, or immediately pushes the built-in deploy script if online.
+func (s *Service) DeployNow(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	if acc.DeployRecipe == core.RecipeH3Video {
+		if _, err := core.BuildDeployEnv(acc); err != nil {
+			s.ShowToast(err.Error())
+			return
+		}
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.StartAccountSession(accountID)
+		return
+	}
+	if acc.DeployRecipe.IsVideoComfy() {
+		go s.launchVideoDeployFlow(acc)
+	} else {
+		s.ShowToast("机器已在运行中")
+	}
+}
+
+func (s *Service) cancelDeployWatcher(accountID string) {
+	s.mu.Lock()
+	if wh, ok := s.deployWatchCancels[accountID]; ok {
+		if wh.cancel != nil {
+			wh.cancel()
+		}
+		delete(s.deployWatchCancels, accountID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) clearDeployWatcherIfToken(accountID, token string) {
+	s.mu.Lock()
+	if wh, ok := s.deployWatchCancels[accountID]; ok && wh.token == token {
+		if wh.cancel != nil {
+			wh.cancel()
+		}
+		delete(s.deployWatchCancels, accountID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
+	envVars, err := core.BuildDeployEnv(acc)
+	if err != nil {
+		s.ShowToast(err.Error())
+		return
+	}
+
+	if acc.UseGoogleDrive {
+		s.ShowToast("正在挂载 Google Drive（复用模型并自动存成片）…")
+		if !s.Engine.EnsureDriveMounted(context.Background(), acc) {
+			s.ShowToast("Google Drive 暂未完成授权，先直接云端下载试跑（成片请记得保存）")
+		}
+	}
+
+	scriptBody := templates.H3VideoScript
+	if acc.DeployRecipe == core.RecipeComfyUIGeneral {
+		scriptBody = templates.ComfyUIVideoScript
+	}
+	if err := s.Engine.StartBuiltinDeployScript(context.Background(), acc, scriptBody, envVars); err != nil {
+		s.ShowToast("送出部署脚本失败：" + err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	cur := s.Runtime[acc.ID]
+	cur.DeployRunning = true
+	cur.WorkloadMetricLabel = "正在部署"
+	cur.WorkloadMetricValue = "10%"
+	cur.WorkloadMetricUnit = "准备中"
+	ratio := 0.10
+	cur.WorkloadMetricRatio = &ratio
+	cur.WorkloadDetail = fmt.Sprintf("正在云端自动部署 %s…", acc.H3Variant.DisplayName())
+	cur.AutoOpenedEndpoint = ""
+	s.Runtime[acc.ID] = cur
+	s.mu.Unlock()
+	s.notifyUI()
+	s.ShowToast("已自动把部署脚本送到云端，大屏将实时显示拷贝与加载进度")
+
+	// Start a bounded 12s progress watcher (up to 18 minutes) scoped by unique token so old watchers never cancel newer deploys
+	s.cancelDeployWatcher(acc.ID)
+	watchToken := uuid.New().String()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.deployWatchCancels[acc.ID] = deployWatchHandle{token: watchToken, cancel: cancel}
+	s.mu.Unlock()
+
+	go func() {
+		defer s.clearDeployWatcherIfToken(acc.ID, watchToken)
+		tk := time.NewTicker(12 * time.Second)
+		defer tk.Stop()
+		deadline := time.Now().Add(18 * time.Minute)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.stopLoops:
+				return
+			case <-tk.C:
+				if time.Now().After(deadline) {
+					return
+				}
+				latestAcc, ok := s.accountByID(acc.ID)
+				if !ok {
+					return
+				}
+				rt := s.StateFor(acc.ID)
+				if !rt.Phase.IsRunning() || rt.ActiveEndpoint == "" {
+					return
+				}
+				s.fetchAndApplyTelemetry(latestAcc, rt.ActiveEndpoint)
+				after := s.StateFor(acc.ID)
+				if !after.DeployRunning && after.ServerHealthy {
+					return
+				}
+			}
+		}
+	}()
 }
 
 func (s *Service) StopAccountSession(accountID, specificSession, reason string) {
@@ -1450,6 +1670,7 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 	s.notifyUI()
 
 	if targetSession == acc.SessionName {
+		s.cancelDeployWatcher(accountID)
 		s.StopSSHTunnel(accountID)
 	}
 	stopRes := s.Engine.StopSession(context.Background(), acc, targetSession)
@@ -1647,13 +1868,47 @@ func (s *Service) LaunchClaudeTerminal(accountID string) {
 	}
 }
 
+func pickAvailableLocalPort(preferred int, used map[int]bool) int {
+	isFree := func(p int) bool {
+		if p < 1024 || p > 65535 || used[p] {
+			return false
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			return false
+		}
+		_ = ln.Close()
+		return true
+	}
+	if isFree(preferred) {
+		return preferred
+	}
+	for offset := 1; offset <= 32; offset++ {
+		if isFree(preferred + offset) {
+			return preferred + offset
+		}
+	}
+	if ln, err := net.Listen("tcp", "127.0.0.1:0"); err == nil {
+		addr := ln.Addr().(*net.TCPAddr)
+		_ = ln.Close()
+		return addr.Port
+	}
+	return preferred
+}
+
 func (s *Service) ToggleSSHTunnel(accountID string) {
 	s.mu.RLock()
 	_, active := s.sshTunnels[accountID]
+	usedPorts := map[int]bool{}
+	for id, rt := range s.Runtime {
+		if id != accountID && rt.SSHTunnelActive && rt.ActiveSSHTunnelPort != nil {
+			usedPorts[*rt.ActiveSSHTunnelPort] = true
+		}
+	}
 	s.mu.RUnlock()
 	if active {
 		s.StopSSHTunnel(accountID)
-		s.ShowToast("SSH 隧道已断开")
+		s.ShowToast("本机加密通道已断开")
 		return
 	}
 	acc, ok := s.accountByID(accountID)
@@ -1669,7 +1924,7 @@ func (s *Service) ToggleSSHTunnel(accountID string) {
 	if rt.DetectedServicePort != nil {
 		remotePort = *rt.DetectedServicePort
 	}
-	localPort := acc.LocalSSHTunnelPort
+	localPort := pickAvailableLocalPort(acc.LocalSSHTunnelPort, usedPorts)
 	adcPath := ""
 	if acc.AuthMode == core.AuthIsolatedVaultADC {
 		if raw, err := s.Vault.LoadADCCredentials(acc.ID); err == nil {
@@ -1702,8 +1957,79 @@ func (s *Service) ToggleSSHTunnel(accountID string) {
 
 	go func() {
 		_ = proc.Wait()
-		s.StopSSHTunnel(accountID)
+		s.stopSSHTunnelIfMatches(accountID, proc)
 	}()
+}
+
+func (s *Service) stopSSHTunnelIfMatches(accountID string, proc *exec.Cmd) {
+	s.mu.RLock()
+	cur := s.sshTunnels[accountID]
+	s.mu.RUnlock()
+	if cur == proc {
+		s.StopSSHTunnel(accountID)
+	}
+}
+
+// OpenComfyUI ensures a local encrypted SSH tunnel to ComfyUI (:8188) is live, waits briefly for localhost port readiness, and opens the default browser.
+func (s *Service) OpenComfyUI(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("请先开机并部署后再打开 ComfyUI")
+		return
+	}
+	if rt.IsFreeRuntimeRestricted(acc) {
+		if rt.DisplayUIURL != "" && s.URLOpener != nil {
+			s.URLOpener(rt.DisplayUIURL)
+			return
+		}
+		s.ShowToast("免费版不支持本机加密通道，请打开「cloudflared 临时链接」或直接点 Colab 网页")
+		return
+	}
+	if !rt.SSHTunnelActive {
+		s.ToggleSSHTunnel(accountID)
+	}
+	rt = s.StateFor(accountID)
+	if !rt.SSHTunnelActive || rt.ActiveSSHTunnelPort == nil {
+		s.ShowToast("本机加密通道未能启动，请检查本机 OpenSSH 或重试")
+		return
+	}
+	port := *rt.ActiveSSHTunnelPort
+	// Verify BOTH that this account's own tunnel process stays alive AND its bound localhost port accepts TCP connections
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(8 * time.Second)
+	connected := false
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		_, stillAlive := s.sshTunnels[accountID]
+		s.mu.RUnlock()
+		if !stillAlive {
+			break
+		}
+		conn, err := net.DialTimeout("tcp", addr, 350*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			connected = true
+			break
+		}
+		time.Sleep(350 * time.Millisecond)
+	}
+	if !connected {
+		s.ShowToast(fmt.Sprintf("本机通道 127.0.0.1:%d 暂未连通，请确认 ComfyUI 已就绪后再试", port))
+		return
+	}
+	if s.URLOpener != nil {
+		s.URLOpener("http://" + addr)
+	}
+}
+
+func (s *Service) OpenDriveOutputs() {
+	if s.URLOpener != nil {
+		s.URLOpener("https://drive.google.com/drive/search?q=ColabTools")
+	}
 }
 
 func (s *Service) StopSSHTunnel(accountID string) {
@@ -1804,13 +2130,14 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 				rt.IdleSeconds++
 			}
 			allowFallback := acc.EnableHardwareIdle || rt.SignalSource == core.SignalSourceStatusFile || rt.SignalSource == core.SignalSourceComfyQueue
+			effectiveTimeout := core.EffectiveIdleTimeoutMinutes(*acc, rt)
 			act := core.EvaluateWatchdog(core.WatchdogInput{
 				IsRunning:             true,
 				EnableLLMModule:       acc.EnableLLMModule,
 				ActivitySignal:        rt.ActivitySignal,
 				AutoShutdownEnabled:   acc.AutoShutdownEnabled,
 				IdleSeconds:           rt.IdleSeconds,
-				TimeoutMinutes:        acc.IdleTimeoutMinutes,
+				TimeoutMinutes:        effectiveTimeout,
 				WarnBeforeMinutes:     acc.WarnBeforeMinutes,
 				AlreadyWarned:         rt.WarnedForCurrentIdle,
 				Now:                   now,

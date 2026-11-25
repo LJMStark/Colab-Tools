@@ -50,6 +50,7 @@ func (f *fakeRunner) LookPath(_ string) string { return "/usr/local/bin/colab" }
 func TestPhaseSettlementPostAllocAndStopVerification(t *testing.T) {
 	svc := NewService(true)
 	acc := core.NewDefaultAccountProfile("Primary", "primary@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeNone
 	acc.EnableLLMModule = false
 	acc.DriveScriptPath = ""
 	svc.Settings.Accounts = []core.AccountProfile{acc}
@@ -162,4 +163,77 @@ func TestIdleTickOnlyCountsFreshIdleEvidenceAndInsightsSnapshotIsRaceFree(t *tes
 		}
 	}()
 	wg.Wait()
+}
+
+func TestVideoQueueDrainFastAutoShutdownAndDeployRecipeSync(t *testing.T) {
+	svc := NewService(true)
+	acc := core.NewDefaultAccountProfile("H3User", "h3@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.IdleTimeoutMinutes = 40
+	acc.QueueDrainMinutes = 10
+	acc.StopAfterQueueDrained = true
+	acc.AutoShutdownEnabled = true
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+
+	// Switching recipes keeps ports & workload kind aligned cleanly
+	svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
+	gotAcc, _ := svc.accountByID(acc.ID)
+	if !gotAcc.EnableLLMModule || gotAcc.RemoteServicePort != 18080 {
+		t.Fatalf("expected LLM proxy recipe alignment, got %+v", gotAcc)
+	}
+	svc.ApplyDeployRecipe(acc.ID, core.RecipeH3Video)
+	gotAcc, _ = svc.accountByID(acc.ID)
+	if gotAcc.EnableLLMModule || gotAcc.WorkloadKind != core.WorkloadVideo || gotAcc.RemoteServicePort != 8188 {
+		t.Fatalf("expected H3 video recipe alignment, got %+v", gotAcc)
+	}
+
+	// Once video queue was busy and then drains to 0/0, 10m idle triggers fast shutdown even though general IdleTimeout is 40m
+	var stopped atomicStopTracker
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "stop") || strings.Contains(cmd, "rm") {
+			stopped.mark()
+		}
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		}
+		return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	now := time.Now()
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.SawQueueBusyThisRun = true
+	rt.QueueRunning = 0
+	rt.QueuePending = 0
+	rt.IdleSeconds = 10*60 - 1 // 1 second before 10m drain timeout
+	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now.Add(-5 * time.Second)}
+	rt.SignalSource = core.SignalSourceComfyQueue
+	svc.Runtime[acc.ID] = rt
+
+	svc.handleOneSecondTick(now)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !stopped.didStop() {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !stopped.didStop() {
+		t.Fatal("expected fast auto-shutdown after ComfyUI queue drained for QueueDrainMinutes")
+	}
+}
+
+type atomicStopTracker struct {
+	mu      sync.Mutex
+	stopped bool
+}
+
+func (a *atomicStopTracker) mark() {
+	a.mu.Lock()
+	a.stopped = true
+	a.mu.Unlock()
+}
+
+func (a *atomicStopTracker) didStop() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stopped
 }

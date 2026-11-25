@@ -271,9 +271,9 @@ func (m *MainUI) onboardingStep3Tour(c *ui.Context, pal Palette) {
 		})
 
 		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(12).Children(func() {
-			m.tourTile(c, pal, pal.Amber, "顺位抢卡与错峰预约", "勾选想要的显卡并排好顺位，设好两阶段保底卡；推荐约清晨 06:30–07:30 欧美低峰自动拿卡。")
-			m.tourTile(c, pal, pal.Emerald, "空闲自动关机省点数", "支持 LLM、视频、生图与训练负载；优先读应用状态，兜底需 GPU+CPU 双低载才会关机，防误杀不烧钱。")
-			m.tourTile(c, pal, pal.Sky, "全生态客户端接入", "自动检测本机 CC Switch、OpenCode、Codex CLI 与 Claude Code；其余工具支持 OpenAI / Anthropic 双协议一键复制。")
+			m.tourTile(c, pal, pal.Violet, "一键部署 H3 视频模型", "默认选「H3 原版」或「H3 Flash 极速版」，也能换轻量 GGUF 或自定义链接；开机自动装好并通过本机加密通道打开 ComfyUI。")
+			m.tourTile(c, pal, pal.Emerald, "跑完自动关机省点数", "视频队列全部生成完就自动倒计时停卡，并去官网再查一次确认停了——再也不用担心忘关机挂一晚白扣几十点。")
+			m.tourTile(c, pal, pal.Amber, "顺位抢卡 + 大模型代理", "热门 A100 / G4 没货时按顺位自动排队，还能约清晨低峰开机；想跑大模型给 Claude / OpenCode 用，切一下模式就行。")
 		})
 
 		ui.Row(c).FillWidth().Padding(8, 0, 0, 0).Children(func() {

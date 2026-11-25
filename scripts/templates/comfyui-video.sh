@@ -1,68 +1,94 @@
 #!/usr/bin/env bash
-# Colab Tools Starter Template — ComfyUI Video / Image Generation
-# Copy to Google Drive (e.g. /content/drive/MyDrive/colab-tools/comfyui-video.sh),
-# customize COMFY_DIR / MODEL_NAME, and select "视频生成" or "图像生成" in Colab Tools.
+# Colab Tools Built-in / Starter Template — General ComfyUI Video & Image Studio
+# Uses sequential `rsync -ahW` from Google Drive to local NVMe (never FUSE symlinks for large weights)
+# and writes every rendered video/image straight to Google Drive outputs.
 set -euo pipefail
 
 SERVICE_PORT="${SERVICE_PORT:-8188}"
 WORKLOAD_KIND="${WORKLOAD_KIND:-video}"
+USE_GOOGLE_DRIVE="${USE_GOOGLE_DRIVE:-1}"
 COMFY_DIR="${COMFY_DIR:-/content/ComfyUI}"
-DRIVE_MODELS="${DRIVE_MODELS:-/content/drive/MyDrive/comfyui-models}"
-DRIVE_OUTPUT="${DRIVE_OUTPUT:-/content/drive/MyDrive/comfyui-output}"
-WORKLOAD_NAME="${WORKLOAD_NAME:-ComfyUI (${WORKLOAD_KIND})}"
+# Prefer new DRIVE_*_DIR env vars while preserving backwards compatibility with legacy DRIVE_MODELS / DRIVE_OUTPUT
+DRIVE_MODELS="${DRIVE_MODELS_DIR:-${DRIVE_MODELS:-/content/drive/MyDrive/ColabTools/models}}"
+DRIVE_OUTPUT="${DRIVE_OUTPUT_DIR:-${DRIVE_OUTPUT:-/content/drive/MyDrive/ColabTools/outputs}}"
+ENABLE_CLOUDFLARED="${ENABLE_CLOUDFLARED:-0}"
+WORKLOAD_NAME="${WORKLOAD_NAME:-ComfyUI 视频/绘图}"
 STATUS_FILE="/tmp/colab-tools-status.json"
 LOG_FILE="/tmp/comfyui.log"
-
-mkdir -p "$DRIVE_OUTPUT"
-if [ ! -w "$DRIVE_OUTPUT" ]; then
-  echo "[error] Output directory is not writable: $DRIVE_OUTPUT" >&2
-  exit 1
-fi
+CF_LOG_FILE="/tmp/cloudflared-comfy.log"
 
 write_status() {
-  local ui_url="${1:-}"
-  python3 - "$STATUS_FILE" "$WORKLOAD_KIND" "$WORKLOAD_NAME" "$ui_url" "$SERVICE_PORT" "$DRIVE_OUTPUT" <<'PY'
+  local label="$1"
+  local val="$2"
+  local unit="$3"
+  local ratio="$4"
+  local busy="$5"
+  local detail="$6"
+  local ui_url="${7:-}"
+  python3 - "$STATUS_FILE" "$WORKLOAD_KIND" "$WORKLOAD_NAME" "$SERVICE_PORT" "$label" "$val" "$unit" "$ratio" "$busy" "$detail" "$ui_url" <<'PY'
 import json, pathlib, sys
-dst, kind, name, ui_url, port_s, out_dir = sys.argv[1:]
-port = int(port_s)
-if not (1024 <= port <= 65535):
-    raise SystemExit(f"Invalid port: {port}")
+dst, kind, name, port_s, label, val, unit, ratio_s, busy_s, detail, ui_url = sys.argv[1:]
 payload = {
     "kind": kind,
     "name": name,
+    "port": int(port_s),
+    "metric_label": label,
+    "metric_value": val,
+    "metric_unit": unit,
+    "metric_ratio": max(0.0, min(1.0, float(ratio_s))),
+    "detail": detail,
     "ui_url": ui_url,
-    "port": port,
-    "detail": f"ComfyUI :{port} · Output -> {pathlib.Path(out_dir).name}",
 }
+if busy_s == "true":
+    payload["busy"] = True
+elif busy_s == "false":
+    payload["busy"] = False
 tmp = pathlib.Path(dst + ".tmp")
 tmp.write_text(json.dumps(payload, ensure_ascii=False))
 tmp.replace(dst)
 PY
 }
 
+DRIVE_AVAILABLE=0
+if [ "$USE_GOOGLE_DRIVE" = "1" ] && [ -d "/content/drive/MyDrive" ]; then
+  DRIVE_AVAILABLE=1
+  OUTPUT_DIR="$DRIVE_OUTPUT"
+  mkdir -p "$OUTPUT_DIR"
+else
+  OUTPUT_DIR="/content/output"
+  mkdir -p "$OUTPUT_DIR"
+fi
+
+write_status "正在部署" "25%" "装 ComfyUI" "0.25" "true" "准备 ComfyUI 运行环境…"
 if [ ! -d "$COMFY_DIR" ]; then
-  echo "[template] Cloning ComfyUI into $COMFY_DIR..."
   git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
   pip install -q -r "$COMFY_DIR/requirements.txt"
 fi
 
-# Link Google Drive models when present
-if [ -d "$DRIVE_MODELS" ] && [ ! -e "$COMFY_DIR/models/drive_shared" ]; then
+# Copy Drive models sequentially to local NVMe (never symlink large .safetensors directly over Drive FUSE)
+if [ "$DRIVE_AVAILABLE" = "1" ] && [ -d "$DRIVE_MODELS" ]; then
+  write_status "拷贝模型" "60%" "拷到本地盘" "0.60" "true" "将 Drive 模型顺序拷至本地高速盘…"
   mkdir -p "$COMFY_DIR/models"
-  ln -s "$DRIVE_MODELS" "$COMFY_DIR/models/drive_shared"
+  rsync -ahW --ignore-existing "$DRIVE_MODELS/" "$COMFY_DIR/models/" || true
 fi
 
-# Start ComfyUI cleanly with explicit Drive --output-directory (never relying on symlinking an existing directory)
-if ! curl -sf "http://127.0.0.1:${SERVICE_PORT}/queue" >/dev/null 2>&1; then
-  nohup python3 "$COMFY_DIR/main.py" \
-    --listen 127.0.0.1 \
-    --port "$SERVICE_PORT" \
-    --output-directory "$DRIVE_OUTPUT" \
-    --disable-auto-launch \
-    > "$LOG_FILE" 2>&1 &
-fi
+# Cleanly restart ComfyUI so updated --output-directory / newly copied models always apply
+write_status "启动画布" "85%" "ComfyUI" "0.85" "true" "正在启动 ComfyUI :${SERVICE_PORT}…"
+pkill -f "${COMFY_DIR}/main.py" 2>/dev/null || true
+for _ in $(seq 1 10); do
+  if ! curl -sf "http://127.0.0.1:${SERVICE_PORT}/queue" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
 
-# Wait up to 90s for ComfyUI API readiness
+nohup python3 "$COMFY_DIR/main.py" \
+  --listen 127.0.0.1 \
+  --port "$SERVICE_PORT" \
+  --output-directory "$OUTPUT_DIR" \
+  --disable-auto-launch \
+  > "$LOG_FILE" 2>&1 &
+
 for _ in $(seq 1 45); do
   if curl -sf "http://127.0.0.1:${SERVICE_PORT}/queue" >/dev/null 2>&1; then
     break
@@ -71,15 +97,34 @@ for _ in $(seq 1 45); do
 done
 
 if ! curl -sf "http://127.0.0.1:${SERVICE_PORT}/queue" >/dev/null 2>&1; then
-  echo "[error] ComfyUI did not become ready on port ${SERVICE_PORT}. Tail of log:"
-  tail -n 30 "$LOG_FILE" || true
+  echo "[error] ComfyUI did not become ready on port ${SERVICE_PORT}" >&2
+  tail -n 30 "$LOG_FILE" >&2 || true
   exit 1
 fi
 
-# Optional: leave PUBLIC_URL empty and use Colab Tools' built-in one-click SSH Tunnel (127.0.0.1:8188)
+# Always reclaim previous cloudflared tunnel before optionally starting a new one
+pkill -f "cloudflared tunnel --url http://127.0.0.1:${SERVICE_PORT}" 2>/dev/null || true
 PUBLIC_URL=""
-write_status "$PUBLIC_URL"
+if [ "$ENABLE_CLOUDFLARED" = "1" ]; then
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+    chmod +x /usr/local/bin/cloudflared
+  fi
+  nohup cloudflared tunnel --url "http://127.0.0.1:${SERVICE_PORT}" --no-autoupdate > "$CF_LOG_FILE" 2>&1 &
+  for _ in $(seq 1 20); do
+    PUBLIC_URL="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$CF_LOG_FILE" | head -n 1 || true)"
+    if [ -n "$PUBLIC_URL" ]; then
+      break
+    fi
+    sleep 1
+  done
+fi
 
+SAVE_NOTE="成片暂存云端"
+if [ "$DRIVE_AVAILABLE" = "1" ]; then
+  SAVE_NOTE="成片直存 Drive · $(basename "$OUTPUT_DIR")"
+fi
+write_status "画布已就绪" "待命" "0 排队" "1.0" "unset" "ComfyUI :${SERVICE_PORT} · ${SAVE_NOTE}" "$PUBLIC_URL"
 echo "WORKLOAD_NAME=${WORKLOAD_NAME}"
 if [ -n "$PUBLIC_URL" ]; then
   echo "PUBLIC_URL=${PUBLIC_URL}"

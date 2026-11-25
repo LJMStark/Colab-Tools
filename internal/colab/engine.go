@@ -2,6 +2,7 @@ package colab
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,10 +49,12 @@ type RemoteTelemetry struct {
 	KVQuant          string
 	Healthy          bool
 	UptimeSeconds    int
-	StatusPayload    *core.WorkloadStatusPayload
-	StatusAgeSeconds *int
-	ComfyQueue       *core.ComfyQueueSummary
-	DetectedWebPort  *int
+	StatusPayload      *core.WorkloadStatusPayload
+	StatusAgeSeconds   *int
+	ComfyQueue         *core.ComfyQueueSummary
+	DetectedWebPort    *int
+	DeployAlive        bool
+	RenderedVideoCount int
 }
 
 type ProbeAttemptRecord struct {
@@ -345,6 +348,31 @@ if not health_ok:
             health_ok = True
             break
 print("HEALTH=" + ("ok" if health_ok else ""))
+deploy_alive = False
+pid_p = pathlib.Path("/tmp/colab-tools-deploy.pid")
+if pid_p.exists():
+    try:
+        dpid = int(pid_p.read_text().strip())
+        cmd_p = pathlib.Path(f"/proc/{dpid}/cmdline")
+        stat_p = pathlib.Path(f"/proc/{dpid}/stat")
+        if cmd_p.exists() and "colab-tools-deploy.sh" in cmd_p.read_bytes().decode("utf-8", errors="ignore"):
+            st_txt = stat_p.read_text(errors="ignore") if stat_p.exists() else ""
+            if ") Z " not in st_txt:
+                deploy_alive = True
+    except Exception:
+        pass
+print("DEPLOY_ALIVE=" + ("1" if deploy_alive else "0"))
+out_count = 0
+for odir in [%q, "/content/drive/MyDrive/ColabTools/outputs", "/content/output"]:
+    op = pathlib.Path(odir)
+    if op.is_dir():
+        try:
+            out_count = sum(1 for f in op.iterdir() if f.is_file() and f.suffix.lower() in (".mp4", ".webm", ".mov", ".mkv", ".gif"))
+            if out_count > 0:
+                break
+        except Exception:
+            pass
+print(f"OUT_VIDEOS={out_count}")
 meta_p = pathlib.Path("/tmp/llama-server.meta")
 if meta_p.exists():
     print("META=" + meta_p.read_text(errors="ignore").strip())
@@ -360,7 +388,7 @@ else:
         "kv": kv.group(1) if kv else "q4_0",
         "alias": al.group(1) if al else ""
     }))
-`, port, port, port, port, port, port)
+`, port, port, port, port, port, port, profile.DriveOutputDir)
 
 	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 30*time.Second)
 	if r.ExitCode != 0 {
@@ -395,6 +423,10 @@ else:
 			}
 		case strings.HasPrefix(raw, "HEALTH="):
 			t.Healthy = strings.Contains(raw, "ok")
+		case strings.HasPrefix(raw, "DEPLOY_ALIVE="):
+			t.DeployAlive = strings.TrimSpace(strings.TrimPrefix(raw, "DEPLOY_ALIVE=")) == "1"
+		case strings.HasPrefix(raw, "OUT_VIDEOS="):
+			t.RenderedVideoCount, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "OUT_VIDEOS=")))
 		case strings.HasPrefix(raw, "UPTIME="):
 			t.UptimeSeconds, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "UPTIME=")))
 		case strings.HasPrefix(raw, "WEB_PORT="):
@@ -690,6 +722,55 @@ print(f"SCRIPT_EXIT_CODE={rc}", flush=True)
 		reason = "启动脚本超时"
 	}
 	return false, r.Stdout, reason
+}
+
+// StartBuiltinDeployScript uploads a built-in script via Base64 over stdin (no host path/WSL issues,
+// immune to shell injection) and launches it detached in the background on the Colab VM.
+func (e *Engine) StartBuiltinDeployScript(ctx context.Context, profile core.AccountProfile, scriptBody string, envVars map[string]string) error {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return errors.New("会话名不合法")
+	}
+	scriptB64 := base64.StdEncoding.EncodeToString([]byte(scriptBody))
+	envJSON, err := json.Marshal(envVars)
+	if err != nil {
+		return err
+	}
+	envB64 := base64.StdEncoding.EncodeToString(envJSON)
+
+	py := fmt.Sprintf(`import base64, json, os, pathlib, signal, subprocess
+script_path = pathlib.Path("/tmp/colab-tools-deploy.sh")
+pid_path = pathlib.Path("/tmp/colab-tools-deploy.pid")
+if pid_path.exists():
+    try:
+        old_pid = int(pid_path.read_text().strip())
+        if pathlib.Path(f"/proc/{old_pid}/cmdline").exists():
+            os.killpg(old_pid, signal.SIGTERM)
+    except Exception:
+        pass
+script_path.write_bytes(base64.b64decode("%s"))
+os.chmod(script_path, 0o700)
+extra = json.loads(base64.b64decode("%s").decode("utf-8"))
+env = os.environ.copy()
+for k, v in extra.items():
+    env[str(k)] = str(v)
+logf = open("/tmp/colab-tools-deploy.log", "wb")
+proc = subprocess.Popen(["bash", "/tmp/colab-tools-deploy.sh"], stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+pid_path.write_text(str(proc.pid))
+print("DEPLOY_LAUNCHED=1")
+`, scriptB64, envB64)
+
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 40*time.Second)
+	if r.ExitCode == 0 && strings.Contains(r.Stdout, "DEPLOY_LAUNCHED=1") {
+		return nil
+	}
+	msg := strings.TrimSpace(r.Stderr)
+	if msg == "" {
+		msg = strings.TrimSpace(r.Stdout)
+	}
+	if msg == "" {
+		msg = "未能把部署脚本送到云端机器"
+	}
+	return errors.New(msg)
 }
 
 func (e *Engine) ResolveColabURL(ctx context.Context, profile core.AccountProfile, sessionName string) string {

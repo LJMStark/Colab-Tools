@@ -274,3 +274,65 @@ func TestAllocationInsightsAndLegacyOnboardingMigration(t *testing.T) {
 		t.Fatal("expected corrupt config backup file to be written")
 	}
 }
+
+func TestH3DeployEnvValidationAndSanitization(t *testing.T) {
+	acc := core.NewDefaultAccountProfile("Video", "v@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.H3Variant = core.H3VariantOriginal
+	env, err := core.BuildDeployEnv(acc)
+	if err != nil {
+		t.Fatalf("unexpected error for original variant: %v", err)
+	}
+	if env["H3_VARIANT"] != "original" || env["USE_GOOGLE_DRIVE"] != "1" || env["ENABLE_CLOUDFLARED"] != "0" {
+		t.Fatalf("unexpected deploy env: %+v", env)
+	}
+
+	// Custom variant rejects command-injection repo / traversal paths
+	acc.H3Variant = core.H3VariantCustom
+	acc.H3DriveOnly = false
+	acc.H3CustomHFRepo = "bad; rm -rf /"
+	acc.H3CustomHFFiles = "../evil.safetensors"
+	if _, err := core.BuildDeployEnv(acc); err == nil {
+		t.Fatal("expected invalid custom HF repo/files to be rejected")
+	}
+
+	// Valid custom repo & Drive-only mode both pass cleanly
+	acc.H3CustomHFRepo = "VideoRebirthAI/hyperflow-h3-flash"
+	acc.H3CustomHFFiles = "fl2va_gguf/model.gguf, ref2va_gguf/model2.gguf"
+	env2, err := core.BuildDeployEnv(acc)
+	if err != nil || env2["H3_CUSTOM_HF_REPO"] != "VideoRebirthAI/hyperflow-h3-flash" {
+		t.Fatalf("expected valid custom HF config, got %+v err=%v", env2, err)
+	}
+
+	acc.H3DriveOnly = true
+	acc.H3CustomHFRepo = ""
+	acc.H3CustomHFFiles = ""
+	if env3, err := core.BuildDeployEnv(acc); err != nil || env3["H3_DRIVE_ONLY"] != "1" {
+		t.Fatalf("expected drive-only custom mode to pass, got %+v err=%v", env3, err)
+	}
+
+	// Switching back to a built-in H3 preset must NOT carry over custom H3DriveOnly=1
+	acc.H3Variant = core.H3VariantFlash
+	if env4, err := core.BuildDeployEnv(acc); err != nil || env4["H3_DRIVE_ONLY"] != "0" {
+		t.Fatalf("built-in H3 preset must force H3_DRIVE_ONLY=0, got %+v err=%v", env4, err)
+	}
+
+	// EffectiveIdleTimeoutMinutes stays consistent between UI display and watchdog execution
+	rt := core.NewAccountRuntimeState()
+	acc.IdleTimeoutMinutes = 40
+	acc.QueueDrainMinutes = 10
+	acc.StopAfterQueueDrained = true
+	acc.EnableLLMModule = false
+	if got := core.EffectiveIdleTimeoutMinutes(acc, rt); got != 40 {
+		t.Fatalf("before queue busy, expected 40m, got %d", got)
+	}
+	rt.SawQueueBusyThisRun = true
+	if got := core.EffectiveIdleTimeoutMinutes(acc, rt); got != 10 {
+		t.Fatalf("after queue drained, expected 10m, got %d", got)
+	}
+
+	// Drive subpath sanitizer blocks traversal & shell metacharacters
+	if got := core.SanitizeDriveSubpath("/content/drive/MyDrive/../../etc/passwd", "/content/drive/MyDrive/ColabTools/outputs"); got != "/content/drive/MyDrive/ColabTools/outputs" {
+		t.Fatalf("traversal must fall back cleanly, got %q", got)
+	}
+}

@@ -46,12 +46,16 @@ type MainUI struct {
 	ShowAddAccPanel bool
 
 	// Drafts for editable text fields
-	CCSwitchNameDraft string
-	DriveScriptDraft  string
-	RemotePortDraft   string
-	LocalPortDraft    string
-	DraftAccountID    string
-	PortValidationErr string
+	CCSwitchNameDraft  string
+	DriveScriptDraft   string
+	RemotePortDraft    string
+	LocalPortDraft     string
+	H3CustomRepoDraft  string
+	H3CustomFilesDraft string
+	DriveModelsDraft   string
+	DriveOutputDraft   string
+	DraftAccountID     string
+	PortValidationErr  string
 }
 
 func NewMainUI(svc *app.Service) *MainUI {
@@ -89,6 +93,10 @@ func (m *MainUI) syncDraftsIfNeeded(acc core.AccountProfile) {
 		m.DriveScriptDraft = acc.DriveScriptPath
 		m.RemotePortDraft = fmt.Sprintf("%d", acc.RemoteServicePort)
 		m.LocalPortDraft = fmt.Sprintf("%d", acc.LocalSSHTunnelPort)
+		m.H3CustomRepoDraft = acc.H3CustomHFRepo
+		m.H3CustomFilesDraft = acc.H3CustomHFFiles
+		m.DriveModelsDraft = acc.DriveModelsDir
+		m.DriveOutputDraft = acc.DriveOutputDir
 		m.PortValidationErr = ""
 	}
 }
@@ -123,6 +131,8 @@ func (m *MainUI) View(c *ui.Context) {
 					switch m.Svc.SelectedSection {
 					case app.SectionStatus:
 						m.renderStatusPage(c, pal)
+					case app.SectionDeploy:
+						m.centeredWorkbench(c, func() { m.renderDeployPage(c, pal) })
 					case app.SectionCompute:
 						m.centeredWorkbench(c, func() { m.renderComputePage(c, pal) })
 					case app.SectionIntegrations:
@@ -574,6 +584,70 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 				foot = fmt.Sprintf("已用 %d%% · %s KV · #%d", int(math.Round(rt.ContextRatio()*100)), rt.KVQuant, max(0, rt.LastTaskID))
 			}
 			ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+		} else if acc.DeployRecipe.IsVideoComfy() || kind == core.WorkloadVideo {
+			title := "视频部署与队列"
+			badge := acc.H3Variant.DisplayName()
+			var bTint *ui.Color
+			if acc.DeployRecipe == core.RecipeComfyUIGeneral {
+				badge = "ComfyUI"
+			}
+			if rt.DeployRunning {
+				title = "部署进度"
+				a := pal.Amber
+				bTint = &a
+			} else if rt.Phase.IsRunning() && rt.RenderedVideoCount > 0 {
+				badge = fmt.Sprintf("已出 %d 条", rt.RenderedVideoCount)
+				e := pal.Emerald
+				bTint = &e
+			} else if rt.Phase.IsRunning() && rt.ServerHealthy {
+				e := pal.Emerald
+				bTint = &e
+			}
+			TileHeader(c, pal, tint, title, badge, bTint)
+
+			ui.Row(c).AlignItems(ui.End).Gap(6).Children(func() {
+				if rt.Phase.IsRunning() {
+					if rt.DeployRunning && rt.WorkloadMetricValue != "" {
+						ui.Text(c, rt.WorkloadMetricValue).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+						ui.Text(c, rt.WorkloadMetricUnit).FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+					} else if rt.QueueRunning > 0 || rt.QueuePending > 0 {
+						ui.Textf(c, "渲染 %d", rt.QueueRunning).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+						ui.Textf(c, "排队 %d", rt.QueuePending).FontSize(13).FontWeight(500).TextColor(pal.Amber).Padding(0, 0, 4, 0)
+					} else if rt.ServerHealthy {
+						ui.Text(c, "已就绪").FontSize(25).Bold().TextColor(pal.Emerald)
+						ui.Text(c, ":8188").FontSize(13).FontFeatures("tnum").TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+					} else {
+						ui.Text(c, "待启动").FontSize(25).Bold().TextColor(pal.TextPrimary)
+					}
+				} else {
+					ui.Text(c, "待开机").FontSize(25).Bold().TextColor(pal.TextPrimary)
+				}
+			})
+
+			prog := 0.0
+			if rt.Phase.IsRunning() {
+				if rt.WorkloadMetricRatio != nil {
+					prog = *rt.WorkloadMetricRatio
+				} else if rt.QueueRunning > 0 {
+					prog = 0.72
+				} else if rt.ServerHealthy {
+					prog = 1.0
+				}
+			}
+			ui.Box(c).Height(4)
+			DrawHorizonBar(c, pal, prog, tint, 8)
+			ui.Spacer(c)
+			foot := "开机自动装好模型并打开 ComfyUI"
+			if rt.Phase.IsRunning() {
+				if rt.WorkloadDetail != "" {
+					foot = rt.WorkloadDetail
+				} else if acc.UseGoogleDrive {
+					foot = "成片实时存 Drive · 断线不白跑"
+				} else {
+					foot = "纯云端运行 · 记得下载成片"
+				}
+			}
+			ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
 		} else {
 			port := acc.RemoteServicePort
 			if rt.DetectedServicePort != nil {
@@ -657,7 +731,8 @@ func (m *MainUI) bentoBatteryQuota(c *ui.Context, pal Palette, acc core.AccountP
 
 func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	wd := m.Svc.WatchdogStatusFor(acc)
-	remMin := max(0, (rt.RemainingIdleSeconds(acc.IdleTimeoutMinutes)+59)/60)
+	effectiveMins := core.EffectiveIdleTimeoutMinutes(acc, rt)
+	remMin := max(0, (rt.RemainingIdleSeconds(effectiveMins)+59)/60)
 	enabled := acc.AutoShutdownEnabled
 
 	BentoCard(c, pal, 176, func() {
@@ -702,10 +777,19 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 			}
 		})
 
-		// Mole 3-pill selector (15m / 40m / 60m)
+		// Mole 3-pill selector (Video: 10m / 15m / 40m; General/LLM: 15m / 40m / 60m)
+		isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
+		presets := []int{15, 40, 60}
+		activeMins := acc.IdleTimeoutMinutes
+		if isVideo {
+			presets = []int{10, 15, 40}
+			if acc.StopAfterQueueDrained {
+				activeMins = acc.QueueDrainMinutes
+			}
+		}
 		ui.Row(c).FillWidth().Gap(6).Children(func() {
-			for _, mins := range []int{15, 40, 60} {
-				sel := acc.IdleTimeoutMinutes == mins && acc.AutoShutdownEnabled
+			for _, mins := range presets {
+				sel := activeMins == mins && acc.AutoShutdownEnabled
 				bg := pal.SubtleBg
 				fg := pal.TextMuted
 				w := 500
@@ -718,6 +802,10 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 				ui.Row(c).Grow(1).Padding(5, 0).Radius(7).Background(bg).Justify(ui.Center).AlignItems(ui.Center).OnClick(func() {
 					cp := acc
 					cp.IdleTimeoutMinutes = minsVal
+					if isVideo {
+						cp.StopAfterQueueDrained = true
+						cp.QueueDrainMinutes = minsVal
+					}
 					cp.AutoShutdownEnabled = true
 					m.Svc.UpdateAccount(cp)
 				}).Children(func() {
@@ -727,12 +815,14 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 		})
 
 		ui.Spacer(c)
-		foot := "已关闭，手动控制关机"
+		foot := "已关闭，需要自己手动停卡"
 		if acc.AutoShutdownEnabled {
 			if rt.Phase.IsRunning() {
-				foot = fmt.Sprintf("空闲已计时 %s", core.FormatDuration(rt.IdleSeconds))
+				foot = fmt.Sprintf("当前空闲已计时 %s", core.FormatDuration(rt.IdleSeconds))
+			} else if isVideo && acc.StopAfterQueueDrained {
+				foot = fmt.Sprintf("跑完队列 %d 分钟自动关机省点", acc.QueueDrainMinutes)
 			} else {
-				foot = "启动后自动守护防烧点"
+				foot = "闲下来自动关机，不怕忘关烧点"
 			}
 		}
 		ui.Text(c, foot).FontSize(12).TextColor(pal.TextMuted).MaxLines(1)
@@ -780,6 +870,49 @@ func (m *MainUI) bentoStrategy(c *ui.Context, pal Palette, acc core.AccountProfi
 }
 
 func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
+	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
+	if isVideo {
+		badge := "本机加密"
+		var bTint *ui.Color
+		if rt.SSHTunnelActive {
+			badge = "通道在线"
+			t := pal.Emerald
+			bTint = &t
+		} else if rt.DisplayUIURL != "" {
+			badge = "公网就绪"
+			t := pal.Sky
+			bTint = &t
+		}
+		BentoCard(c, pal, 176, func() {
+			TileHeader(c, pal, pal.Sky, "视频快捷操作", badge, bTint)
+			ui.Column(c).FillWidth().Gap(7).Children(func() {
+				ui.Row(c).FillWidth().Gap(7).Children(func() {
+					m.quickCardBtn(c, pal, "开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
+						go m.Svc.OpenComfyUI(acc.ID)
+					})
+					m.quickCardBtn(c, pal, "换 H3 版本", false, false, func() {
+						m.Svc.SetSection(app.SectionDeploy)
+					})
+				})
+				ui.Row(c).FillWidth().Gap(7).Children(func() {
+					tunLabel := "本机通道"
+					if rt.SSHTunnelActive {
+						tunLabel = "断通道"
+					}
+					tunDisabled := (!rt.Phase.IsRunning() && !rt.SSHTunnelActive) || rt.IsFreeRuntimeRestricted(acc)
+					m.quickCardBtn(c, pal, tunLabel, rt.SSHTunnelActive, tunDisabled, func() {
+						m.Svc.ToggleSSHTunnel(acc.ID)
+					})
+					m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
+						m.Svc.OpenDriveOutputs()
+					})
+				})
+			})
+			ui.Spacer(c)
+		})
+		return
+	}
+
 	hasTargets := acc.AutoSyncCCSwitch || acc.AutoSyncOpenCode || acc.AutoSyncCodex
 	allSynced := hasTargets && (!acc.AutoSyncCCSwitch || rt.CCSwitchSynced) && (!acc.AutoSyncOpenCode || rt.OpenCodeSynced) && (!acc.AutoSyncCodex || rt.CodexSynced)
 	badge := "快捷入口"
@@ -929,7 +1062,17 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 						})
 						sub := "默认官方 CLI 账号"
 						if rt.Phase.IsRunning() {
-							sub = fmt.Sprintf("会话 %s · %s", accCopy.SessionName, rt.ShortModelName())
+							modelLabel := rt.ShortModelName()
+							if !accCopy.EnableLLMModule {
+								if rt.WorkloadName != "" {
+									modelLabel = rt.WorkloadName
+								} else if accCopy.DeployRecipe == core.RecipeH3Video {
+									modelLabel = accCopy.H3Variant.DisplayName()
+								} else {
+									modelLabel = accCopy.WorkloadKind.DisplayName()
+								}
+							}
+							sub = fmt.Sprintf("会话 %s · %s", accCopy.SessionName, modelLabel)
 						} else if accCopy.Email != "" {
 							sub = accCopy.Email
 						}

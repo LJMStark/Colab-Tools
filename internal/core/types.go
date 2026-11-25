@@ -495,6 +495,143 @@ const (
 
 var AllAccountColors = []AccountColorTag{ColorAmber, ColorEmerald, ColorSky, ColorViolet, ColorCoral, ColorCyan}
 
+// DeployRecipe defines one-click built-in deployment presets shipped inside Colab Tools.
+type DeployRecipe string
+
+const (
+	RecipeNone           DeployRecipe = "none"
+	RecipeH3Video        DeployRecipe = "h3_video"
+	RecipeComfyUIGeneral DeployRecipe = "comfyui_general"
+	RecipeLLMProxy       DeployRecipe = "llm_proxy"
+)
+
+func (r DeployRecipe) DisplayName() string {
+	switch r {
+	case RecipeH3Video:
+		return "H3 视频模型"
+	case RecipeComfyUIGeneral:
+		return "通用 ComfyUI"
+	case RecipeLLMProxy:
+		return "大模型代理"
+	default:
+		return "只开机不装东西"
+	}
+}
+
+func (r DeployRecipe) IsVideoComfy() bool {
+	return r == RecipeH3Video || r == RecipeComfyUIGeneral
+}
+
+// H3Variant selects which MiniMax H3 / HyperFlow H3 diffusion weights to deploy on top of the shared 21.5GB base.
+type H3Variant string
+
+const (
+	H3VariantFlash     H3Variant = "flash"      // HyperFlow H3 Flash 13.7B INT8 fast
+	H3VariantOriginal  H3Variant = "original"   // Official MiniMax H3 31B
+	H3VariantFlashGGUF H3Variant = "flash_gguf" // HyperFlow H3 Flash GGUF (24GB L4 friendly)
+	H3VariantCustom    H3Variant = "custom"     // Custom HuggingFace repo/files or Drive-only
+)
+
+func (v H3Variant) DisplayName() string {
+	switch v {
+	case H3VariantOriginal:
+		return "H3 原版 (31B)"
+	case H3VariantFlashGGUF:
+		return "H3 Flash 轻量 GGUF"
+	case H3VariantCustom:
+		return "自定义 / 仅用 Drive"
+	default:
+		return "H3 Flash 极速版"
+	}
+}
+
+var (
+	hfRepoRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	hfFileRegex = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+)
+
+func IsValidHFRepo(repo string) bool {
+	r := strings.TrimSpace(repo)
+	return r != "" && len(r) <= 160 && hfRepoRegex.MatchString(r) && !strings.Contains(r, "..")
+}
+
+func SanitizeCustomHFFiles(raw string) string {
+	var clean []string
+	for _, part := range strings.Split(raw, ",") {
+		f := strings.TrimSpace(part)
+		if f == "" || len(f) > 220 || strings.HasPrefix(f, "/") || strings.Contains(f, "..") || !hfFileRegex.MatchString(f) {
+			continue
+		}
+		clean = append(clean, f)
+	}
+	return strings.Join(clean, ",")
+}
+
+func SanitizeDriveSubpath(raw, fallback string) string {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return fallback
+	}
+	if strings.Contains(p, "..") || strings.ContainsAny(p, "\r\n\t;`$|&><\"'") {
+		return fallback
+	}
+	if !strings.HasPrefix(p, "/content/drive/MyDrive") {
+		p = "/content/drive/MyDrive/" + strings.TrimLeft(p, "/")
+	}
+	return strings.TrimRight(p, "/")
+}
+
+// BuildDeployEnv constructs validated, injection-safe environment variables for built-in video deploy scripts.
+func BuildDeployEnv(acc AccountProfile) (map[string]string, error) {
+	acc.Sanitize()
+	boolStr := func(b bool) string {
+		if b {
+			return "1"
+		}
+		return "0"
+	}
+	env := map[string]string{
+		"SERVICE_PORT":        fmt.Sprintf("%d", acc.RemoteServicePort),
+		"WORKLOAD_KIND":       string(acc.WorkloadKind),
+		"USE_GOOGLE_DRIVE":    boolStr(acc.UseGoogleDrive),
+		"DRIVE_MODELS_DIR":    acc.DriveModelsDir,
+		"DRIVE_OUTPUT_DIR":    acc.DriveOutputDir,
+		"DRIVE_WHEELS_DIR":    "/content/drive/MyDrive/ColabTools/wheels",
+		"CACHE_BASE_TO_DRIVE": boolStr(acc.CacheBaseToDrive),
+		"ENABLE_CLOUDFLARED":  boolStr(acc.EnableCloudflared),
+	}
+	if acc.DeployRecipe == RecipeH3Video {
+		env["H3_VARIANT"] = string(acc.H3Variant)
+		env["H3_GGUF_QUANT"] = acc.H3GGUFQuant
+		driveOnly := acc.H3Variant == H3VariantCustom && acc.H3DriveOnly
+		env["H3_DRIVE_ONLY"] = boolStr(driveOnly)
+		env["H3_ENABLE_SOL_ATTN"] = boolStr(acc.H3EnableSolAttn)
+		if acc.H3Variant == H3VariantCustom && !driveOnly {
+			repo := strings.TrimSpace(acc.H3CustomHFRepo)
+			files := SanitizeCustomHFFiles(acc.H3CustomHFFiles)
+			if !IsValidHFRepo(repo) || files == "" {
+				return nil, fmt.Errorf("自定义模式请填合法的 HuggingFace 仓库（如 owner/repo）和文件名，或勾选「只用我 Drive 里的现成模型」")
+			}
+			env["H3_CUSTOM_HF_REPO"] = repo
+			env["H3_CUSTOM_HF_FILES"] = files
+		}
+	}
+	return env, nil
+}
+
+// EffectiveIdleTimeoutMinutes returns the unified idle shutdown timeout shared by both the watchdog loop and UI countdowns.
+func EffectiveIdleTimeoutMinutes(acc AccountProfile, rt AccountRuntimeState) int {
+	timeout := acc.IdleTimeoutMinutes
+	if timeout < 5 {
+		timeout = 40
+	}
+	queueDrainMode := !acc.EnableLLMModule && acc.StopAfterQueueDrained && rt.SawQueueBusyThisRun && rt.QueueRunning == 0 && rt.QueuePending == 0
+	if queueDrainMode && acc.QueueDrainMinutes >= 5 && acc.QueueDrainMinutes < timeout {
+		return acc.QueueDrainMinutes
+	}
+	return timeout
+}
+
 // AccountProfile persists a single Google Colab account's preferences.
 type AccountProfile struct {
 	ID                   string              `json:"id"`
@@ -509,6 +646,23 @@ type AccountProfile struct {
 	WorkloadKind         WorkloadKind        `json:"workloadKind"`
 	EnableLLMModule      bool                `json:"enableLLMModule"`
 	EnableHardwareIdle   bool                `json:"enableHardwareIdleFallback"`
+
+	// Built-in Video / H3 One-Click Deployment & Google Drive Sync
+	DeployRecipe          DeployRecipe `json:"deployRecipe,omitempty"`
+	H3Variant             H3Variant    `json:"h3Variant,omitempty"`
+	H3GGUFQuant           string       `json:"h3GGUFQuant,omitempty"`
+	H3CustomHFRepo        string       `json:"h3CustomHFRepo,omitempty"`
+	H3CustomHFFiles       string       `json:"h3CustomHFFiles,omitempty"`
+	H3DriveOnly           bool         `json:"h3DriveOnly,omitempty"`
+	H3EnableSolAttn       bool         `json:"h3EnableSolAttn"`
+	UseGoogleDrive        bool         `json:"useGoogleDrive"`
+	DriveModelsDir        string       `json:"driveModelsDir,omitempty"`
+	DriveOutputDir        string       `json:"driveOutputDir,omitempty"`
+	CacheBaseToDrive      bool         `json:"cacheBaseToDrive"`
+	AutoOpenComfyUI       bool         `json:"autoOpenComfyUI"`
+	EnableCloudflared     bool         `json:"enableCloudflared,omitempty"`
+	StopAfterQueueDrained bool         `json:"stopAfterQueueDrained"`
+	QueueDrainMinutes     int          `json:"queueDrainMinutes,omitempty"`
 
 	// Polite queue & off-peak scheduling
 	EnablePoliteQueue        bool                `json:"enablePoliteQueue"`
@@ -565,9 +719,21 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		SessionName:               fmt.Sprintf("colab-%s", shortID),
 		PreferredAccelerator:      tier.DefaultAccelerator(),
 		HighMem:                   false,
-		WorkloadKind:              WorkloadGeneral,
+		WorkloadKind:              WorkloadVideo,
 		EnableLLMModule:           false,
 		EnableHardwareIdle:        true,
+		DeployRecipe:              RecipeH3Video,
+		H3Variant:                 H3VariantFlash,
+		H3GGUFQuant:               "Q4_K_M",
+		H3EnableSolAttn:           true,
+		UseGoogleDrive:            true,
+		DriveModelsDir:            "",
+		DriveOutputDir:            "/content/drive/MyDrive/ColabTools/outputs",
+		CacheBaseToDrive:          true,
+		AutoOpenComfyUI:           true,
+		EnableCloudflared:         false,
+		StopAfterQueueDrained:     true,
+		QueueDrainMinutes:         10,
 		EnablePoliteQueue:         false,
 		QueueTargets:              defaultTargets,
 		QueueFallbackEnabled:      false,
@@ -586,8 +752,8 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		AutoSyncCodex:             false,
 		CCSwitchProviderID:        "colab-tools-" + shortID,
 		CCSwitchName:              fmt.Sprintf("Colab (%s)", name),
-		LocalSSHTunnelPort:        18080,
-		RemoteServicePort:         18080,
+		LocalSSHTunnelPort:        8188,
+		RemoteServicePort:         8188,
 	}
 }
 
@@ -620,6 +786,35 @@ func (a *AccountProfile) Sanitize() {
 	}
 	if a.WorkloadKind == WorkloadLLM {
 		a.EnableLLMModule = true
+	}
+	switch a.DeployRecipe {
+	case RecipeNone, RecipeH3Video, RecipeComfyUIGeneral, RecipeLLMProxy:
+	default:
+		if a.EnableLLMModule {
+			a.DeployRecipe = RecipeLLMProxy
+		} else {
+			a.DeployRecipe = RecipeNone
+		}
+	}
+	switch a.H3Variant {
+	case H3VariantFlash, H3VariantOriginal, H3VariantFlashGGUF, H3VariantCustom:
+	default:
+		a.H3Variant = H3VariantFlash
+	}
+	switch a.H3GGUFQuant {
+	case "Q4_K_M", "Q6_K", "Q8_0":
+	default:
+		a.H3GGUFQuant = "Q4_K_M"
+	}
+	if a.DriveModelsDir != "" {
+		a.DriveModelsDir = SanitizeDriveSubpath(a.DriveModelsDir, "")
+	}
+	a.DriveOutputDir = SanitizeDriveSubpath(a.DriveOutputDir, "/content/drive/MyDrive/ColabTools/outputs")
+	if a.QueueDrainMinutes < 5 {
+		a.QueueDrainMinutes = 10
+	}
+	if a.QueueDrainMinutes > 60 {
+		a.QueueDrainMinutes = 60
 	}
 	a.QueueTargets = SanitizedQueueTargets(a.QueueTargets, a.Tier)
 	if a.QueueFallbackAfterRounds < 1 {
@@ -756,6 +951,21 @@ func normalizeLegacySettingsJSON(raw []byte) ([]byte, bool, error) {
 					m["scheduledNextFireAt"] = t.Format(time.RFC3339Nano)
 				} else {
 					delete(m, "scheduledNextFireAt")
+				}
+			}
+			// Populate friendly v0.3.8 video/Drive defaults for accounts upgraded from earlier versions
+			if _, hasRecipe := m["deployRecipe"]; !hasRecipe {
+				for k, v := range map[string]any{
+					"useGoogleDrive":        true,
+					"cacheBaseToDrive":      true,
+					"autoOpenComfyUI":       true,
+					"h3EnableSolAttn":       true,
+					"stopAfterQueueDrained": true,
+					"queueDrainMinutes":     10,
+				} {
+					if _, exists := m[k]; !exists {
+						m[k] = v
+					}
 				}
 			}
 		}
@@ -983,6 +1193,10 @@ type AccountRuntimeState struct {
 	QueuePending         int
 	DetectedServicePort  *int
 	QueueInFlight        bool
+	DeployRunning        bool
+	RenderedVideoCount   int
+	SawQueueBusyThisRun  bool
+	AutoOpenedEndpoint   string
 
 	ActivitySignal ActivitySignal
 	SignalSource   ActivitySignalSource
