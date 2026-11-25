@@ -35,7 +35,7 @@ public enum SubscriptionTier: String, CaseIterable, Codable, Identifiable, Senda
 
     public var summaryNote: String {
         switch self {
-        case .aiUltra: return "高额 CU · 全系 GPU/TPU（含 G4 / H100）· 24h"
+        case .aiUltra: return "5x (1000 CU) / 20x (2000 CU) · G4 / H100 / A100 · 24h"
         case .colabProPlus: return "~600 CU/月 · 优先高阶 GPU + 后台运行 24h"
         case .aiPro: return "~100 CU/月 · A100 / L4 / T4 · 24h"
         case .colabPro: return "~100 CU/月 · A100 / L4 / T4 · 高内存形态"

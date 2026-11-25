@@ -98,8 +98,8 @@ struct AddAccountSheetView: View {
                     .font(.system(size: 11))
                     .controlSize(.mini)
             }
-            .padding(10)
-            .refinedCard()
+            .padding(12)
+            .hudCard()
 
             // Step 1 & 2: Official OAuth2 Browser Consent
             VStack(alignment: .leading, spacing: 8) {
@@ -165,8 +165,8 @@ struct AddAccountSheetView: View {
                         .foregroundStyle(Color(nsColor: .systemRed))
                 }
             }
-            .padding(10)
-            .refinedCard()
+            .padding(12)
+            .hudCard()
         }
     }
 

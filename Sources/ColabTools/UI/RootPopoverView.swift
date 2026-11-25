@@ -4,6 +4,38 @@ import SwiftUI
 
 struct RootPopoverView: View {
     @ObservedObject var store: WorkspaceStore
+    var isPreviewMode: Bool = false
+
+    @ViewBuilder
+    private var mainContent: some View {
+        VStack(spacing: 11) {
+            if !store.cliInstalled {
+                missingCLICard
+            } else if store.showingAddAccount {
+                AddAccountSheetView(store: store) {
+                    withAnimation(.snappy(duration: 0.18)) {
+                        store.showingAddAccount = false
+                    }
+                }
+            } else {
+                switch store.selectedTab {
+                case .dashboard:
+                    if store.settings.accounts.isEmpty {
+                        emptyAccountOnboardingCard
+                    } else if store.isMultiAccount && store.selectedViewMode == .overview {
+                        AccountOverviewView(store: store)
+                    } else if let acc = store.selectedAccount {
+                        AccountDetailView(store: store, account: acc)
+                    }
+                case .settings:
+                    SettingsTabView(store: store)
+                case .about:
+                    AboutTabView()
+                }
+            }
+        }
+        .padding(14)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -15,49 +47,27 @@ struct RootPopoverView: View {
                 Divider().opacity(0.35)
             }
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(spacing: 10) {
-                    if !store.cliInstalled {
-                        missingCLICard
-                    } else if store.showingAddAccount {
-                        AddAccountSheetView(store: store) {
-                            withAnimation(.snappy(duration: 0.18)) {
-                                store.showingAddAccount = false
-                            }
-                        }
-                    } else {
-                        switch store.selectedTab {
-                        case .dashboard:
-                            if store.settings.accounts.isEmpty {
-                                emptyAccountOnboardingCard
-                            } else if store.isMultiAccount && store.selectedViewMode == .overview {
-                                AccountOverviewView(store: store)
-                            } else if let acc = store.selectedAccount {
-                                AccountDetailView(store: store, account: acc)
-                            }
-                        case .settings:
-                            SettingsTabView(store: store)
-                        case .about:
-                            AboutTabView()
-                        }
-                    }
+            if isPreviewMode {
+                mainContent
+            } else {
+                ScrollView(.vertical, showsIndicators: false) {
+                    mainContent
                 }
-                .padding(12)
+                .frame(maxHeight: 620)
             }
-            .frame(maxHeight: 560)
 
             if let toast = store.toastMessage {
                 HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(ColabTheme.emerald)
                     Text(toast)
-                        .font(.system(size: 11))
+                        .font(.system(size: 11.5))
                         .lineLimit(1)
                     Spacer()
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
                 .background(.ultraThinMaterial)
                 .overlay(alignment: .top) { Divider().opacity(0.35) }
                 .transition(.opacity)
@@ -66,23 +76,31 @@ struct RootPopoverView: View {
             Divider().opacity(0.4)
             footerBar
         }
-        .frame(width: 384)
-        .background(.regularMaterial)
+        .frame(width: 396)
+        .background {
+            if isPreviewMode {
+                Color.clear
+            } else {
+                Rectangle().fill(.regularMaterial)
+            }
+        }
     }
 
     // MARK: - Header
     private var headerBar: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 7) {
+        HStack(spacing: 7) {
+            HStack(spacing: 6) {
                 Circle()
                     .fill(globalDotColor)
                     .frame(width: 8, height: 8)
                 Text("Colab Tools")
                     .font(.system(size: 13.5, weight: .semibold))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 headerStatusPill
             }
 
-            Spacer()
+            Spacer(minLength: 4)
 
             Picker("", selection: Binding(
                 get: { store.selectedTab },
@@ -94,7 +112,7 @@ struct RootPopoverView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 126)
+            .frame(width: 124)
             .controlSize(.small)
 
             Button {
@@ -142,36 +160,45 @@ struct RootPopoverView: View {
     private var headerStatusPill: some View {
         let running = store.runningAccounts
         if running.count >= 2 {
-            Text("\(running.count) 实例运行中")
+            Text("\(running.count) 运行中")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 6.5)
                 .padding(.vertical, 2)
-                .background(Color.primary.opacity(0.06), in: Capsule())
+                .background(Color.primary.opacity(0.07), in: Capsule())
         } else if let first = running.first {
-            Text("\(first.1.shortGPUName) · \(Formatters.cu(first.1.cuBalance)) CU")
+            let label = first.0.enableLLMModule
+                ? "\(first.1.shortGPUName) · \(first.1.contextLimit / 1024)K"
+                : first.1.shortGPUName
+            Text(label)
                 .font(.system(size: 10, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 6.5)
                 .padding(.vertical, 2)
-                .background(Color.primary.opacity(0.06), in: Capsule())
+                .background(Color.primary.opacity(0.07), in: Capsule())
         } else if let acc = store.selectedAccount {
             let bal = store.state(for: acc.id).cuBalance
             Text("\(Formatters.cu(bal)) CU")
                 .font(.system(size: 10, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 6.5)
                 .padding(.vertical, 2)
-                .background(Color.primary.opacity(0.05), in: Capsule())
+                .background(Color.primary.opacity(0.06), in: Capsule())
         }
     }
 
     // MARK: - Multi-Account Pill Switcher (Hidden when single account for clean minimalism)
     private var multiAccountRail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 Button {
                     withAnimation(.snappy(duration: 0.18)) {
                         store.selectedViewMode = .overview
@@ -183,7 +210,7 @@ struct RootPopoverView: View {
                         Text("总览")
                             .font(.system(size: 11, weight: store.selectedViewMode == .overview ? .semibold : .regular))
                     }
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 7.5)
                     .padding(.vertical, 4)
                     .background(
                         store.selectedViewMode == .overview ? Color.primary.opacity(0.13) : Color.primary.opacity(0.04),
@@ -201,7 +228,7 @@ struct RootPopoverView: View {
                             store.selectedViewMode = .singleAccount
                         }
                     } label: {
-                        HStack(spacing: 5) {
+                        HStack(spacing: 4.5) {
                             Circle()
                                 .fill(st.phase.isRunning ? Color(nsColor: .systemGreen) : ColabTheme.color(for: acc.colorTag))
                                 .frame(width: 6.5, height: 6.5)
@@ -213,7 +240,7 @@ struct RootPopoverView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, 7.5)
                         .padding(.vertical, 4)
                         .background(
                             isSelected ? Color.primary.opacity(0.13) : Color.primary.opacity(0.04),
@@ -247,32 +274,30 @@ struct RootPopoverView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
         }
-        .padding(12)
-        .refinedCard()
+        .padding(14)
+        .hudCard()
     }
 
     private var emptyAccountOnboardingCard: some View {
         VStack(spacing: 10) {
             Image(systemName: "person.crop.circle.badge.plus")
-                .font(.system(size: 28, weight: .light))
+                .font(.system(size: 30, weight: .light))
                 .foregroundStyle(.secondary)
             Text("尚未绑定 Google Colab 账号")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 13.5, weight: .semibold))
             Text("点击下方按钮通过官方 Google OAuth2 完成授权，即可实时查看点数、一键启停 GPU/TPU 并开启自动空闲关机。")
-                .font(.system(size: 11))
+                .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             Button("绑定第一个账号") {
-                withAnimation(.snappy(duration: 0.18)) {
-                    store.showingAddAccount = true
-                }
+                store.openAddAccountFlow()
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
         }
         .frame(maxWidth: .infinity)
         .padding(18)
-        .refinedCard()
+        .hudCard()
     }
 
     // MARK: - Footer

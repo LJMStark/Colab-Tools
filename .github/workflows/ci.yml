@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Swift toolchain
+        run: swift --version
+
+      - name: Lint shell scripts
+        run: |
+          bash -n scripts/build-app.sh
+          bash -n scripts/remote/start_server.sh
+
+      - name: Run unit tests
+        run: swift test --parallel
+
+      - name: Build & verify release bundle
+        run: |
+          chmod +x scripts/build-app.sh
+          ./scripts/build-app.sh --zip
+          codesign --verify --deep --strict "build/Colab Tools.app"

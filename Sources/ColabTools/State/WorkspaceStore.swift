@@ -9,7 +9,7 @@ import SwiftUI
 public final class WorkspaceStore: ObservableObject {
     @Published public var settings: AppSettings {
         didSet {
-            settings.save()
+            if persistSettingsChanges { settings.save() }
             onStatusBarNeedsUpdate?()
         }
     }
@@ -48,7 +48,14 @@ public final class WorkspaceStore: ObservableObject {
     private var refreshingAccounts: Set<UUID> = []
     private var toastTask: Task<Void, Never>?
 
-    public init() {
+    private var persistSettingsChanges: Bool = true
+
+    public init(skipAutoBootstrap: Bool = false) {
+        self.persistSettingsChanges = !skipAutoBootstrap
+        if skipAutoBootstrap {
+            self.settings = AppSettings()
+            return
+        }
         KeychainVault.cleanupStaleEphemeralFiles()
         self.settings = AppSettings.load()
         for acc in settings.accounts {
@@ -363,6 +370,7 @@ public final class WorkspaceStore: ObservableObject {
                 latest.kvQuant = remote.kvQuant
                 latest.serverHealthy = remote.healthy
                 latest.sessionUptimeSeconds = remote.uptimeSeconds
+                latest.appendTelemetrySample(gpuUtil: remote.gpuUtil, vramRatio: latest.vramRatio)
                 runtimeByAccount[accountId] = latest
 
                 // Ensure API key is cached in Keychain via safe `colab download` (never via `colab exec` history)

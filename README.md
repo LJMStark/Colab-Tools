@@ -1,87 +1,130 @@
 <div align="center">
 
-<img src="assets/AppIcon.png" width="128" height="128" alt="Colab Tools Icon" />
+<img src="assets/AppIcon.png" width="120" height="120" alt="Colab Tools App Icon" />
 
 # Colab Tools
 
-**面向 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏工具**
+**A native macOS menu bar companion for the official Google Colab CLI.**
 
-基于官方 [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) · 多订阅工作区隔离管理 · 实时 Compute Units 监控 · 自定义空闲自动关机 · 可选 LLM / Claude Code 增强
+Monitor Compute Units across subscriptions, manage isolated multi-account GPU/TPU sessions in parallel, protect your balance with safe idle auto-shutdown, and optionally wire self-hosted LLMs into Claude Code & CC Switch.
 
-[![macOS](https://img.shields.io/badge/macOS-14%2B%20(Apple%20Silicon)-black?logo=apple)](https://www.apple.com/macos)
+[English](README.md) · [简体中文](README.zh-CN.md) · [Download Latest](https://github.com/LJMStark/Colab-Tools/releases/latest) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
+
+[![CI](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml/badge.svg)](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/LJMStark/Colab-Tools?color=f59e0b&logo=github)](https://github.com/LJMStark/Colab-Tools/releases/latest)
+[![Platform](https://img.shields.io/badge/macOS-14%2B%20(Apple%20Silicon)-111827?logo=apple)](https://www.apple.com/macos)
 [![Swift](https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white)](https://swift.org)
-[![Colab CLI](https://img.shields.io/badge/google--colab--cli-0.8.x-F59E0B)](https://github.com/googlecolab/google-colab-cli)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Colab CLI](https://img.shields.io/badge/google--colab--cli-0.8.x-4285F4)](https://github.com/googlecolab/google-colab-cli)
+[![License](https://img.shields.io/badge/License-MIT-10b981)](LICENSE)
+
+<br />
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/preview-dashboard.png" alt="Colab Tools Dashboard HUD" width="380" /><br />
+      <sub><b>Single-Account Live HUD</b> · VRAM segments, GPU sparkline, 256K context & idle watchdog</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/preview-multi-account.png" alt="Colab Tools Multi-Account Overview" width="380" /><br />
+      <sub><b>Multi-Account Workspace</b> · Isolated Keychain profiles, aggregate CU balance & one-click stop-all</sub>
+    </td>
+  </tr>
+</table>
 
 </div>
 
 ---
 
-## 核心特性
+## Overview
 
-### 1. 订阅档位识别 + 单/多账号自适应体验
-- 支持 6 档订阅选项：**Google AI Ultra / Colab Pro+ / Google AI Pro / Colab Pro / Pay As You Go / Free**。
-- 通过官方 `colab usage` 读取真实 Compute Units（CU）余额与小时费率，自动推荐订阅档位并约束可用加速器选项（例如 Free 仅开放 T4 / CPU）。
-- **单账号极简模式**：仅有 1 个账号时自动隐藏账号切换条，界面纯净零噪音。
-- **多账号并行管理模式**（≥ 2 个账号）：
-  - 顶部出现横向胶囊切换栏 + **全局总览（Overview）**，聚合展示总点数、运行中实例数与合计小时消耗；
-  - 支持各账号在独立会话与独立钥匙串凭证下并行运行、独立启停与独立 SSH 终端/隧道接入。
+Google's official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) brings Colab GPUs and TPUs directly to the terminal for **Google AI Ultra (5x / 20x)**, **Colab Pro+ / Pro**, **Google AI Pro**, **Pay As You Go**, and **Free** users. **Colab Tools** wraps those official commands into a lightweight, zero-Dock, native SwiftUI menu bar HUD (`~2.5 MB`, zero Electron overhead).
 
-### 2. 官方 CLI 驱动与合规使用说明
-- **官方命令封装**：账号状态、余额、会话管理、Drive 挂载、SSH、浏览器附着与续费入口均通过官方 `google-colab-cli` 子命令（`whoami`、`usage`、`sessions`、`new`、`stop`、`exec`、`download`、`drivemount`、`ssh`、`url`、`pay`）执行；多账号添加引导复用了本机已安装 `google-colab-cli 0.8.x` 的官方 OAuth2 客户端定义（`PUBLIC_SCOPES` 与 `REMOTE_REDIRECT_URI`）。
-- **安全凭证隔离**：新增多账号凭证加密存于 **macOS Keychain**，每次执行通过 `0600` 独占临时 ADC 文件传递并在结束后擦除销毁；绝不覆盖终端默认 `colab` 登录态。
-- **克制节流与保护**：后台同步默认 3 分钟且多账号错峰串行、手动刷新带 5 秒防抖；`COLAB_CLI_ASSIGN_RETRIES=0` 仅在明确 `503` 库存不足时有限回退，遇 `429` 限流、`412` 配额上限或超时立即停止。
-- **合规边界提醒**：请严格遵守 [Google Colab 服务条款与 FAQ](https://research.google.com/colaboratory/faq.html)——请勿将多账号管理用于绕过免费额度限制，也勿在 Colab 上托管违反平台政策的长期服务；部分免费运行时按官方策略可能不支持 SSH。另需注意：`google-colab-cli 0.8.x` 的 `--config` 仅隔离会话索引，`colab exec` 历史仍统一记录在 `~/.config/colab-cli/history/<session>.jsonl`，因此本工具默认给新增账号生成唯一会话名且绝不通过 `exec` 输出明文 API Key。
+### Key Capabilities
 
-### 3. 通用 Colab 伴侣 + 可选 LLM / Claude Code 增强
-- **通用 Colab 能力（默认开箱即用）**：一键启停 GPU（`G4 / H100 / A100 / L4 / T4`）与 TPU（`v6e1 / v5e1`）+ `--high-mem`，展示全量活跃会话（含孤儿会话 `[?]`），一键 `colab url --open` 浏览器打开、`colab ssh` 连终端、停机后二次复查服务端确认释放。
-- **可选 LLM & Claude Code 模块（需手动开启）**：
-  - 支持挂载 Google Drive 启动自托管 `llama-server`（如 `Qwen3.8-27B` 256K）与 Cloudflare 公网 HTTPS 隧道；
-  - **三态安全空闲看门狗**：仅在 LLM 模式且最近 90 秒内通过 `/slots` 真实观测到 `idle` 信号时才推进自定义倒计时（5–720 分钟），普通 Notebook 训练或网络失联时自动暂停计时绝不误停；
-  - **CC Switch 事务安全同步**：通过 SQLite 在线备份（WAL 安全）与 `BEGIN IMMEDIATE` 事务仅写入独立待机渠道（拒绝覆盖 `is_current=1` 或官方订阅），自动写入真实上下文与自动压缩窗口环境变量。
+| Area | What Colab Tools Does |
+| :--- | :--- |
+| **Live Telemetry HUD** | Hero Compute Units (CU) readout, GPU utilization sparkline, 10-segment VRAM bar, 256K context bar, session uptime vs. 24h cap, and remaining hours estimate. |
+| **Subscription-Aware Controls** | Select your tier (`AI Ultra`, `Pro+`, `AI Pro`, `Pro`, `PAYG`, `Free`) with automatic CU-based suggestions and tier-appropriate accelerator menus (`G4 / H100 / A100 / L4 / T4 / TPU v6e / v5e / CPU` + `--high-mem`). |
+| **Adaptive Single & Multi-Account** | Clean zero-noise layout for 1 account; automatically reveals a horizontal account switcher + parallel Overview when managing 2+ accounts, with **external/orphan session `[?]` billing warnings**. |
+| **Three-State Idle Auto-Shutdown** | Customizable timeout (`5–720 min`, quick `15 / 40 / 60m` pills + pre-shutdown macOS notification + one-click extend). Only advances countdown on fresh verified `/slots` `idle` observations — never kills active notebooks or training runs. |
+| **Verified Billing Stop** | After `colab stop`, independently re-verifies server-side `colab sessions` (bypassing UI cooldown) before confirming billing has stopped. |
+| **Optional LLM & Claude Code Integration** | Optional module to boot `llama-server` + Cloudflare HTTPS tunnel from Google Drive, launch Claude Code via `0700` self-deleting wrappers (zero keys in shell history), and WAL-safely sync a dedicated standby provider in [CC Switch](https://github.com/farion1231/cc-switch) without touching your official Claude subscription. |
 
 ---
 
-## 快速安装
+## Architecture
 
-### 前提条件
-- **系统与架构**：macOS 14.0+（当前预编译 Release 为 Apple Silicon `arm64`，Intel Mac 可通过源码 `swift build` 本地编译）
-- **安装并登录官方 Google Colab CLI（已测试兼容 `0.8.0`）**：
+```mermaid
+flowchart LR
+    HUD["macOS Menu Bar HUD (Swift 6 + SwiftUI)"] --> Store["WorkspaceStore (@MainActor)"]
+    Store --> Watchdog["3-State Idle Watchdog (busy / idle / unknown)"]
+    Store --> Vault["KeychainVault (macOS Security.framework)"]
+    Store --> Engine["ColabCLIEngine (Official google-colab-cli)"]
+
+    Engine -->|"Default Profile"| OAuth["colab --auth=oauth2"]
+    Engine -->|"Isolated Profiles"| ADC["0600 Ephemeral ADC -> colab --auth=adc --config profile/sessions.json"]
+    Store -.->|"Optional LLM Module"| CCSwitch["CCSwitchSync (WAL Online Backup + Standby-Only SQLite Tx)"]
+```
+
+---
+
+## Installation
+
+### Prerequisites
+- **macOS 14.0+** (Prebuilt release targets Apple Silicon `arm64`; Intel Macs can build locally from source)
+- **Official Google Colab CLI** (`0.8.x` tested):
   ```bash
   uv tool install google-colab-cli
   colab --auth=oauth2 whoami
   ```
 
-### 从源码编译与安装
+### Option 1: Download Prebuilt App
+1. Download `Colab-Tools-v0.3.0-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest).
+2. Unzip and move **`Colab Tools.app`** into `/Applications`.
+3. Launch **`Colab Tools`** — your existing `colab` CLI login is detected automatically on first start.
+
+> **Ad-hoc signature note:** Prebuilt community binaries are ad-hoc signed. If macOS Gatekeeper prompts on first launch, right-click the app → **Open**, or run `xattr -cr "/Applications/Colab Tools.app"`.
+
+### Option 2: Build from Source
 ```bash
 git clone https://github.com/LJMStark/Colab-Tools.git
 cd Colab-Tools
+swift test
 chmod +x scripts/build-app.sh
 ./scripts/build-app.sh --install
 open "/Applications/Colab Tools.app"
 ```
 
-### （可选）启用 LLM 推理模块前的准备
-如果你希望使用内置的 LLM / Claude Code 推理增强功能：
-1. 将仓库中的 [`scripts/remote/start_server.sh`](scripts/remote/start_server.sh) 上传到你 Google Drive 的 `/MyDrive/colab-llm/scripts/start_server.sh`（也可在 App 设置中自定义路径）；
-2. 在 Colab Tools 主面板打开「LLM 推理模式」开关，再点击一键启动即可。
+### Optional: Enabling the Self-Hosted LLM / Claude Code Module
+The optional LLM module is **off by default** for new profiles so general Colab users can start immediately:
+1. Upload [`scripts/remote/start_server.sh`](scripts/remote/start_server.sh) to Google Drive at `/MyDrive/colab-llm/scripts/start_server.sh` (path is customizable in **Settings**).
+2. Toggle **LLM 推理与 Claude 接入** on in the main card and click **Start**.
 
 ---
 
-## 联系作者与交流群
+## Security & Official Policy Compliance
 
-> 如果这个工具帮到了你，欢迎点个 ⭐ Star！有任何建议或 Bug 欢迎提 Issue / PR。
+- **100% Official CLI Execution**: Session lifecycle, usage, SSH, browser attachment (`colab url --open`), and billing (`colab pay`) invoke official `google-colab-cli` commands. Multi-account onboarding reuses the locally installed `google-colab-cli` OAuth2 client definition (`PUBLIC_SCOPES` & `REMOTE_REDIRECT_URI`).
+- **Polite Throttling**: Staggered multi-account background sync (default `180s`), `5s` manual refresh debounce, `COLAB_CLI_ASSIGN_RETRIES=0`, and immediate stop on `429` rate limits, `412` assignment caps, auth errors, or timeouts (fallback only on explicit `503` capacity shortage).
+- **Respect Google Colab ToS**: Please follow the [Google Colab FAQ & Terms of Service](https://research.google.com/colaboratory/faq.html). Do **not** use multi-account features to circumvent free-tier quotas or host prohibited non-interactive services. Note that `google-colab-cli 0.8.x` shares `~/.config/colab-cli/history/<session>.jsonl` across configs; Colab Tools generates unique default session names and retrieves LLM keys via `colab download` rather than `exec` logs. See [SECURITY.md](SECURITY.md) for full details.
 
-- **X (Twitter)**：[https://x.com/starkljm](https://x.com/starkljm)
-- **联系方式**：X DM [`@starkljm`](https://x.com/starkljm)（如群二维码过期请私信拉群）
-- **微信交流群（Colab Tools 交流群）**：
+---
+
+## Community & Contact
+
+If **Colab Tools** saves your Compute Units or streamlines your workflow, consider leaving a ⭐ Star!
+
+- **X (Twitter)**: [@starkljm](https://x.com/starkljm)
+- **Contact**: DM [@starkljm](https://x.com/starkljm) on X *(if the WeChat QR expires, DM for a fresh invite)*
+- **WeChat Community Group (`Colab Tools 交流群`)**:
 
 <p align="left">
-  <img src="assets/wechat-qr.png" width="240" alt="Colab Tools 微信交流群二维码" />
+  <img src="assets/wechat-qr.png" width="220" alt="Colab Tools WeChat Group QR Code" />
 </p>
 
 ---
 
 ## License
 
-[MIT](LICENSE)
+Released under the [MIT License](LICENSE). Copyright © 2026 [LJMStark](https://github.com/LJMStark).

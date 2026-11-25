@@ -15,39 +15,46 @@ struct ColabToolsEntry {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
-    private var statusItem: NSStatusItem!
-    private var popover: NSPopover!
-    private var store: WorkspaceStore!
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+    private var store: WorkspaceStore?
     private var eventMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        store = WorkspaceStore()
-        store.onStatusBarNeedsUpdate = { [weak self] in
+        if PreviewExporter.runIfRequested() {
+            NSApplication.shared.terminate(nil)
+            return
+        }
+        let s = WorkspaceStore()
+        store = s
+        s.onStatusBarNeedsUpdate = { [weak self] in
             self?.updateStatusItem()
         }
         // Keep popover pinned open during browser OAuth2 authorization so pasted codes aren't lost
-        store.onPopoverPinChanged = { [weak self] pinned in
-            self?.popover.behavior = pinned ? .applicationDefined : .transient
+        s.onPopoverPinChanged = { [weak self] pinned in
+            self?.popover?.behavior = pinned ? .applicationDefined : .transient
         }
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = item
+        if let button = item.button {
             button.action = #selector(handleStatusBarClick(_:))
             button.target = self
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        popover = NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: RootPopoverView(store: store))
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.animates = true
+        pop.delegate = self
+        pop.contentViewController = NSHostingController(rootView: RootPopoverView(store: s))
+        popover = pop
 
         updateStatusItem()
 
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self, self.popover.isShown, !self.store.showingAddAccount else { return }
-            self.popover.performClose(nil)
+            guard let self, let pop = self.popover, pop.isShown, !(self.store?.showingAddAccount ?? false) else { return }
+            pop.performClose(nil)
         }
     }
 
@@ -55,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
         }
-        store.cleanup()
+        store?.cleanup()
     }
 
     @objc private func handleStatusBarClick(_ sender: NSStatusBarButton) {
@@ -71,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func togglePopover(_ sender: NSStatusBarButton) {
+        guard let popover, let store else { return }
         if popover.isShown {
             popover.performClose(sender)
         } else {
@@ -82,6 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func showContextMenu() {
+        guard let store, let statusItem else { return }
         let menu = NSMenu()
         let running = store.runningAccounts
         let headerTitle = running.isEmpty
@@ -121,16 +130,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func menuStartCurrent() {
-        guard let acc = store.selectedAccount else { return }
+        guard let store, let acc = store.selectedAccount else { return }
         Task { await store.startAccountSession(acc.id) }
     }
 
     @objc private func menuStopCurrent() {
-        guard let acc = store.selectedAccount else { return }
+        guard let store, let acc = store.selectedAccount else { return }
         Task { await store.stopAccountSession(acc.id) }
     }
 
     @objc private func menuStopAll() {
+        guard let store else { return }
         let targets = store.runningAccounts.map(\.0.id)
         Task {
             for id in targets {
@@ -140,20 +150,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func menuResetIdle() {
-        guard let acc = store.selectedAccount else { return }
+        guard let store, let acc = store.selectedAccount else { return }
         store.resetIdleTimer(for: acc.id)
     }
 
     @objc private func menuOpenWeb() {
-        guard let acc = store.selectedAccount else { return }
+        guard let store, let acc = store.selectedAccount else { return }
         store.openColabInBrowser(accountId: acc.id)
     }
 
-    @objc private func menuPay() { store.openPayPage() }
+    @objc private func menuPay() { store?.openPayPage() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
 
     private func updateStatusItem() {
-        guard let button = statusItem.button else { return }
+        guard let store, let button = statusItem?.button else { return }
         let running = store.runningAccounts
         let anyProcessing = running.contains(where: { $0.1.isProcessing })
         let anyBusy = store.settings.accounts.contains(where: { store.state(for: $0.id).phase.isBusy })

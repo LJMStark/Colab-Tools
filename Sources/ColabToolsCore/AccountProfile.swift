@@ -308,10 +308,19 @@ public struct AccountRuntimeState: Equatable, Sendable {
     public var publicURL: String = ""
     public var serverHealthy: Bool = false
 
-    // Live /slots activity (three-state)
+    // Live /slots activity (three-state) & micro-chart telemetry history
     public var activitySignal: ActivitySignal = .unknown
     public var lastTaskID: Int = -1
     public var promptTokensUsed: Int = 0
+    public var gpuUtilHistory: [Double] = []
+    public var vramHistory: [Double] = []
+
+    public mutating func appendTelemetrySample(gpuUtil: Int, vramRatio: Double) {
+        gpuUtilHistory.append(min(100, max(0, Double(gpuUtil))))
+        if gpuUtilHistory.count > 24 { gpuUtilHistory.removeFirst(gpuUtilHistory.count - 24) }
+        vramHistory.append(min(1.0, max(0.0, vramRatio)) * 100.0)
+        if vramHistory.count > 24 { vramHistory.removeFirst(vramHistory.count - 24) }
+    }
 
     // Idle watchdog tracking
     public var lastActiveAt: Date = Date()

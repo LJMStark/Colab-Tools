@@ -37,8 +37,8 @@ struct SettingsTabView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
-            .padding(11)
-            .refinedCard()
+            .padding(12)
+            .hudCard()
 
             // 2. Selected Account Detailed Settings
             if let acc = store.selectedAccount {
@@ -126,8 +126,8 @@ struct SettingsTabView: View {
                             .controlSize(.small)
                     }
                 }
-                .padding(11)
-                .refinedCard()
+                .padding(12)
+                .hudCard()
             }
 
             // 3. Multi-Account Management List
@@ -175,8 +175,8 @@ struct SettingsTabView: View {
                     .padding(.vertical, 2)
                 }
             }
-            .padding(11)
-            .refinedCard()
+            .padding(12)
+            .hudCard()
         }
     }
 
@@ -214,8 +214,8 @@ struct AboutTabView: View {
                 }
 
                 Text("Colab Tools")
-                    .font(.system(size: 15, weight: .semibold))
-                Text("v0.2.0 · MIT Open Source")
+                    .font(.system(size: 16, weight: .semibold))
+                Text("v0.3.0 · MIT Open Source")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Text("面向全体 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣。100% 基于官方 google-colab-cli，支持多订阅并行隔离管理、点数监控、自定义空闲自动关机与 Claude Code / CC Switch 无感联动。")
@@ -226,7 +226,7 @@ struct AboutTabView: View {
             }
             .frame(maxWidth: .infinity)
             .padding(14)
-            .refinedCard()
+            .hudCard()
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("开源仓库与社区")
@@ -262,8 +262,8 @@ struct AboutTabView: View {
                     .padding(.top, 2)
                 }
             }
-            .padding(11)
-            .refinedCard()
+            .padding(12)
+            .hudCard()
         }
     }
 }
