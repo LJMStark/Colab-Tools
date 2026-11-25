@@ -15,17 +15,23 @@ LOG_FILE="/tmp/gradio-workload.log"
 
 write_status() {
   local ui_url="${1:-}"
-  local tmp="${STATUS_FILE}.tmp"
-  cat > "$tmp" <<JSON
-{
-  "kind": "${WORKLOAD_KIND}",
-  "name": "${WORKLOAD_NAME}",
-  "ui_url": "${ui_url}",
-  "port": ${SERVICE_PORT},
-  "detail": "Gradio :${SERVICE_PORT} · GPU+CPU Watchdog"
+  python3 - "$STATUS_FILE" "$WORKLOAD_KIND" "$WORKLOAD_NAME" "$ui_url" "$SERVICE_PORT" <<'PY'
+import json, pathlib, sys
+dst, kind, name, ui_url, port_s = sys.argv[1:]
+port = int(port_s)
+if not (1024 <= port <= 65535):
+    raise SystemExit(f"Invalid port: {port}")
+payload = {
+    "kind": kind,
+    "name": name,
+    "ui_url": ui_url,
+    "port": port,
+    "detail": f"Gradio :{port} · GPU+CPU Watchdog",
 }
-JSON
-  mv "$tmp" "$STATUS_FILE"
+tmp = pathlib.Path(dst + ".tmp")
+tmp.write_text(json.dumps(payload, ensure_ascii=False))
+tmp.replace(dst)
+PY
 }
 
 if [ ! -d "$APP_DIR" ]; then

@@ -930,14 +930,19 @@ struct AccountDetailView: View {
                     )
                 }
 
-                let endpointText: String = {
-                    if !rt.publicURL.isEmpty { return rt.publicURL }
-                    if rt.sshTunnelActive { return "http://127.0.0.1:\(String(account.localSSHTunnelPort))" }
-                    return "远端端口 :\(String(activeServicePort))（可开隧道）"
-                }()
-                let copyableEndpoint: String = !rt.publicURL.isEmpty
-                    ? rt.publicURL
-                    : (rt.sshTunnelActive ? "http://127.0.0.1:\(String(account.localSSHTunnelPort))" : "")
+            let freeRestricted = rt.isFreeRuntimeRestricted(for: account)
+            let endpointDisplayURL = !rt.displayUIURL.isEmpty ? rt.displayUIURL : rt.publicURL
+            let endpointText: String = {
+                if freeRestricted { return "免费版仅限官方 Colab Notebook" }
+                if !endpointDisplayURL.isEmpty { return endpointDisplayURL }
+                if rt.sshTunnelActive { return "http://127.0.0.1:\(String(account.localSSHTunnelPort))" }
+                return "远端端口 :\(String(activeServicePort))（可开隧道）"
+            }()
+            let copyableEndpoint: String = freeRestricted
+                ? ""
+                : (!endpointDisplayURL.isEmpty
+                    ? endpointDisplayURL
+                    : (rt.sshTunnelActive ? "http://127.0.0.1:\(String(account.localSSHTunnelPort))" : ""))
 
                 HStack(spacing: 6) {
                     Text("端点")
@@ -1015,7 +1020,7 @@ struct AccountDetailView: View {
             } else {
                 HStack(spacing: 6) {
                     QuickActionButton(
-                        title: effectiveKind.webUIButtonTitle,
+                        title: rt.isFreeRuntimeRestricted(for: account) ? "网页" : effectiveKind.webUIButtonTitle,
                         icon: "safari",
                         disabled: !rt.phase.isRunning
                     ) {
@@ -1025,7 +1030,7 @@ struct AccountDetailView: View {
                     QuickActionButton(
                         title: rt.sshTunnelActive ? "断隧道" : "隧道",
                         icon: rt.sshTunnelActive ? "lock.fill" : "arrow.left.arrow.right",
-                        disabled: !rt.phase.isRunning && !rt.sshTunnelActive,
+                        disabled: (!rt.phase.isRunning && !rt.sshTunnelActive) || rt.isFreeRuntimeRestricted(for: account),
                         active: rt.sshTunnelActive
                     ) {
                         store.toggleSSHTunnel(for: account.id)
@@ -1034,7 +1039,7 @@ struct AccountDetailView: View {
                     QuickActionButton(
                         title: "SSH",
                         icon: "terminal",
-                        disabled: !rt.phase.isRunning
+                        disabled: !rt.phase.isRunning || rt.isFreeRuntimeRestricted(for: account)
                     ) {
                         store.openRemoteSSHShell(accountId: account.id)
                     }

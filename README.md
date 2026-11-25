@@ -80,7 +80,7 @@ flowchart LR
   ```
 
 ### Option 1: Download Prebuilt App
-1. Download `Colab-Tools-v0.3.3-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest).
+1. Download `Colab-Tools-v0.3.4-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest).
 2. Unzip and move **`Colab Tools.app`** into `/Applications`.
 3. Launch **`Colab Tools`** — your existing `colab` CLI login is detected automatically on first start.
 

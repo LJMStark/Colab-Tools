@@ -43,10 +43,15 @@ public struct RemoteTelemetry: Equatable, Sendable {
     public var gpuName: String = ""
     public var vramUsedMB: Int = 0
     public var vramTotalMB: Int = 0
-    public var gpuUtil: Int = 0
-    public var cpuUtil: Int = 0
+    /// Optional so missing nvidia-smi / TPU runtimes are never mistaken for 0% idle GPU.
+    public var gpuUtil: Int? = nil
+    /// Optional so `/proc/stat` read errors are never mistaken for 0% idle CPU.
+    public var cpuUtil: Int? = nil
     public var cudaProcessCount: Int = 0
+    /// Trusted LLM public URL from `/tmp/public_url.txt` only (never overwritten by status.json `ui_url`).
     public var publicURL: String = ""
+    /// Separate display/WebUI URL reported by workload `status.json` (never receives LLM API keys).
+    public var displayUIURL: String = ""
     public var modelFile: String = ""
     public var modelAlias: String = ""
     public var contextLimit: Int = 262144
@@ -54,10 +59,54 @@ public struct RemoteTelemetry: Equatable, Sendable {
     public var healthy: Bool = false
     public var uptimeSeconds: Int = 0
     public var statusPayload: WorkloadStatusPayload? = nil
+    /// Age of `/tmp/colab-tools-status.json` in seconds on the remote host (computed from remote mtime).
+    public var statusAgeSeconds: Int? = nil
     public var comfyQueue: ComfyQueueSummary? = nil
     public var detectedWebPort: Int? = nil
 
     public init() {}
+}
+
+public struct ProvisionRoundResult: Equatable, Sendable {
+    public let outcome: ProvisionOutcome
+    /// Target values that returned HTTP 400 (unsupported by current subscription) and must not be retried in later rounds.
+    public let unsupportedTargetValues: Set<String>
+
+    public init(outcome: ProvisionOutcome, unsupportedTargetValues: Set<String> = []) {
+        self.outcome = outcome
+        self.unsupportedTargetValues = unsupportedTargetValues
+    }
+}
+
+/// Prevents `x-api-key` from ever leaking across HTTP redirects to a different origin.
+private final class SameOriginAuthRedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    private let allowedOrigin: String
+
+    init(allowedOrigin: String) {
+        self.allowedOrigin = allowedOrigin
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let url = request.url, Self.originKey(for: url) == allowedOrigin else {
+            // Strip auth header and reject cross-origin redirect
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    static func originKey(for url: URL) -> String {
+        let scheme = (url.scheme ?? "").lowercased()
+        let host = (url.host ?? "").lowercased()
+        let port = url.port ?? (scheme == "https" ? 443 : 80)
+        return "\(scheme)://\(host):\(port)"
+    }
 }
 
 public struct OAuthSessionTicket: Sendable {
@@ -439,10 +488,12 @@ public enum ColabCLIEngine {
                 i1, t1 = sample()
                 time.sleep(0.35)
                 i2, t2 = sample()
-                dt = max(1, t2 - t1)
-                return max(0, min(100, int(round(100.0 * (dt - (i2 - i1)) / dt))))
+                dt = t2 - t1
+                if dt <= 0:
+                    return ""
+                return str(max(0, min(100, int(round(100.0 * (dt - (i2 - i1)) / dt)))))
             except Exception:
-                return 0
+                return ""
         def http_get(url, timeout=2.0):
             try:
                 with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -453,11 +504,16 @@ public enum ColabCLIEngine {
             return ""
         print("NV=" + sh("nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || true"))
         print("CUDA_PROCS=" + sh("nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c '[0-9]' || true"))
-        print("CPU=" + str(read_cpu()))
+        print("CPU=" + read_cpu())
         print("URL=" + sh("cat /tmp/public_url.txt 2>/dev/null || true"))
         print("UPTIME=" + sh("awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0"))
         status_p = pathlib.Path("/tmp/colab-tools-status.json")
         if status_p.exists():
+            try:
+                age = max(0, int(time.time() - status_p.stat().st_mtime))
+                print("STATUS_AGE=" + str(age))
+            except Exception:
+                pass
             raw_s = status_p.read_text(errors="ignore").strip().replace("\\n", " ")
             if raw_s:
                 print("STATUS_JSON=" + raw_s)
@@ -507,12 +563,13 @@ public enum ColabCLIEngine {
                     t.gpuName = parts[0]
                     t.vramUsedMB = Int(parts[1]) ?? 0
                     t.vramTotalMB = Int(parts[2]) ?? 0
-                    t.gpuUtil = Int(parts[3]) ?? 0
+                    t.gpuUtil = Int(parts[3])
                 }
             } else if line.hasPrefix("CUDA_PROCS=") {
                 t.cudaProcessCount = Int(line.dropFirst(11).trimmingCharacters(in: .whitespaces)) ?? 0
             } else if line.hasPrefix("CPU=") {
-                t.cpuUtil = Int(line.dropFirst(4).trimmingCharacters(in: .whitespaces)) ?? 0
+                let rawCPU = line.dropFirst(4).trimmingCharacters(in: .whitespaces)
+                t.cpuUtil = rawCPU.isEmpty ? nil : Int(rawCPU)
             } else if line.hasPrefix("URL=") {
                 let raw = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
                 if InputValidator.isValidEndpointURL(raw) {
@@ -524,12 +581,15 @@ public enum ColabCLIEngine {
                 t.uptimeSeconds = Int(line.dropFirst(7).trimmingCharacters(in: .whitespaces)) ?? 0
             } else if line.hasPrefix("WEB_PORT="), let wp = Int(line.dropFirst(9).trimmingCharacters(in: .whitespaces)) {
                 t.detectedWebPort = wp
+            } else if line.hasPrefix("STATUS_AGE=") {
+                t.statusAgeSeconds = Int(line.dropFirst(11).trimmingCharacters(in: .whitespaces))
             } else if line.hasPrefix("STATUS_JSON=") {
                 let raw = String(line.dropFirst(12))
                 if let payload = WorkloadStatusParser.parseStatusJSON(raw) {
                     t.statusPayload = payload
+                    // Security: keep workload display UI URL strictly separated from LLM API origin (`t.publicURL`)
                     if let ui = payload.uiURL, InputValidator.isValidEndpointURL(ui) {
-                        t.publicURL = ui
+                        t.displayUIURL = ui
                     }
                     if let p = payload.port, (1024...65535).contains(p) {
                         t.detectedWebPort = p
@@ -577,15 +637,18 @@ public enum ColabCLIEngine {
         return key
     }
 
-    public static func fetchSlots(baseURL: String, apiKey: String) async -> SlotInfo? {
+    /// Fetches ALL llama-server `/slots` entries and blocks cross-origin redirects so `x-api-key` never leaks.
+    public static func fetchSlots(baseURL: String, apiKey: String) async -> [SlotInfo]? {
         guard InputValidator.isValidEndpointURL(baseURL), let url = URL(string: "\(baseURL)/slots") else { return nil }
         var req = URLRequest(url: url, timeoutInterval: 10)
         if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "x-api-key") }
+        let delegate = SameOriginAuthRedirectDelegate(allowedOrigin: SameOriginAuthRedirectDelegate.originKey(for: url))
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await session.data(for: req)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
-            let slots = try JSONDecoder().decode([SlotInfo].self, from: data)
-            return slots.first
+            return try JSONDecoder().decode([SlotInfo].self, from: data)
         } catch {
             return nil
         }
@@ -593,38 +656,52 @@ public enum ColabCLIEngine {
 
     /// Polite accelerator allocation: ONLY falls back to the next tier on explicit capacity unavailability (503).
     /// Immediately circuit-breaks on rate-limit (429), assignment cap (412 / precondition failed), auth/abuse errors (401/403), or uncertain timeouts.
+    /// Records any HTTP 400 unsupported targets so multi-round queues permanently prune them instead of retrying.
     public static func provisionSession(
         profile: AccountProfile,
         overrideTargets: [AcceleratorOption.ProbeTarget]? = nil,
+        deadline: Date? = nil,
         interTargetDelaySeconds: (@Sendable () -> TimeInterval)? = nil,
+        onBeforeAttempt: (@Sendable (AcceleratorOption.ProbeTarget) -> Void)? = nil,
         onProgress: @escaping @Sendable (String) -> Void
-    ) async -> ProvisionOutcome {
+    ) async -> ProvisionRoundResult {
         guard InputValidator.isValidSessionName(profile.sessionName) else {
-            return .circuitBroken(code: "INVALID_SESSION", message: "会话名不合法（仅允许字母、数字、._-）")
+            return ProvisionRoundResult(outcome: .circuitBroken(code: "INVALID_SESSION", message: "会话名不合法（仅允许字母、数字、._-）"))
         }
         let targets = overrideTargets ?? profile.preferredAccelerator.probeTargets
         guard !targets.isEmpty else {
-            return .circuitBroken(code: "NO_TARGET", message: "未选择任何目标算力卡")
+            return ProvisionRoundResult(outcome: .circuitBroken(code: "NO_TARGET", message: "未选择任何目标算力卡"))
         }
 
         var lastOutcome: ProvisionOutcome = .capacityUnavailable503(message: "当前目标算力无库存 (503)")
         var sawCapacity503 = false
+        var unsupportedValues: Set<String> = []
 
         for (index, target) in targets.enumerated() {
             if Task.isCancelled {
-                return .circuitBroken(code: "CANCELLED", message: "已取消申请")
+                return ProvisionRoundResult(outcome: .circuitBroken(code: "CANCELLED", message: "已取消申请"), unsupportedTargetValues: unsupportedValues)
+            }
+            if let deadline, Date() >= deadline {
+                return ProvisionRoundResult(outcome: .capacityUnavailable503(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues)
             }
             if index > 0, let delayFn = interTargetDelaySeconds {
                 let pause = max(0, delayFn())
+                if let deadline, Date().addingTimeInterval(pause) >= deadline {
+                    return ProvisionRoundResult(outcome: .capacityUnavailable503(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues)
+                }
                 if pause > 0 {
                     onProgress("准备尝试 \(target.display)（间隔 \(Int(pause))s）…")
                     try? await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
                     if Task.isCancelled {
-                        return .circuitBroken(code: "CANCELLED", message: "已取消申请")
+                        return ProvisionRoundResult(outcome: .circuitBroken(code: "CANCELLED", message: "已取消申请"), unsupportedTargetValues: unsupportedValues)
+                    }
+                    if let deadline, Date() >= deadline {
+                        return ProvisionRoundResult(outcome: .capacityUnavailable503(message: "已达排队总时长上限"), unsupportedTargetValues: unsupportedValues)
                     }
                 }
             }
 
+            onBeforeAttempt?(target)
             onProgress("申请 \(target.display)…")
             var args = ["new", "-s", profile.sessionName]
             if let flag = target.flag, let val = target.value {
@@ -635,7 +712,7 @@ public enum ColabCLIEngine {
             }
             let r = await runColab(profile: profile, subcommandArgs: args, timeoutSeconds: 50)
             if r.exitCode == 0 {
-                return .allocated(hardware: target.display)
+                return ProvisionRoundResult(outcome: .allocated(hardware: target.display), unsupportedTargetValues: unsupportedValues)
             }
             let outcome = PoliteQueuePolicy.classifyFailure(
                 exitCode: r.exitCode,
@@ -646,22 +723,25 @@ public enum ColabCLIEngine {
             )
             switch outcome {
             case .allocated:
-                return outcome
+                return ProvisionRoundResult(outcome: outcome, unsupportedTargetValues: unsupportedValues)
             case .circuitBroken:
                 // Hard circuit-breaker: stop immediately on 412 / 429 / 401 / 403 / timeout / unknown
-                return outcome
+                return ProvisionRoundResult(outcome: outcome, unsupportedTargetValues: unsupportedValues)
             case .capacityUnavailable503:
                 sawCapacity503 = true
                 lastOutcome = outcome
                 continue
             case .unsupportedTier400:
+                if let val = target.value {
+                    unsupportedValues.insert(val.uppercased())
+                }
                 if !sawCapacity503 {
                     lastOutcome = outcome
                 }
                 continue
             }
         }
-        return lastOutcome
+        return ProvisionRoundResult(outcome: lastOutcome, unsupportedTargetValues: unsupportedValues)
     }
 
     public static func stopSession(profile: AccountProfile, sessionName: String? = nil) async -> ShellResult {

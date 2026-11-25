@@ -319,7 +319,8 @@ final class ColabToolsCoreTests: XCTestCase {
         XCTAssertFalse(decoded.enablePoliteQueue)
         XCTAssertEqual(decoded.queueTargets, [.g4, .h100])
         XCTAssertEqual(decoded.workloadKind, .llm)
-        XCTAssertTrue(decoded.enableHardwareIdleFallback)
+        // Legacy configs missing `enableHardwareIdleFallback` MUST stay `false` to preserve safe paused behavior
+        XCTAssertFalse(decoded.enableHardwareIdleFallback)
         XCTAssertEqual(decoded.remoteServicePort, 18080)
     }
 
@@ -373,6 +374,51 @@ final class ColabToolsCoreTests: XCTestCase {
         if case .idle = trulyIdle {} else {
             XCTFail("Expected .idle when both GPU<5% and CPU<25%")
         }
+
+        // Missing readings (nil) or TPU runtimes MUST NEVER map to 0 / `.idle`
+        XCTAssertEqual(IdleWatchdogEvaluator.evaluateHardwareActivity(gpuUtilPercent: nil, cpuUtilPercent: 5, now: now), .unknown)
+        XCTAssertEqual(IdleWatchdogEvaluator.evaluateHardwareActivity(gpuUtilPercent: 0, cpuUtilPercent: nil, now: now), .unknown)
+        XCTAssertEqual(IdleWatchdogEvaluator.evaluateHardwareActivity(gpuUtilPercent: 0, cpuUtilPercent: 5, isTPU: true, now: now), .unknown)
+    }
+
+    func testMultiSlotLLMAggregationPreventsFalseIdleWhenSecondSlotBusy() {
+        let now = Date()
+        let busySlot2 = [
+            SlotInfo(id: 0, n_ctx: 262144, is_processing: false, id_task: 10, n_prompt_tokens: 1000),
+            SlotInfo(id: 1, n_ctx: 262144, is_processing: true, id_task: 11, n_prompt_tokens: 5000)
+        ]
+        let aggBusy = IdleWatchdogEvaluator.evaluateLLMSlots(busySlot2, now: now)
+        XCTAssertTrue(aggBusy.signal.isBusy)
+        XCTAssertEqual(aggBusy.maxPromptTokens, 5000)
+
+        let missingFlag = [
+            SlotInfo(id: 0, n_ctx: 262144, is_processing: false, id_task: 10, n_prompt_tokens: 1000),
+            SlotInfo(id: 1, n_ctx: 262144, is_processing: nil, id_task: 11, n_prompt_tokens: 2000)
+        ]
+        XCTAssertEqual(IdleWatchdogEvaluator.evaluateLLMSlots(missingFlag, now: now).signal, .unknown)
+
+        let allIdle = [
+            SlotInfo(id: 0, n_ctx: 262144, is_processing: false, id_task: 10, n_prompt_tokens: 1000),
+            SlotInfo(id: 1, n_ctx: 262144, is_processing: false, id_task: 12, n_prompt_tokens: 800)
+        ]
+        if case .idle = IdleWatchdogEvaluator.evaluateLLMSlots(allIdle, now: now).signal {} else {
+            XCTFail("Expected .idle only when ALL slots are explicitly idle")
+        }
+        XCTAssertEqual(IdleWatchdogEvaluator.evaluateLLMSlots([], now: now).signal, .unknown)
+    }
+
+    func testFreeTierWithoutPaidCUIsRestrictedFromSSHAndWebUI() {
+        let freeAcc = AccountProfile(tier: .free)
+        var rt = AccountRuntimeState()
+        rt.cuBalance = 0
+        XCTAssertTrue(rt.isFreeRuntimeRestricted(for: freeAcc))
+
+        rt.cuBalance = 50
+        XCTAssertFalse(rt.isFreeRuntimeRestricted(for: freeAcc))
+
+        let proAcc = AccountProfile(tier: .colabPro)
+        rt.cuBalance = 0
+        XCTAssertFalse(rt.isFreeRuntimeRestricted(for: proAcc))
     }
 
     func testNonLLMHardwareFallbackWatchdogLifecycle() {

@@ -7,168 +7,179 @@ import SwiftUI
 /// when launched with `COLABTOOLS_RENDER_PREVIEW=/path/to/output_dir`.
 @MainActor
 enum PreviewExporter {
+    private enum ExportError: Error {
+        case emptySize(URL)
+        case bitmapAllocFailed(URL)
+        case pngEncodeFailed(URL)
+    }
+
     static func runIfRequested() -> Bool {
         guard let outDir = ProcessInfo.processInfo.environment["COLABTOOLS_RENDER_PREVIEW"], !outDir.isEmpty else {
             return false
         }
         let dirURL = URL(fileURLWithPath: outDir, isDirectory: true)
-        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
-        // 1. Single-account dashboard showcase
-        let singleStore = makeDemoStore(multiAccount: false)
-        renderPanel(
-            RootPopoverView(store: singleStore, isPreviewMode: true),
-            to: dirURL.appendingPathComponent("preview-dashboard.png")
-        )
-
-        // 2. Multi-account overview showcase
-        let multiStore = makeDemoStore(multiAccount: true)
-        multiStore.selectedViewMode = .overview
-        renderPanel(
-            RootPopoverView(store: multiStore, isPreviewMode: true),
-            to: dirURL.appendingPathComponent("preview-multi-account.png"),
-            dark: true
-        )
-
-        // 3. Optional extra visual QA checks (Light/Dark Settings with iconOnly selected)
-        if let qaDir = ProcessInfo.processInfo.environment["COLABTOOLS_RENDER_QA"], !qaDir.isEmpty {
-            let qaURL = URL(fileURLWithPath: qaDir, isDirectory: true)
-            try? FileManager.default.createDirectory(at: qaURL, withIntermediateDirectories: true)
-
-            let settingsStore = makeDemoStore(multiAccount: false)
-            settingsStore.selectedTab = .settings
-            settingsStore.settings.menuBarMode = .iconOnly
-            renderPanel(
-                RootPopoverView(store: settingsStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-settings-light-icononly.png"),
-                dark: false
+            // 1. Single-account dashboard showcase
+            let singleStore = makeDemoStore(multiAccount: false)
+            try renderPanel(
+                RootPopoverView(store: singleStore, isPreviewMode: true),
+                to: dirURL.appendingPathComponent("preview-dashboard.png")
             )
-            renderPanel(
-                RootPopoverView(store: settingsStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-settings-dark-icononly.png"),
+
+            // 2. Multi-account overview showcase
+            let multiStore = makeDemoStore(multiAccount: true)
+            multiStore.selectedViewMode = .overview
+            try renderPanel(
+                RootPopoverView(store: multiStore, isPreviewMode: true),
+                to: dirURL.appendingPathComponent("preview-multi-account.png"),
                 dark: true
             )
-            let liveDashStore = makeDemoStore(multiAccount: false)
-            renderPanel(
-                RootPopoverView(store: liveDashStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-dashboard-live-light.png"),
-                dark: false
-            )
 
-            // Queue active state (Light & Dark) + About page without QR
-            let queueStore = makeDemoStore(multiAccount: false)
-            if var acc = queueStore.settings.accounts.first {
-                acc.enablePoliteQueue = true
-                acc.queueTargets = [.g4, .h100]
-                queueStore.settings.accounts = [acc]
-                var qst = queueStore.state(for: acc.id)
-                qst.phase = .queuing(
-                    attempt: 2,
-                    maxAttempts: PoliteQueuePolicy.maxAttempts,
-                    nextRetryAt: Date().addingTimeInterval(258),
-                    targetsSummary: "G4 → H100"
+            // 3. Optional extra visual QA checks (Light/Dark Settings, Queue, Multimodal, About)
+            if let qaDir = ProcessInfo.processInfo.environment["COLABTOOLS_RENDER_QA"], !qaDir.isEmpty {
+                let qaURL = URL(fileURLWithPath: qaDir, isDirectory: true)
+                try FileManager.default.createDirectory(at: qaURL, withIntermediateDirectories: true)
+
+                let settingsStore = makeDemoStore(multiAccount: false)
+                settingsStore.selectedTab = .settings
+                settingsStore.settings.menuBarMode = .iconOnly
+                try renderPanel(
+                    RootPopoverView(store: settingsStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-settings-light-icononly.png"),
+                    dark: false
                 )
-                qst.vramUsedMB = 0
-                qst.vramTotalMB = 0
-                qst.gpuUtilPercent = 0
-                qst.serverHealthy = false
-                qst.sessions = []
-                queueStore.runtimeByAccount[acc.id] = qst
-            }
-            renderPanel(
-                RootPopoverView(store: queueStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-queue-active-dark.png"),
-                dark: true
-            )
-            renderPanel(
-                RootPopoverView(store: queueStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-queue-active-light.png"),
-                dark: false
-            )
+                try renderPanel(
+                    RootPopoverView(store: settingsStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-settings-dark-icononly.png"),
+                    dark: true
+                )
+                let liveDashStore = makeDemoStore(multiAccount: false)
+                try renderPanel(
+                    RootPopoverView(store: liveDashStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-dashboard-live-light.png"),
+                    dark: false
+                )
 
-            let aboutStore = makeDemoStore(multiAccount: false)
-            aboutStore.selectedTab = .about
-            renderPanel(
-                RootPopoverView(store: aboutStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-about-noqr-dark.png"),
-                dark: true
-            )
+                let queueStore = makeDemoStore(multiAccount: false)
+                if var acc = queueStore.settings.accounts.first {
+                    acc.enablePoliteQueue = true
+                    acc.queueTargets = [.g4, .h100]
+                    queueStore.settings.accounts = [acc]
+                    var qst = queueStore.state(for: acc.id)
+                    qst.phase = .queuing(
+                        attempt: 2,
+                        maxAttempts: PoliteQueuePolicy.maxAttempts,
+                        nextRetryAt: Date().addingTimeInterval(258),
+                        targetsSummary: "G4 → H100"
+                    )
+                    qst.vramUsedMB = 0
+                    qst.vramTotalMB = 0
+                    qst.gpuUtilPercent = 0
+                    qst.serverHealthy = false
+                    qst.sessions = []
+                    queueStore.runtimeByAccount[acc.id] = qst
+                }
+                try renderPanel(
+                    RootPopoverView(store: queueStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-queue-active-dark.png"),
+                    dark: true
+                )
+                try renderPanel(
+                    RootPopoverView(store: queueStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-queue-active-light.png"),
+                    dark: false
+                )
 
-            // Multimodal video (ComfyUI queue) & music (Gradio) visual QA
-            let videoStore = makeDemoStore(multiAccount: false)
-            if var acc = videoStore.settings.accounts.first {
-                acc.workloadKind = .video
-                acc.remoteServicePort = 8188
-                acc.localSSHTunnelPort = 8188
-                acc.autoShutdownEnabled = true
-                videoStore.settings.accounts = [acc]
-                var vst = videoStore.state(for: acc.id)
-                vst.gpuName = "NVIDIA H100 80GB HBM3"
-                vst.activeHardware = "H100"
-                vst.vramUsedMB = 54200
-                vst.vramTotalMB = 81559
-                vst.gpuUtilPercent = 94
-                vst.cpuUtilPercent = 38
-                vst.cudaProcessCount = 1
-                vst.cuRatePerHour = 18.0
-                vst.workloadName = "Wan2.2-14B (ComfyUI)"
-                vst.workloadMetricLabel = "渲染进度"
-                vst.workloadMetricValue = "18/30"
-                vst.workloadMetricUnit = "steps"
-                vst.workloadMetricRatio = 0.60
-                vst.workloadDetail = "运行 1 · 排队 2 · 720p"
-                vst.queueRunning = 1
-                vst.queuePending = 2
-                vst.detectedServicePort = 8188
-                vst.publicURL = "https://wan-comfy-demo.trycloudflare.com"
-                vst.activitySignal = .busy(observedAt: Date())
-                vst.signalSource = .statusFile
-                vst.gpuUtilHistory = [42, 78, 92, 96, 89, 95, 94, 91, 96, 94]
-                vst.sessions = [
-                    ColabSessionItem(name: "wan-video", endpoint: "gpu-h100-demo", hardware: "H100", shape: "High-RAM", variant: "GPU")
-                ]
-                videoStore.runtimeByAccount[acc.id] = vst
-            }
-            renderPanel(
-                RootPopoverView(store: videoStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-multimodal-video-dark.png"),
-                dark: true
-            )
+                let aboutStore = makeDemoStore(multiAccount: false)
+                aboutStore.selectedTab = .about
+                try renderPanel(
+                    RootPopoverView(store: aboutStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-about-noqr-dark.png"),
+                    dark: true
+                )
 
-            let musicStore = makeDemoStore(multiAccount: false)
-            if var acc = musicStore.settings.accounts.first {
-                acc.workloadKind = .music
-                acc.remoteServicePort = 7860
-                acc.localSSHTunnelPort = 7860
-                acc.autoShutdownEnabled = true
-                musicStore.settings.accounts = [acc]
-                var mst = musicStore.state(for: acc.id)
-                mst.gpuName = "NVIDIA L4"
-                mst.activeHardware = "L4"
-                mst.vramUsedMB = 11400
-                mst.vramTotalMB = 23034
-                mst.gpuUtilPercent = 2
-                mst.cpuUtilPercent = 9
-                mst.cudaProcessCount = 1
-                mst.workloadName = "ACE-Step 音乐工坊"
-                mst.workloadMetricLabel = ""
-                mst.workloadMetricValue = ""
-                mst.detectedServicePort = 7860
-                mst.publicURL = ""
-                mst.sshTunnelActive = true
-                mst.serverHealthy = true
-                mst.activitySignal = .idle(observedAt: Date())
-                mst.signalSource = .hardwareDualLowLoad
-                mst.idleSeconds = 420
-                musicStore.runtimeByAccount[acc.id] = mst
+                let videoStore = makeDemoStore(multiAccount: false)
+                if var acc = videoStore.settings.accounts.first {
+                    acc.workloadKind = .video
+                    acc.remoteServicePort = 8188
+                    acc.localSSHTunnelPort = 8188
+                    acc.autoShutdownEnabled = true
+                    videoStore.settings.accounts = [acc]
+                    var vst = videoStore.state(for: acc.id)
+                    vst.gpuName = "NVIDIA H100 80GB HBM3"
+                    vst.activeHardware = "H100"
+                    vst.vramUsedMB = 54200
+                    vst.vramTotalMB = 81559
+                    vst.gpuUtilPercent = 94
+                    vst.cpuUtilPercent = 38
+                    vst.cudaProcessCount = 1
+                    vst.cuRatePerHour = 18.0
+                    vst.workloadName = "Wan2.2-14B (ComfyUI)"
+                    vst.workloadMetricLabel = "渲染进度"
+                    vst.workloadMetricValue = "18/30"
+                    vst.workloadMetricUnit = "steps"
+                    vst.workloadMetricRatio = 0.60
+                    vst.workloadDetail = "运行 1 · 排队 2 · 720p"
+                    vst.queueRunning = 1
+                    vst.queuePending = 2
+                    vst.detectedServicePort = 8188
+                    vst.displayUIURL = "https://wan-comfy-demo.trycloudflare.com"
+                    vst.publicURL = ""
+                    vst.activitySignal = .busy(observedAt: Date())
+                    vst.signalSource = .statusFile
+                    vst.gpuUtilHistory = [42, 78, 92, 96, 89, 95, 94, 91, 96, 94]
+                    vst.sessions = [
+                        ColabSessionItem(name: "wan-video", endpoint: "gpu-h100-demo", hardware: "H100", shape: "High-RAM", variant: "GPU")
+                    ]
+                    videoStore.runtimeByAccount[acc.id] = vst
+                }
+                try renderPanel(
+                    RootPopoverView(store: videoStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-multimodal-video-dark.png"),
+                    dark: true
+                )
+
+                let musicStore = makeDemoStore(multiAccount: false)
+                if var acc = musicStore.settings.accounts.first {
+                    acc.workloadKind = .music
+                    acc.remoteServicePort = 7860
+                    acc.localSSHTunnelPort = 7860
+                    acc.autoShutdownEnabled = true
+                    musicStore.settings.accounts = [acc]
+                    var mst = musicStore.state(for: acc.id)
+                    mst.gpuName = "NVIDIA L4"
+                    mst.activeHardware = "L4"
+                    mst.vramUsedMB = 11400
+                    mst.vramTotalMB = 23034
+                    mst.gpuUtilPercent = 2
+                    mst.cpuUtilPercent = 9
+                    mst.cudaProcessCount = 1
+                    mst.workloadName = "ACE-Step 音乐工坊"
+                    mst.workloadMetricLabel = ""
+                    mst.workloadMetricValue = ""
+                    mst.detectedServicePort = 7860
+                    mst.displayUIURL = ""
+                    mst.publicURL = ""
+                    mst.sshTunnelActive = true
+                    mst.serverHealthy = true
+                    mst.activitySignal = .idle(observedAt: Date())
+                    mst.signalSource = .hardwareDualLowLoad
+                    mst.idleSeconds = 420
+                    musicStore.runtimeByAccount[acc.id] = mst
+                }
+                try renderPanel(
+                    RootPopoverView(store: musicStore, isPreviewMode: false),
+                    to: qaURL.appendingPathComponent("qa-multimodal-music-light.png"),
+                    dark: false
+                )
             }
-            renderPanel(
-                RootPopoverView(store: musicStore, isPreviewMode: false),
-                to: qaURL.appendingPathComponent("qa-multimodal-music-light.png"),
-                dark: false
-            )
+            return true
+        } catch {
+            fputs("[ERROR] Preview export failed: \(error)\n", stderr)
+            exit(1)
         }
-        return true
     }
 
     private static func makeDemoStore(multiAccount: Bool) -> WorkspaceStore {
@@ -277,7 +288,7 @@ enum PreviewExporter {
         return store
     }
 
-    private static func renderPanel<V: View>(_ content: V, to url: URL, dark: Bool = true) {
+    private static func renderPanel<V: View>(_ content: V, to url: URL, dark: Bool = true) throws {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let framed = ZStack {
             LinearGradient(
@@ -323,7 +334,9 @@ enum PreviewExporter {
         let hosting = NSHostingView(rootView: framed)
         hosting.appearance = appearance
         let size = hosting.fittingSize
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width > 0, size.height > 0 else {
+            throw ExportError.emptySize(url)
+        }
 
         let window = NSWindow(
             contentRect: NSRect(origin: NSPoint(x: -8000, y: -8000), size: size),
@@ -331,6 +344,7 @@ enum PreviewExporter {
             backing: .buffered,
             defer: false
         )
+        defer { window.close() }
         window.appearance = appearance
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -366,17 +380,16 @@ enum PreviewExporter {
             bytesPerRow: 0,
             bitsPerPixel: 0
         ) else {
-            window.close()
-            return
+            throw ExportError.bitmapAllocFailed(url)
         }
         rep.size = renderSize
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
-        window.close()
 
-        if let png = rep.representation(using: .png, properties: [:]) {
-            try? png.write(to: url, options: .atomic)
-            print("Exported preview -> \(url.path) (\(pixelW)x\(pixelH))")
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            throw ExportError.pngEncodeFailed(url)
         }
+        try png.write(to: url, options: .atomic)
+        print("Exported preview -> \(url.path) (\(pixelW)x\(pixelH))")
     }
 }
 #endif

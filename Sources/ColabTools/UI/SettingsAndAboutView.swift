@@ -277,7 +277,7 @@ struct AboutTabView: View {
 
                 Text("Colab Tools")
                     .font(.system(size: 16, weight: .semibold))
-                Text("v0.3.3 · MIT Open Source")
+                Text("v0.3.4 · MIT Open Source")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Text("面向全体 Google AI / Gemini 与 Colab 订阅用户的原生 macOS 菜单栏伴侣。100% 基于官方 google-colab-cli，支持多订阅并行隔离管理、点数监控、自定义空闲自动关机与 Claude Code / CC Switch 无感联动。")

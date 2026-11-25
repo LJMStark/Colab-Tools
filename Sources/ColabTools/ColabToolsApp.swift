@@ -96,9 +96,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let store, let statusItem else { return }
         let menu = NSMenu()
         let running = store.runningAccounts
-        let headerTitle = running.isEmpty
-            ? "Colab Tools · 已关闭"
-            : "Colab Tools · \(running.count) 运行中 · 余额 \(Formatters.cu(store.totalBalanceCU)) CU"
+        let queuingAcc = store.settings.accounts.first(where: { store.state(for: $0.id).phase.isQueuing })
+        let busyAcc = store.settings.accounts.first(where: { store.state(for: $0.id).phase.isBusy })
+        let headerTitle: String = {
+            if !running.isEmpty {
+                return "Colab Tools · \(running.count) 运行中 · 余额 \(Formatters.cu(store.totalBalanceCU)) CU"
+            }
+            if let qAcc = queuingAcc, case .queuing(let a, let m, _, _) = store.state(for: qAcc.id).phase {
+                return "Colab Tools · 排队中 \(a)/\(m) (\(qAcc.displayName))"
+            }
+            if let bAcc = busyAcc {
+                return "Colab Tools · 处理中 (\(bAcc.displayName))"
+            }
+            return "Colab Tools · 已关闭"
+        }()
         let header = NSMenuItem(title: headerTitle, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)

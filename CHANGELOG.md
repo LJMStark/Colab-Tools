@@ -3,6 +3,16 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.4] - 2026-11-25
+
+### Security & Anti-False-Shutdown Hardening (Codex Review Follow-Up)
+- **LLM API Key Origin Isolation**: Strictly separated workload `status.json` `ui_url` (`displayUIURL`) from credential-bearing LLM `publicURL`, bound LLM `/slots` polling to the current active session endpoint, and blocked cross-origin HTTP redirects from forwarding `x-api-key`.
+- **Safe In-Flight Queue Cancellation**: Cancelling a polite queue while `colab new` is already in flight now verifies server-side sessions before declaring offline, alerting immediately if an allocation succeeded so billing runtimes are never hidden.
+- **Per-Round Identity Verification & Persisted Cooldowns**: Re-verifies default OAuth2 CLI login before every queue round, persists 15-minute anti-abuse circuit-breaker cooldowns across app restarts and all start paths, enforces an absolute 40-minute queue deadline, and permanently prunes HTTP `400` unsupported targets across rounds.
+- **Watchdog Hardening**: Made remote GPU & CPU telemetry optional so missing readings or TPU runtimes return `.unknown` instead of `0%` idle; enforced remote mtime freshness (`<= 5m`) on `/tmp/colab-tools-status.json` so stale files never override a live busy ComfyUI `/queue`; aggregated all llama-server `/slots` entries instead of checking only slot 0; preserved legacy `enableHardwareIdleFallback = false` on old `config.json` upgrades.
+- **Concurrency & Entitlement Safeguards**: Added per-run queue mutex tokens, synchronous busy-state acquisition against double-clicks, immediate post-allocation 10-minute reminder scheduling, custom script execution for `.general` workloads, and Google Colab FAQ compliance guardrails for free-tier runtimes without positive CU balance.
+- **Template & Build Script Fixes**: Switched ComfyUI and Gradio starter templates to `python3 json.dumps` with explicit `--output-directory` verification; fixed `pipefail` + `grep -q` SIGPIPE false-clean check in `build-app.sh` so path leaks hard-fail before replacing the app bundle; aligned context menu header status and non-zero failure exit in `PreviewExporter`.
+
 ## [0.3.3] - 2026-11-25
 
 ### Added

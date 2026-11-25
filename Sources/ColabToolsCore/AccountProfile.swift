@@ -221,7 +221,8 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
             let legacyLLM = try c.decodeIfPresent(Bool.self, forKey: .enableLLMModule) ?? false
             workloadKind = legacyLLM ? .llm : .general
         }
-        enableHardwareIdleFallback = try c.decodeIfPresent(Bool.self, forKey: .enableHardwareIdleFallback) ?? true
+        // Preserve legacy safe paused behavior when upgrading old config.json lacking `enableHardwareIdleFallback`
+        enableHardwareIdleFallback = try c.decodeIfPresent(Bool.self, forKey: .enableHardwareIdleFallback) ?? false
         enablePoliteQueue = try c.decodeIfPresent(Bool.self, forKey: .enablePoliteQueue) ?? false
         let decodedQueue = try c.decodeIfPresent([AcceleratorOption].self, forKey: .queueTargets)
         queueTargets = PoliteQueuePolicy.sanitizedTargets(
@@ -287,6 +288,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Minimum background refresh interval in seconds (default 180s to remain polite to official endpoints).
     public var backgroundRefreshSeconds: Int = 180
     public var lowBalanceWarningCU: Double = 20.0
+    /// Persisted anti-abuse circuit-breaker cooldown deadlines keyed by account identity (survives app restarts).
+    public var circuitBreakUntilByAccount: [String: Date] = [:]
 
     public static let configDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/colab-tools", isDirectory: true)
@@ -294,10 +297,22 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     public init() {}
 
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        accounts = try c.decodeIfPresent([AccountProfile].self, forKey: .accounts) ?? []
+        selectedAccountId = try c.decodeIfPresent(UUID.self, forKey: .selectedAccountId)
+        menuBarMode = try c.decodeIfPresent(MenuBarDisplayMode.self, forKey: .menuBarMode) ?? .compact
+        backgroundRefreshSeconds = try c.decodeIfPresent(Int.self, forKey: .backgroundRefreshSeconds) ?? 180
+        lowBalanceWarningCU = try c.decodeIfPresent(Double.self, forKey: .lowBalanceWarningCU) ?? 20.0
+        circuitBreakUntilByAccount = try c.decodeIfPresent([String: Date].self, forKey: .circuitBreakUntilByAccount) ?? [:]
+    }
+
     public static func load() -> AppSettings {
         if let data = try? Data(contentsOf: configFile),
            var loaded = try? JSONDecoder().decode(AppSettings.self, from: data) {
             loaded.backgroundRefreshSeconds = max(60, min(900, loaded.backgroundRefreshSeconds))
+            let now = Date()
+            loaded.circuitBreakUntilByAccount = loaded.circuitBreakUntilByAccount.filter { $0.value > now }
             for i in loaded.accounts.indices {
                 loaded.accounts[i].idleTimeoutMinutes = max(5, min(720, loaded.accounts[i].idleTimeoutMinutes))
             }
@@ -406,7 +421,13 @@ public struct AccountRuntimeState: Equatable, Sendable {
     public var modelAlias: String = "qwen3.8-27b-uncensored"
     public var contextLimit: Int = 262144
     public var kvQuant: String = "q4_0"
+    /// Trusted LLM API origin verified from the current session's start script or `/tmp/public_url.txt`.
+    /// NEVER populated from untrusted workload `status.json` `ui_url`.
     public var publicURL: String = ""
+    /// Session endpoint to which `publicURL` (and its Keychain LLM API key transmission) is bound.
+    public var llmURLBoundEndpoint: String = ""
+    /// Separate display/WebUI URL reported by non-LLM workloads (`status.json` `ui_url`). Never carries LLM API keys.
+    public var displayUIURL: String = ""
     public var serverHealthy: Bool = false
 
     // Multimodal workload protocol / auto-detected details
@@ -420,6 +441,18 @@ public struct AccountRuntimeState: Equatable, Sendable {
     public var queueRunning: Int = 0
     public var queuePending: Int = 0
     public var detectedServicePort: Int? = nil
+    public var queueInFlightProvisioning: Bool = false
+
+    /// Returns true for free-tier runtimes without positive paid Compute Units balance,
+    /// where Google Colab FAQ restricts remote SSH and standalone WebUI tunneling.
+    public func isFreeRuntimeRestricted(for account: AccountProfile) -> Bool {
+        account.tier == .free && cuBalance <= 0.01
+    }
+
+    public var isTPUHardware: Bool {
+        let src = (gpuName.isEmpty ? activeHardware : gpuName).uppercased()
+        return src.contains("TPU") || src.contains("V6E") || src.contains("V5E") || src.contains("V2-") || src.contains("V3-")
+    }
 
     // Live activity signal (three-state) & micro-chart telemetry history
     public var activitySignal: ActivitySignal = .unknown

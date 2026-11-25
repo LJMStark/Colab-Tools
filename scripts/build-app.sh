@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DISPLAY_NAME="Colab Tools"
 EXECUTABLE_NAME="ColabTools"
-VERSION="0.3.3"
+VERSION="0.3.4"
 BUILD_DIR="$ROOT_DIR/build"
 APP_BUNDLE="$BUILD_DIR/${APP_DISPLAY_NAME}.app"
 INSTALL_FLAG=0
@@ -89,7 +89,7 @@ cat > "$STAGING_BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key>
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>6</string>
+  <string>7</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>
@@ -103,16 +103,22 @@ EOF
 codesign --force --deep --sign - "$STAGING_BUNDLE"
 codesign --verify --deep --strict "$STAGING_BUNDLE"
 
+echo "[4/5] Verifying release binary has zero host path leakage..."
+STAGING_BIN="$STAGING_BUNDLE/Contents/MacOS/${EXECUTABLE_NAME}"
+STRINGS_DUMP="$(mktemp "${BUILD_DIR}/strings-audit.XXXXXX")"
+strings "$STAGING_BIN" > "$STRINGS_DUMP"
+LEAK_MATCHES="$(grep -F "/Users/" "$STRINGS_DUMP" || true)"
+rm -f "$STRINGS_DUMP"
+if [ -n "$LEAK_MATCHES" ]; then
+  echo "[ERROR] Release binary contains local /Users/ paths (aborting before replacing bundle):" >&2
+  printf '%s\n' "$LEAK_MATCHES" | head -5 >&2
+  rm -rf "$STAGING_BUNDLE"
+  exit 1
+fi
+echo "  -> Binary path check passed (clean, arch: $(lipo -archs "$STAGING_BIN"))."
+
 rm -rf "$APP_BUNDLE"
 mv "$STAGING_BUNDLE" "$APP_BUNDLE"
-
-echo "[4/5] Verifying release binary has zero host path leakage..."
-if strings "$APP_BUNDLE/Contents/MacOS/${EXECUTABLE_NAME}" | grep -q "/Users/"; then
-  echo "[WARN] Binary still contains /Users/ strings:" >&2
-  strings "$APP_BUNDLE/Contents/MacOS/${EXECUTABLE_NAME}" | grep "/Users/" | head -5 >&2
-else
-  echo "  -> Binary path check passed (clean, arch: $(lipo -archs "$APP_BUNDLE/Contents/MacOS/${EXECUTABLE_NAME}"))."
-fi
 
 echo "[5/5] Built -> $APP_BUNDLE"
 

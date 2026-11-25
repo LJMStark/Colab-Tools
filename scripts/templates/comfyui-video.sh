@@ -14,20 +14,30 @@ STATUS_FILE="/tmp/colab-tools-status.json"
 LOG_FILE="/tmp/comfyui.log"
 
 mkdir -p "$DRIVE_OUTPUT"
+if [ ! -w "$DRIVE_OUTPUT" ]; then
+  echo "[error] Output directory is not writable: $DRIVE_OUTPUT" >&2
+  exit 1
+fi
 
 write_status() {
   local ui_url="${1:-}"
-  local tmp="${STATUS_FILE}.tmp"
-  cat > "$tmp" <<JSON
-{
-  "kind": "${WORKLOAD_KIND}",
-  "name": "${WORKLOAD_NAME}",
-  "ui_url": "${ui_url}",
-  "port": ${SERVICE_PORT},
-  "detail": "ComfyUI :${SERVICE_PORT} · Output -> Drive"
+  python3 - "$STATUS_FILE" "$WORKLOAD_KIND" "$WORKLOAD_NAME" "$ui_url" "$SERVICE_PORT" "$DRIVE_OUTPUT" <<'PY'
+import json, pathlib, sys
+dst, kind, name, ui_url, port_s, out_dir = sys.argv[1:]
+port = int(port_s)
+if not (1024 <= port <= 65535):
+    raise SystemExit(f"Invalid port: {port}")
+payload = {
+    "kind": kind,
+    "name": name,
+    "ui_url": ui_url,
+    "port": port,
+    "detail": f"ComfyUI :{port} · Output -> {pathlib.Path(out_dir).name}",
 }
-JSON
-  mv "$tmp" "$STATUS_FILE"
+tmp = pathlib.Path(dst + ".tmp")
+tmp.write_text(json.dumps(payload, ensure_ascii=False))
+tmp.replace(dst)
+PY
 }
 
 if [ ! -d "$COMFY_DIR" ]; then
@@ -36,18 +46,18 @@ if [ ! -d "$COMFY_DIR" ]; then
   pip install -q -r "$COMFY_DIR/requirements.txt"
 fi
 
-# Link Google Drive models & outputs when present
-if [ -d "$DRIVE_MODELS" ] && [ ! -L "$COMFY_DIR/models/checkpoints" ]; then
+# Link Google Drive models when present
+if [ -d "$DRIVE_MODELS" ] && [ ! -e "$COMFY_DIR/models/drive_shared" ]; then
   mkdir -p "$COMFY_DIR/models"
-  ln -sfn "$DRIVE_MODELS" "$COMFY_DIR/models/drive_shared"
+  ln -s "$DRIVE_MODELS" "$COMFY_DIR/models/drive_shared"
 fi
-ln -sfn "$DRIVE_OUTPUT" "$COMFY_DIR/output"
 
-# Start ComfyUI cleanly if not already listening
+# Start ComfyUI cleanly with explicit Drive --output-directory (never relying on symlinking an existing directory)
 if ! curl -sf "http://127.0.0.1:${SERVICE_PORT}/queue" >/dev/null 2>&1; then
   nohup python3 "$COMFY_DIR/main.py" \
     --listen 127.0.0.1 \
     --port "$SERVICE_PORT" \
+    --output-directory "$DRIVE_OUTPUT" \
     --disable-auto-launch \
     > "$LOG_FILE" 2>&1 &
 fi

@@ -48,7 +48,10 @@ public final class WorkspaceStore: ObservableObject {
     private var sshTunnelADCFiles: [UUID: URL] = [:]
     private var activeTasks: [UUID: Task<Void, Never>] = [:]
     private var queueTasks: [UUID: Task<Void, Never>] = [:]
+    private var queueTokens: [UUID: UUID] = [:]
+    private var activeQueueToken: UUID? = nil
     private var postAllocateReminderTasks: [UUID: Task<Void, Never>] = [:]
+    private var reminderBoundEndpoint: [UUID: String] = [:]
     private var refreshingAccounts: Set<UUID> = []
     private var toastTask: Task<Void, Never>?
 
@@ -62,8 +65,13 @@ public final class WorkspaceStore: ObservableObject {
         }
         KeychainVault.cleanupStaleEphemeralFiles()
         self.settings = AppSettings.load()
+        let now = Date()
         for acc in settings.accounts {
-            runtimeByAccount[acc.id] = AccountRuntimeState()
+            var st = AccountRuntimeState()
+            if let until = settings.circuitBreakUntilByAccount[acc.id.uuidString], until > now {
+                st.queueCircuitBreakUntil = until
+            }
+            runtimeByAccount[acc.id] = st
         }
         if settings.selectedAccountId == nil, let first = settings.accounts.first {
             settings.selectedAccountId = first.id
@@ -85,9 +93,12 @@ public final class WorkspaceStore: ObservableObject {
         activeTasks.removeAll()
         for (_, t) in queueTasks { t.cancel() }
         queueTasks.removeAll()
+        queueTokens.removeAll()
         for (_, t) in postAllocateReminderTasks { t.cancel() }
         postAllocateReminderTasks.removeAll()
+        reminderBoundEndpoint.removeAll()
         activeQueueAccountId = nil
+        activeQueueToken = nil
         for id in Array(sshTunnelProcesses.keys) {
             stopSSHTunnel(for: id)
         }
@@ -231,6 +242,9 @@ public final class WorkspaceStore: ObservableObject {
                 if until <= now {
                     st.queueCircuitBreakUntil = nil
                     runtimeByAccount[acc.id] = st
+                    if settings.circuitBreakUntilByAccount.removeValue(forKey: acc.id.uuidString) != nil {
+                        // Persisted cleanup handled automatically by settings.didSet
+                    }
                     anyQueueOrCooldown = true
                 } else {
                     anyQueueOrCooldown = true
@@ -381,19 +395,27 @@ public final class WorkspaceStore: ObservableObject {
 
         // Strictly match the configured primary sessionName (never masquerade another session as primary)
         if let primary = sessions.first(where: { $0.name == acc.sessionName && !$0.isOrphan }) {
-            let wasOffline = !cur.phase.isRunning
+            // If a polite queue is actively managing startup for this account, do NOT hijack or cancel it
+            // (so mounting Drive, startup scripts, and post-allocate reminders are never skipped).
             if cur.phase.isQueuing {
-                queueTasks.removeValue(forKey: accountId)?.cancel()
-                if activeQueueAccountId == accountId { activeQueueAccountId = nil }
+                runtimeByAccount[accountId] = cur
+                return
             }
+            let wasOffline = !cur.phase.isRunning
+            let endpointChanged = !cur.activeEndpoint.isEmpty && cur.activeEndpoint != primary.endpoint
             cur.phase = .running
             cur.activeEndpoint = primary.endpoint
             cur.activeHardware = primary.hardware
-            if wasOffline {
+            if wasOffline || endpointChanged {
+                // Invalidate any prior session's credential-bearing API URL when session/endpoint changes
+                cur.publicURL = ""
+                cur.llmURLBoundEndpoint = ""
+                cur.displayUIURL = ""
                 cur.lastActiveAt = Date()
                 cur.idleSeconds = 0
                 cur.warnedForCurrentIdle = false
                 cur.activitySignal = .unknown
+                cur.signalSource = .none
             }
             runtimeByAccount[accountId] = cur
 
@@ -425,6 +447,9 @@ public final class WorkspaceStore: ObservableObject {
             cur.gpuUtilPercent = 0
             cur.cpuUtilPercent = 0
             cur.cudaProcessCount = 0
+            cur.publicURL = ""
+            cur.llmURLBoundEndpoint = ""
+            cur.displayUIURL = ""
             cur.serverHealthy = false
             cur.activitySignal = .unknown
             cur.signalSource = .none
@@ -440,8 +465,11 @@ public final class WorkspaceStore: ObservableObject {
     }
 
     /// Applies universal GPU/VRAM/CPU telemetry + multimodal status.json / ComfyUI queue signals
-    /// and updates the anti-false-shutdown ActivitySignal with strict priority:
-    /// 1) status.json explicit `busy` -> 2) ComfyUI `/queue` -> 3) GPU+CPU dual low-load fallback.
+    /// and updates the anti-false-shutdown ActivitySignal with strict safety rules:
+    /// 1) Live ComfyUI busy ALWAYS blocks shutdown (never overridden by stale status.json `busy:false`).
+    /// 2) `status.json` `busy` is honored ONLY when its remote mtime age <= `statusFileMaxAgeSeconds` (5m).
+    /// 3) Hardware dual low-load requires BOTH valid non-nil GPU & CPU readings on non-TPU hardware.
+    /// 4) Missing readings or TPU hardware safely downgrade to `.unknown` (never mistaken for 0% idle).
     private func applyRemoteTelemetry(_ remote: RemoteTelemetry, to accountId: UUID, account acc: AccountProfile) {
         var latest = state(for: accountId)
         guard latest.phase.isRunning else { return }
@@ -450,10 +478,17 @@ public final class WorkspaceStore: ObservableObject {
         if !remote.gpuName.isEmpty { latest.gpuName = remote.gpuName }
         latest.vramUsedMB = remote.vramUsedMB
         latest.vramTotalMB = remote.vramTotalMB
-        latest.gpuUtilPercent = remote.gpuUtil
-        latest.cpuUtilPercent = remote.cpuUtil
+        if let g = remote.gpuUtil { latest.gpuUtilPercent = g }
+        if let c = remote.cpuUtil { latest.cpuUtilPercent = c }
         latest.cudaProcessCount = remote.cudaProcessCount
-        if !remote.publicURL.isEmpty { latest.publicURL = remote.publicURL }
+        // Bind trusted LLM API URL to current activeEndpoint only (never overwritten by status.json `ui_url`)
+        if !remote.publicURL.isEmpty && !latest.activeEndpoint.isEmpty {
+            latest.publicURL = remote.publicURL
+            latest.llmURLBoundEndpoint = latest.activeEndpoint
+        }
+        if !remote.displayUIURL.isEmpty {
+            latest.displayUIURL = remote.displayUIURL
+        }
         if !remote.modelFile.isEmpty { latest.modelFile = remote.modelFile }
         if !remote.modelAlias.isEmpty { latest.modelAlias = remote.modelAlias }
         latest.contextLimit = remote.contextLimit
@@ -461,7 +496,9 @@ public final class WorkspaceStore: ObservableObject {
         latest.serverHealthy = remote.healthy
         latest.sessionUptimeSeconds = remote.uptimeSeconds
         latest.detectedServicePort = remote.detectedWebPort ?? latest.detectedServicePort
-        latest.appendTelemetrySample(gpuUtil: remote.gpuUtil, vramRatio: latest.vramRatio)
+        if let g = remote.gpuUtil {
+            latest.appendTelemetrySample(gpuUtil: g, vramRatio: latest.vramRatio)
+        }
 
         if let payload = remote.statusPayload {
             if let pk = payload.parsedKind { latest.detectedWorkloadKind = pk }
@@ -481,11 +518,25 @@ public final class WorkspaceStore: ObservableObject {
             if latest.workloadName.isEmpty { latest.workloadName = "ComfyUI" }
         }
 
+        let statusFileIsFresh: Bool = {
+            guard let age = remote.statusAgeSeconds else { return false }
+            return age >= 0 && age <= IdleWatchdogEvaluator.statusFileMaxAgeSeconds
+        }()
+
         // Update ActivitySignal for non-LLM workloads (or LLM when /slots is unavailable)
         let shouldDriveNonLLMSignal = !acc.enableLLMModule || latest.publicURL.isEmpty
         if shouldDriveNonLLMSignal {
             let prevSignal = latest.activitySignal
-            if let payloadBusy = remote.statusPayload?.isWorkloadBusy {
+
+            // 1. Live ComfyUI busy signal ALWAYS overrides everything to prevent false shutdown
+            if let cq = remote.comfyQueue, cq.isBusy {
+                latest.signalSource = .comfyQueue
+                latest.activitySignal = .busy(observedAt: now)
+                latest.lastActiveAt = now
+                latest.idleSeconds = 0
+                latest.warnedForCurrentIdle = false
+            } else if statusFileIsFresh, let payloadBusy = remote.statusPayload?.isWorkloadBusy {
+                // 2. Fresh status.json explicit signal
                 latest.signalSource = .statusFile
                 if payloadBusy {
                     latest.activitySignal = .busy(observedAt: now)
@@ -496,32 +547,35 @@ public final class WorkspaceStore: ObservableObject {
                     if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
                     latest.activitySignal = .idle(observedAt: now)
                 }
-            } else if let cq = remote.comfyQueue {
+            } else if remote.comfyQueue != nil {
+                // 3. Live ComfyUI explicitly idle (running==0 && pending==0)
                 latest.signalSource = .comfyQueue
-                if cq.isBusy {
-                    latest.activitySignal = .busy(observedAt: now)
-                    latest.lastActiveAt = now
-                    latest.idleSeconds = 0
-                    latest.warnedForCurrentIdle = false
-                } else {
-                    if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
-                    latest.activitySignal = .idle(observedAt: now)
-                }
+                if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
+                latest.activitySignal = .idle(observedAt: now)
             } else if acc.enableHardwareIdleFallback {
-                latest.signalSource = .hardwareDualLowLoad
+                // 4. Hardware dual low-load fallback (requires non-nil GPU & CPU readings on non-TPU hardware)
                 let hwSig = IdleWatchdogEvaluator.evaluateHardwareActivity(
                     gpuUtilPercent: remote.gpuUtil,
                     cpuUtilPercent: remote.cpuUtil,
+                    isTPU: latest.isTPUHardware,
                     now: now
                 )
-                if hwSig.isBusy {
+                switch hwSig {
+                case .busy:
+                    latest.signalSource = .hardwareDualLowLoad
                     latest.activitySignal = hwSig
                     latest.lastActiveAt = now
                     latest.idleSeconds = 0
                     latest.warnedForCurrentIdle = false
-                } else {
+                case .idle:
+                    latest.signalSource = .hardwareDualLowLoad
                     if case .unknown = prevSignal { latest.lastActiveAt = now; latest.idleSeconds = 0 }
                     latest.activitySignal = hwSig
+                case .unknown:
+                    // Missing telemetry or TPU runtime -> pause watchdog cleanly and reset continuous idle window
+                    latest.signalSource = .none
+                    latest.activitySignal = .unknown
+                    latest.idleSeconds = 0
                 }
             }
         }
@@ -556,44 +610,51 @@ public final class WorkspaceStore: ObservableObject {
     public func pollSlots(for accountId: UUID) async {
         guard settings.accounts.contains(where: { $0.id == accountId }) else { return }
         let snap = state(for: accountId)
-        guard snap.phase.isRunning, !snap.publicURL.isEmpty else { return }
+        // Strictly send Keychain LLM API key ONLY to a publicURL bound to the current active session endpoint
+        guard snap.phase.isRunning,
+              !snap.publicURL.isEmpty,
+              !snap.activeEndpoint.isEmpty,
+              snap.llmURLBoundEndpoint == snap.activeEndpoint else { return }
         let startGen = snap.generation
+        let boundEndpoint = snap.activeEndpoint
         let apiKey = KeychainVault.loadAPIKey(for: accountId) ?? ""
 
-        let slot = await ColabCLIEngine.fetchSlots(baseURL: snap.publicURL, apiKey: apiKey)
+        let slots = await ColabCLIEngine.fetchSlots(baseURL: snap.publicURL, apiKey: apiKey)
         guard isStillValid(accountId: accountId, expectedGeneration: startGen) else { return }
 
         var cur = state(for: accountId)
-        guard cur.phase.isRunning else { return }
+        guard cur.phase.isRunning, cur.activeEndpoint == boundEndpoint else { return }
 
-        if let slot {
+        if let slots {
             let now = Date()
             let prevTask = cur.lastTaskID
-            let nextTask = slot.id_task ?? prevTask
-            let processing = slot.is_processing ?? false
+            let agg = IdleWatchdogEvaluator.evaluateLLMSlots(slots, now: now)
 
             cur.signalSource = .llmSlots
-            cur.promptTokensUsed = slot.n_prompt_tokens ?? cur.promptTokensUsed
-            if let ctx = slot.n_ctx, ctx > 0 { cur.contextLimit = ctx }
+            if agg.maxPromptTokens > 0 || !slots.isEmpty { cur.promptTokensUsed = agg.maxPromptTokens }
+            if agg.maxContext > 0 { cur.contextLimit = agg.maxContext }
+            if agg.latestTaskID >= 0 { cur.lastTaskID = agg.latestTaskID }
 
-            if processing {
-                cur.activitySignal = .busy(observedAt: now)
+            switch agg.signal {
+            case .busy:
+                cur.activitySignal = agg.signal
                 cur.lastActiveAt = now
                 cur.idleSeconds = 0
                 cur.warnedForCurrentIdle = false
-            } else {
-                if prevTask >= 0 && nextTask != prevTask {
+            case .idle:
+                if prevTask >= 0 && agg.latestTaskID >= 0 && agg.latestTaskID != prevTask {
                     cur.lastActiveAt = now
                     cur.idleSeconds = 0
                     cur.warnedForCurrentIdle = false
                 } else if case .unknown = cur.activitySignal {
-                    // First confirmed idle observation starts the clock cleanly from now
                     cur.lastActiveAt = now
                     cur.idleSeconds = 0
                 }
-                cur.activitySignal = .idle(observedAt: now)
+                cur.activitySignal = agg.signal
+            case .unknown:
+                cur.activitySignal = .unknown
+                cur.idleSeconds = 0
             }
-            cur.lastTaskID = nextTask
             cur.serverHealthy = true
         } else {
             // Transient fetch failure -> downgrade to `.unknown` so watchdog pauses safely
@@ -636,16 +697,107 @@ public final class WorkspaceStore: ObservableObject {
         updateAccount(acc)
     }
 
+    private func activeCircuitBreakerUntil(for accountId: UUID, now: Date = Date()) -> Date? {
+        let key = accountId.uuidString
+        let persisted = settings.circuitBreakUntilByAccount[key]
+        let mem = state(for: accountId).queueCircuitBreakUntil
+        let latest = [persisted, mem].compactMap { $0 }.max()
+        if let latest, latest > now {
+            return latest
+        }
+        return nil
+    }
+
+    private func recordCircuitBreaker(for accountId: UUID) {
+        let until = Date().addingTimeInterval(PoliteQueuePolicy.circuitBreakerCooldownSeconds)
+        var st = state(for: accountId)
+        st.queueCircuitBreakUntil = until
+        runtimeByAccount[accountId] = st
+        settings.circuitBreakUntilByAccount[accountId.uuidString] = until
+    }
+
     public func cancelQueue(for accountId: UUID, silent: Bool = false) {
+        let st = state(for: accountId)
+        let wasInFlight = st.queueInFlightProvisioning
+        let existingToken = queueTokens[accountId]
         queueTasks.removeValue(forKey: accountId)?.cancel()
-        if activeQueueAccountId == accountId {
+
+        if wasInFlight, let acc = settings.accounts.first(where: { $0.id == accountId }) {
+            // An allocation POST was already in flight! Keep the mutex locked and verify server state
+            // so a newly allocated billing runtime is NEVER hidden as "offline".
+            var verifying = st
+            verifying.generation += 1
+            let verifyGen = verifying.generation
+            verifying.queueInFlightProvisioning = false
+            verifying.phase = .starting("取消中 · 核实服务端…")
+            runtimeByAccount[accountId] = verifying
+            onStatusBarNeedsUpdate?()
+            if !silent { showToast("正在取消并核实服务端是否已分配…") }
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer {
+                    if self.queueTokens[accountId] == existingToken {
+                        self.queueTokens.removeValue(forKey: accountId)
+                    }
+                    if self.activeQueueToken == existingToken {
+                        self.activeQueueToken = nil
+                        self.activeQueueAccountId = nil
+                    }
+                    self.onStatusBarNeedsUpdate?()
+                }
+                let verify = await ColabCLIEngine.fetchUsageAndSessions(profile: acc)
+                guard self.isStillValid(accountId: accountId, expectedGeneration: verifyGen) else { return }
+                var cur = self.state(for: accountId)
+                if verify.ok, let usage = verify.usage, let sessions = verify.sessions {
+                    cur.cuBalance = usage.balance
+                    cur.cuRatePerHour = usage.ratePerHour
+                    cur.activeAssignments = usage.activeAssignments
+                    cur.sessions = sessions
+                    if let primary = sessions.first(where: { $0.name == acc.sessionName && !$0.isOrphan }) {
+                        cur.phase = .running
+                        cur.activeEndpoint = primary.endpoint
+                        cur.activeHardware = primary.hardware
+                        cur.lastError = "取消前服务端已完成分配，实例正在计费，请按需关机止损！"
+                        self.runtimeByAccount[accountId] = cur
+                        let rate = usage.ratePerHour > 0 ? usage.ratePerHour : AcceleratorOption.estimatedHourlyCU(forHardware: primary.hardware)
+                        ColabCLIEngine.sendNotification(
+                            title: "Colab Tools 计费提醒 · \(acc.displayName)",
+                            body: "取消前 \(primary.hardware) 已成功分配（约 \(String(format: "%.1f", rate)) CU/hr），如不使用请立即关机！"
+                        )
+                        if !acc.enableLLMModule {
+                            self.scheduleNonLLMPostAllocateReminder(for: acc, endpoint: primary.endpoint, hardwareLabel: primary.hardware, hourlyRate: rate)
+                        }
+                        self.showToast("取消前已分配 \(primary.hardware)，请注意关机止损")
+                        return
+                    }
+                    cur.phase = .offline
+                    cur.lastError = nil
+                    self.runtimeByAccount[accountId] = cur
+                    if !silent { self.showToast("已确认取消，未产生计费实例") }
+                } else {
+                    cur.phase = .error("取消时无法核实服务端状态，请手动刷新确认有无计费实例")
+                    cur.lastError = verify.error ?? "服务端核验失败"
+                    self.runtimeByAccount[accountId] = cur
+                    self.showToast("无法核实服务端分配状态，请刷新检查")
+                }
+            }
+            return
+        }
+
+        if queueTokens[accountId] == existingToken {
+            queueTokens.removeValue(forKey: accountId)
+        }
+        if activeQueueToken == existingToken || activeQueueAccountId == accountId {
+            activeQueueToken = nil
             activeQueueAccountId = nil
         }
-        var st = state(for: accountId)
-        if st.phase.isQueuing || st.phase.isBusy {
-            st.generation += 1
-            st.phase = .offline
-            runtimeByAccount[accountId] = st
+        var next = st
+        next.queueInFlightProvisioning = false
+        if next.phase.isQueuing || next.phase.isBusy {
+            next.generation += 1
+            next.phase = .offline
+            runtimeByAccount[accountId] = next
         }
         onStatusBarNeedsUpdate?()
         if !silent { showToast("已取消算力排队") }
@@ -653,6 +805,7 @@ public final class WorkspaceStore: ObservableObject {
 
     private func cancelPostAllocateReminder(for accountId: UUID) {
         postAllocateReminderTasks.removeValue(forKey: accountId)?.cancel()
+        reminderBoundEndpoint.removeValue(forKey: accountId)
         var st = state(for: accountId)
         if st.nonLLMReminderPending {
             st.nonLLMReminderPending = false
@@ -660,7 +813,7 @@ public final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func scheduleNonLLMPostAllocateReminder(for acc: AccountProfile, hardwareLabel: String, hourlyRate: Double) {
+    private func scheduleNonLLMPostAllocateReminder(for acc: AccountProfile, endpoint: String, hardwareLabel: String, hourlyRate: Double) {
         cancelPostAllocateReminder(for: acc.id)
         var st = state(for: acc.id)
         st.nonLLMReminderPending = true
@@ -668,15 +821,21 @@ public final class WorkspaceStore: ObservableObject {
 
         let accountId = acc.id
         let displayName = acc.displayName
+        reminderBoundEndpoint[accountId] = endpoint
         postAllocateReminderTasks[accountId] = Task { @MainActor [weak self] in
             let waitNs = UInt64(PoliteQueuePolicy.nonLLMPostAllocateReminderSeconds * 1_000_000_000)
             try? await Task.sleep(nanoseconds: waitNs)
             guard !Task.isCancelled, let self else { return }
+            let expectedEp = self.reminderBoundEndpoint[accountId]
             var cur = self.state(for: accountId)
             cur.nonLLMReminderPending = false
             self.runtimeByAccount[accountId] = cur
             self.postAllocateReminderTasks.removeValue(forKey: accountId)
+            self.reminderBoundEndpoint.removeValue(forKey: accountId)
             guard cur.phase.isRunning else { return }
+            if let expectedEp, !expectedEp.isEmpty, !cur.activeEndpoint.isEmpty, cur.activeEndpoint != expectedEp {
+                return
+            }
             let rate = cur.cuRatePerHour > 0 ? cur.cuRatePerHour : hourlyRate
             ColabCLIEngine.sendNotification(
                 title: "Colab Tools 防遗忘提醒 · \(displayName)",
@@ -697,15 +856,37 @@ public final class WorkspaceStore: ObservableObject {
     private func runSingleStartSession(_ accountId: UUID) async {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
         var st = state(for: accountId)
-        guard !st.phase.isBusy && !st.phase.isQueuing else { return }
+        guard !st.phase.isBusy && !st.phase.isQueuing && !st.phase.isRunning else { return }
 
-        guard await verifySystemDefaultIdentityIfNeeded(for: acc) else { return }
+        // Enforce persisted 15-minute anti-abuse cooldown across ALL `colab new` entry points
+        if let until = activeCircuitBreakerUntil(for: accountId) {
+            let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
+            showToast("处于防风控硬熔断冷却期（剩余约 \(remMin) 分钟）")
+            return
+        }
 
+        // Claim busy state SYNCHRONOUSLY before the very first `await` to eliminate double-click races
         st.generation += 1
         let runGen = st.generation
-        st.phase = .starting("核验现有会话…")
+        st.phase = .starting("核验身份…")
         st.lastError = nil
         runtimeByAccount[accountId] = st
+        onStatusBarNeedsUpdate?()
+
+        guard await verifySystemDefaultIdentityIfNeeded(for: acc) else {
+            if isStillValid(accountId: accountId, expectedGeneration: runGen) {
+                var cur = state(for: accountId)
+                if cur.phase.isBusy { cur.phase = .offline }
+                runtimeByAccount[accountId] = cur
+                onStatusBarNeedsUpdate?()
+            }
+            return
+        }
+        guard isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+
+        var preSt = state(for: accountId)
+        preSt.phase = .starting("核验现有会话…")
+        runtimeByAccount[accountId] = preSt
         onStatusBarNeedsUpdate?()
 
         // Strictly require pre-flight query success before calling `colab new`
@@ -729,7 +910,7 @@ public final class WorkspaceStore: ObservableObject {
         let alreadyExists = sessions.contains(where: { $0.name == acc.sessionName && !$0.isOrphan })
         var allocatedHW: String? = nil
         if !alreadyExists {
-            let outcome = await ColabCLIEngine.provisionSession(profile: acc) { [weak self] step in
+            let roundRes = await ColabCLIEngine.provisionSession(profile: acc) { [weak self] step in
                 Task { @MainActor [weak self] in
                     guard let self, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
                     var c = self.state(for: accountId)
@@ -739,7 +920,7 @@ public final class WorkspaceStore: ObservableObject {
                 }
             }
             guard isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
-            switch outcome {
+            switch roundRes.outcome {
             case .allocated(let hw):
                 allocatedHW = hw
             case .capacityUnavailable503(let msg), .unsupportedTier400(let msg):
@@ -754,10 +935,10 @@ public final class WorkspaceStore: ObservableObject {
                 var errState = state(for: accountId)
                 errState.phase = .error(msg)
                 errState.lastError = msg
-                if code == "429" || code == "412" || code == "ABUSE_BLOCK" {
-                    errState.queueCircuitBreakUntil = Date().addingTimeInterval(PoliteQueuePolicy.circuitBreakerCooldownSeconds)
-                }
                 runtimeByAccount[accountId] = errState
+                if code == "429" || code == "412" || code == "ABUSE_BLOCK" || code == "401/403" {
+                    recordCircuitBreaker(for: accountId)
+                }
                 showToast(msg)
                 onStatusBarNeedsUpdate?()
                 return
@@ -784,49 +965,76 @@ public final class WorkspaceStore: ObservableObject {
             return
         }
 
-        // Enforce mandatory circuit-breaker cooldown after 412 / 429 / 403 / abuse signal
-        if let until = st.queueCircuitBreakUntil, until > Date() {
+        // Enforce persisted circuit-breaker cooldown after 412 / 429 / 403 / abuse signal
+        if let until = activeCircuitBreakerUntil(for: accountId) {
             let remMin = max(1, Int(ceil(until.timeIntervalSinceNow / 60.0)))
             showToast("触发防风控硬熔断，冷却剩余约 \(remMin) 分钟后再试")
             return
         }
 
         let cleanTargets = PoliteQueuePolicy.sanitizedTargets(selected: acc.queueTargets, for: acc.tier)
-        let summary = PoliteQueuePolicy.targetsSummary(cleanTargets)
-        let probeTargets = cleanTargets.flatMap(\.probeTargets)
+        var remainingTargets = cleanTargets.flatMap(\.probeTargets)
+        var summary = PoliteQueuePolicy.targetsSummary(cleanTargets)
 
+        let myToken = UUID()
         var nextSt = st
         nextSt.generation += 1
         let runGen = nextSt.generation
         nextSt.lastError = nil
+        nextSt.queueInFlightProvisioning = false
         nextSt.phase = .queuing(attempt: 1, maxAttempts: PoliteQueuePolicy.maxAttempts, nextRetryAt: nil, targetsSummary: summary)
         runtimeByAccount[accountId] = nextSt
         activeQueueAccountId = accountId
+        activeQueueToken = myToken
+        queueTokens[accountId] = myToken
         onStatusBarNeedsUpdate?()
 
         let startedAt = Date()
+        let absoluteDeadline = startedAt.addingTimeInterval(PoliteQueuePolicy.maxTotalWaitSeconds)
+
         queueTasks[accountId] = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                self.queueTasks.removeValue(forKey: accountId)
-                if self.activeQueueAccountId == accountId {
+                // Only the active token holder may clear the task entry or release the global queue mutex
+                if self.queueTokens[accountId] == myToken {
+                    self.queueTokens.removeValue(forKey: accountId)
+                    self.queueTasks.removeValue(forKey: accountId)
+                }
+                if self.activeQueueToken == myToken {
+                    self.activeQueueToken = nil
                     self.activeQueueAccountId = nil
+                }
+                if self.isStillValid(accountId: accountId, expectedGeneration: runGen) {
+                    var c = self.state(for: accountId)
+                    c.queueInFlightProvisioning = false
+                    self.runtimeByAccount[accountId] = c
                 }
                 self.onStatusBarNeedsUpdate?()
             }
 
-            guard await self.verifySystemDefaultIdentityIfNeeded(for: acc) else {
-                var c = self.state(for: accountId)
-                if c.phase.isQueuing { c.phase = .offline }
-                self.runtimeByAccount[accountId] = c
-                return
-            }
-
             for attempt in 1...PoliteQueuePolicy.maxAttempts {
                 guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+                guard Date() < absoluteDeadline else {
+                    var done = self.state(for: accountId)
+                    done.phase = .offline
+                    done.lastError = "已达 40 分钟合规排队上限，\(summary) 仍暂无库存，已自动停止"
+                    self.runtimeByAccount[accountId] = done
+                    return
+                }
                 guard let latestAcc = self.settings.accounts.first(where: { $0.id == accountId }) else { return }
 
-                // Pre-flight read-only check before every attempt to avoid duplicate assignments or orphan contention
+                // Re-verify default OAuth2 CLI identity before EVERY round so switching `colab login` never provisions on another account
+                guard await self.verifySystemDefaultIdentityIfNeeded(for: latestAcc) else {
+                    if self.isStillValid(accountId: accountId, expectedGeneration: runGen) {
+                        var c = self.state(for: accountId)
+                        if c.phase.isQueuing { c.phase = .offline }
+                        self.runtimeByAccount[accountId] = c
+                    }
+                    return
+                }
+                guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+
+                // Pre-flight read-only check before every attempt to avoid duplicate assignments
                 var checking = self.state(for: accountId)
                 checking.phase = .queuing(attempt: attempt, maxAttempts: PoliteQueuePolicy.maxAttempts, nextRetryAt: nil, targetsSummary: summary)
                 self.runtimeByAccount[accountId] = checking
@@ -858,15 +1066,39 @@ public final class WorkspaceStore: ObservableObject {
                     return
                 }
 
-                let outcome = await ColabCLIEngine.provisionSession(
+                let roundRes = await ColabCLIEngine.provisionSession(
                     profile: latestAcc,
-                    overrideTargets: probeTargets,
-                    interTargetDelaySeconds: { PoliteQueuePolicy.interTargetDelaySeconds() }
+                    overrideTargets: remainingTargets,
+                    deadline: absoluteDeadline,
+                    interTargetDelaySeconds: { PoliteQueuePolicy.interTargetDelaySeconds() },
+                    onBeforeAttempt: { [weak self] _ in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
+                            var f = self.state(for: accountId)
+                            f.queueInFlightProvisioning = true
+                            self.runtimeByAccount[accountId] = f
+                        }
+                    }
                 ) { _ in }
+
+                if self.isStillValid(accountId: accountId, expectedGeneration: runGen) {
+                    var f = self.state(for: accountId)
+                    f.queueInFlightProvisioning = false
+                    self.runtimeByAccount[accountId] = f
+                }
 
                 guard !Task.isCancelled, self.isStillValid(accountId: accountId, expectedGeneration: runGen) else { return }
 
-                switch outcome {
+                // Permanently prune any targets that returned HTTP 400 so we never re-probe unsupported tiers in later rounds
+                if !roundRes.unsupportedTargetValues.isEmpty {
+                    remainingTargets.removeAll { target in
+                        guard let val = target.value?.uppercased() else { return false }
+                        return roundRes.unsupportedTargetValues.contains(val)
+                    }
+                    summary = remainingTargets.map(\.display).joined(separator: " → ")
+                }
+
+                switch roundRes.outcome {
                 case .allocated(let hw):
                     await self.finalizeStartedSession(
                         accountId: accountId,
@@ -881,8 +1113,8 @@ public final class WorkspaceStore: ObservableObject {
                     var broken = self.state(for: accountId)
                     broken.phase = .error(msg)
                     broken.lastError = msg
-                    broken.queueCircuitBreakUntil = Date().addingTimeInterval(PoliteQueuePolicy.circuitBreakerCooldownSeconds)
                     self.runtimeByAccount[accountId] = broken
+                    self.recordCircuitBreaker(for: accountId)
                     ColabCLIEngine.sendNotification(
                         title: "Colab Tools 排队熔断 · \(latestAcc.displayName)",
                         body: msg
@@ -899,6 +1131,13 @@ public final class WorkspaceStore: ObservableObject {
                     return
 
                 case .capacityUnavailable503(let msg):
+                    if remainingTargets.isEmpty {
+                        var noLeft = self.state(for: accountId)
+                        noLeft.phase = .error("所选算力均不受当前订阅支持，已停止排队")
+                        noLeft.lastError = msg
+                        self.runtimeByAccount[accountId] = noLeft
+                        return
+                    }
                     guard let delay = PoliteQueuePolicy.nextDelay(
                         completedAttempts: attempt,
                         startedAt: startedAt,
@@ -947,13 +1186,20 @@ public final class WorkspaceStore: ObservableObject {
             runtimeByAccount[accountId] = allocState
         }
 
+        // Schedule 10-minute anti-forget reminder IMMEDIATELY upon confirmed non-LLM queue allocation
+        // so even if Drive mounting or a startup script later fails, the user is still warned about billing.
+        let initialHW = allocatedHardware ?? state(for: accountId).shortGPUName
+        if fromQueue && !acc.enableLLMModule {
+            let estRate = AcceleratorOption.estimatedHourlyCU(forHardware: initialHW)
+            scheduleNonLLMPostAllocateReminder(for: acc, endpoint: state(for: accountId).activeEndpoint, hardwareLabel: initialHW, hourlyRate: estRate)
+        }
+
         let trimmedScript = acc.driveScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldRunNonLLMScript = !acc.enableLLMModule
-            && acc.workloadKind != .general
+        let shouldRunCustomNonLLMScript = !acc.enableLLMModule
             && !trimmedScript.isEmpty
             && !trimmedScript.hasSuffix("/colab-llm/scripts/start_server.sh")
 
-        if acc.enableLLMModule || shouldRunNonLLMScript {
+        if acc.enableLLMModule || shouldRunCustomNonLLMScript {
             var mState = state(for: accountId)
             mState.phase = .starting("挂载 Google Drive…")
             runtimeByAccount[accountId] = mState
@@ -972,7 +1218,7 @@ public final class WorkspaceStore: ObservableObject {
             }
 
             var sState = state(for: accountId)
-            sState.phase = .starting(acc.enableLLMModule ? "启动模型与公网隧道…" : "启动 \(acc.workloadKind.displayName) 服务…")
+            sState.phase = .starting(acc.enableLLMModule ? "启动模型与公网隧道…" : "启动 \(acc.workloadKind.displayName) 脚本…")
             runtimeByAccount[accountId] = sState
             onStatusBarNeedsUpdate?()
 
@@ -992,7 +1238,14 @@ public final class WorkspaceStore: ObservableObject {
             for line in startRes.stdout.components(separatedBy: .newlines) {
                 if line.hasPrefix("PUBLIC_URL=") {
                     let u = String(line.dropFirst(11)).trimmingCharacters(in: .whitespaces)
-                    if InputValidator.isValidEndpointURL(u) { parsed.publicURL = u }
+                    if InputValidator.isValidEndpointURL(u) {
+                        if acc.enableLLMModule {
+                            parsed.publicURL = u
+                            parsed.llmURLBoundEndpoint = parsed.activeEndpoint
+                        } else {
+                            parsed.displayUIURL = u
+                        }
+                    }
                 } else if line.hasPrefix("ALIAS=") {
                     let a = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
                     if InputValidator.isValidModelAlias(a) { parsed.modelAlias = a }
@@ -1006,7 +1259,7 @@ public final class WorkspaceStore: ObservableObject {
                     parsed.contextLimit = c
                 }
             }
-            parsed.serverHealthy = !parsed.publicURL.isEmpty
+            parsed.serverHealthy = acc.enableLLMModule ? !parsed.publicURL.isEmpty : (!parsed.displayUIURL.isEmpty || true)
             runtimeByAccount[accountId] = parsed
 
             if acc.enableLLMModule, let apiKey = await ColabCLIEngine.fetchRemoteAPIKeySafely(profile: acc) {
@@ -1021,6 +1274,7 @@ public final class WorkspaceStore: ObservableObject {
         doneState.idleSeconds = 0
         doneState.warnedForCurrentIdle = false
         doneState.activitySignal = .unknown
+        doneState.signalSource = .none
         runtimeByAccount[accountId] = doneState
 
         await refreshAccount(accountId, force: true, bypassCooldown: true, silent: true)
@@ -1035,15 +1289,17 @@ public final class WorkspaceStore: ObservableObject {
             : AcceleratorOption.estimatedHourlyCU(forHardware: latest.shortGPUName)
         let rateText = String(format: "%.1f CU/hr", rate)
 
-        ColabCLIEngine.sendNotification(
-            title: fromQueue ? "Colab Tools 排到卡啦 · \(acc.displayName)" : "Colab Tools 已就绪 · \(acc.displayName)",
-            body: "\(latest.shortGPUName) 已上线（约 \(rateText)）"
-        )
-        showToast("\(acc.displayName) · \(latest.shortGPUName) 已上线")
-
-        if fromQueue && !acc.enableLLMModule {
-            scheduleNonLLMPostAllocateReminder(for: acc, hardwareLabel: latest.shortGPUName, hourlyRate: rate)
+        // Update bound endpoint on pending non-LLM reminder now that refreshAccount populated activeEndpoint
+        if fromQueue && !acc.enableLLMModule && !latest.activeEndpoint.isEmpty {
+            reminderBoundEndpoint[accountId] = latest.activeEndpoint
         }
+
+        let readyLabel = (acc.enableLLMModule || shouldRunCustomNonLLMScript) ? "已上线" : "实例已分配"
+        ColabCLIEngine.sendNotification(
+            title: fromQueue ? "Colab Tools 排到卡啦 · \(acc.displayName)" : "Colab Tools \(readyLabel) · \(acc.displayName)",
+            body: "\(latest.shortGPUName) \(readyLabel)（约 \(rateText)）"
+        )
+        showToast("\(acc.displayName) · \(latest.shortGPUName) \(readyLabel)")
     }
 
     /// Strictly verifies server-side session removal after `colab stop` before claiming billing has stopped.
@@ -1103,9 +1359,17 @@ public final class WorkspaceStore: ObservableObject {
                 cur.vramUsedMB = 0
                 cur.vramTotalMB = 0
                 cur.gpuUtilPercent = 0
+                cur.cpuUtilPercent = 0
+                cur.cudaProcessCount = 0
+                cur.publicURL = ""
+                cur.llmURLBoundEndpoint = ""
+                cur.displayUIURL = ""
                 cur.serverHealthy = false
                 cur.activitySignal = .unknown
+                cur.signalSource = .none
                 cur.promptTokensUsed = 0
+                cur.queueRunning = 0
+                cur.queuePending = 0
                 cur.sessionUptimeSeconds = 0
                 cur.idleSeconds = 0
                 cur.lastError = nil
@@ -1255,11 +1519,18 @@ public final class WorkspaceStore: ObservableObject {
     }
 
     /// Opens the multimodal WebUI / audio preview page (public URL > active local SSH tunnel > Colab web fallback).
+    /// Respects Google Colab FAQ limitations: free-tier runtimes without paid CU balance use official Notebook web UI.
     public func openWorkloadWebUI(accountId: UUID) {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
         let st = state(for: accountId)
         cancelPostAllocateReminder(for: accountId)
-        if !st.publicURL.isEmpty, InputValidator.isValidEndpointURL(st.publicURL), let url = URL(string: st.publicURL) {
+        if st.isFreeRuntimeRestricted(for: acc) {
+            showToast("免费且无付费 CU 运行时按官方规定请使用 Colab 网页 Notebook")
+            openColabInBrowser(accountId: accountId)
+            return
+        }
+        let targetUI = !st.displayUIURL.isEmpty ? st.displayUIURL : st.publicURL
+        if !targetUI.isEmpty, InputValidator.isValidEndpointURL(targetUI), let url = URL(string: targetUI) {
             NSWorkspace.shared.open(url)
             showToast("已在浏览器打开 \(acc.workloadKind.webUIButtonTitle)")
             return
@@ -1281,6 +1552,11 @@ public final class WorkspaceStore: ObservableObject {
     /// Uses an owner-only (`0700`) self-cleaning wrapper script so ADC credentials are bound properly and wiped on exit.
     public func openRemoteSSHShell(accountId: UUID, sessionName: String? = nil) {
         guard let acc = settings.accounts.first(where: { $0.id == accountId }) else { return }
+        let st = state(for: accountId)
+        if st.isFreeRuntimeRestricted(for: acc) {
+            showToast("免费且无付费 CU 余额的运行时受官方条款限制，请使用 Colab 网页打开")
+            return
+        }
         cancelPostAllocateReminder(for: accountId)
         let target = sessionName ?? acc.sessionName
         guard InputValidator.isValidSessionName(target) else {
@@ -1384,6 +1660,10 @@ public final class WorkspaceStore: ObservableObject {
         }
         guard st.phase.isRunning, InputValidator.isValidSessionName(acc.sessionName) else {
             showToast("请先启动有效的 GPU 会话")
+            return
+        }
+        if st.isFreeRuntimeRestricted(for: acc) {
+            showToast("免费且无付费 CU 余额的运行时不支持 SSH 端口隧道，请使用 Colab 网页打开")
             return
         }
 
