@@ -1,7 +1,6 @@
 package uiapp
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/LJMStark/Colab-Tools/internal/core"
@@ -57,36 +56,40 @@ func (m *MainUI) compactOverlayChip(c *ui.Context, pal Palette, label string, ac
 }
 
 // renderHomeOptionsDrawer renders the clean, consolidated inspector inside the centered ui.Overlay
-// (Extended recipe quick-switcher + GPU strategy + Drive/ComfyUI or LLM integrations + unified Auto-Shutdown).
+// (Task recipe switcher + GPU strategy + Drive storage or LLM integrations).
 func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
 
-	// Top Block: Extended Mode Quick-Switcher + Contextual Sub-Options
+	// Top Block: Layered Task Picker (4 primary tasks + compact row for advanced recipes)
 	activeRecipeLabel := acc.DeployRecipe.DisplayName()
 	if acc.DeployRecipe == core.RecipeH3Video {
 		activeRecipeLabel = acc.H3Variant.DisplayName()
 	}
-	SectionCard(c, pal, "扩展模式快捷切", activeRecipeLabel, func() {
-		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
-			m.compactOverlayChip(c, pal, "H3 Flash", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlash, func() {
+	SectionCard(c, pal, "任务玩法", activeRecipeLabel, func() {
+		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(8).Children(func() {
+			m.compactOverlayChip(c, pal, "H3 Flash 极速版", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlash, func() {
 				m.selectH3Preset(acc, core.H3VariantFlash)
 			})
-			m.compactOverlayChip(c, pal, "H3 原版", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal, func() {
+			m.compactOverlayChip(c, pal, "H3 原版 (31B)", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal, func() {
 				m.selectH3Preset(acc, core.H3VariantOriginal)
 			})
 			m.compactOverlayChip(c, pal, "轻量 GGUF", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF, func() {
 				m.selectH3Preset(acc, core.H3VariantFlashGGUF)
 			})
-			m.compactOverlayChip(c, pal, "自定义 HF 或 Drive", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom, func() {
+			m.compactOverlayChip(c, pal, "大模型代理", acc.DeployRecipe == core.RecipeLLMProxy, func() {
+				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
+			})
+		})
+
+		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "其他进阶玩法：").FontSize(11.5).TextColor(pal.TextMuted).Shrink(0)
+			m.compactOverlayChip(c, pal, "自定义 HF / 网盘模型", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom, func() {
 				m.selectH3Preset(acc, core.H3VariantCustom)
 			})
 			m.compactOverlayChip(c, pal, "通用 ComfyUI", acc.DeployRecipe == core.RecipeComfyUIGeneral, func() {
 				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeComfyUIGeneral)
 			})
-			m.compactOverlayChip(c, pal, "大模型代理", acc.DeployRecipe == core.RecipeLLMProxy, func() {
-				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
-			})
-			m.compactOverlayChip(c, pal, "只开机", acc.DeployRecipe == core.RecipeNone, func() {
+			m.compactOverlayChip(c, pal, "纯开机", acc.DeployRecipe == core.RecipeNone, func() {
 				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeNone)
 			})
 		})
@@ -201,147 +204,29 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 		m.renderPersistentQueueSection(c, pal, acc)
 	})
 
-	// Block B: Video Drive & ComfyUI Options or LLM Coding Tool Integrations
+	// Block B: Single Google Drive Toggle for Video or LLM Coding Tool Integrations
 	if acc.DeployRecipe == core.RecipeLLMProxy {
 		m.renderIntegrationsPanel(c, pal, acc, rt)
 	}
 	if isVideo {
-		SectionCard(c, pal, "Google Drive 存片与打开方式", "默认已开齐，一般不用改", func() {
+		SectionCard(c, pal, "视频存储", "已自动启用本机加密直连与加速", func() {
 			useDrive := acc.UseGoogleDrive
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 				ui.Column(c).Grow(1).Gap(2).Children(func() {
-					ui.Text(c, "联动 Google Drive（复用模型 + 成片实时存盘）").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
-					ui.Text(c, "开机先把 Drive 里的模型拷到本地高速盘跑，不卡顿不掉盘；每出一条视频立刻存进 Drive。").FontSize(12).TextColor(pal.TextMuted)
+					ui.Text(c, "成片自动存进 Google Drive").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+					ui.Text(c, "开启后自动缓存底座模型并实时保存成片，自定义目录可在「设置 → 高级选项」调整。").FontSize(12).TextColor(pal.TextMuted)
 				})
 				if ui.Switch(c, &useDrive).Clicked() || useDrive != acc.UseGoogleDrive {
 					cp := acc
 					cp.UseGoogleDrive = useDrive
-					m.Svc.UpdateAccount(cp)
-				}
-			})
-
-			if acc.UseGoogleDrive {
-				cacheBase := acc.CacheBaseToDrive
-				ui.Row(c).FillWidth().Padding(8, 12).Radius(10).Background(pal.SubtleBg).AlignItems(ui.Center).Children(func() {
-					ui.Column(c).Grow(1).Gap(2).Children(func() {
-						ui.Text(c, "首次下载完 21.5GB 底座后，顺手存一份回 Drive").FontSize(13).FontWeight(500).TextColor(pal.TextPrimary)
-						ui.Text(c, "下次开机直接从 Drive 拷，切换 H3 原版或 Flash 都不用重下。").FontSize(11.5).TextColor(pal.TextMuted)
-					})
-					if ui.Switch(c, &cacheBase).Clicked() || cacheBase != acc.CacheBaseToDrive {
-						cp := acc
-						cp.CacheBaseToDrive = cacheBase
-						m.Svc.UpdateAccount(cp)
+					if useDrive {
+						cp.CacheBaseToDrive = true
 					}
-				})
-
-				ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "成片目录").FontSize(12.5).TextColor(pal.TextMuted).Width(72)
-					ui.TextInput(c, &m.DriveOutputDraft).Placeholder("/content/drive/MyDrive/ColabTools/outputs").Grow(1)
-					SmallActionButton(c, pal, "保存目录", nil, false, func() {
-						cp := acc
-						cp.DriveModelsDir = core.SanitizeDriveSubpath(m.DriveModelsDraft, "")
-						cp.DriveOutputDir = core.SanitizeDriveSubpath(m.DriveOutputDraft, "/content/drive/MyDrive/ColabTools/outputs")
-						m.Svc.UpdateAccount(cp)
-						m.Svc.ShowToast("已保存 Google Drive 成片目录")
-					})
-					SmallActionButton(c, pal, "去 Drive 看成片", &pal.Sky, false, func() {
-						m.Svc.OpenDriveOutputs()
-					})
-				})
-			}
-
-			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
-
-			if acc.DeployRecipe == core.RecipeH3Video {
-				solOn := acc.H3EnableSolAttn
-				ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-					ui.Column(c).Grow(1).Gap(2).Children(func() {
-						ui.Text(c, "开启 sol-attn 稀疏加速（推荐）").FontSize(13.5).FontWeight(500).TextColor(pal.TextPrimary)
-						ui.Text(c, "单条视频平均能快约三成，优先安装 Drive/ColabTools/wheels 里现成的预编译包。").FontSize(12).TextColor(pal.TextMuted)
-					})
-					if ui.Switch(c, &solOn).Clicked() || solOn != acc.H3EnableSolAttn {
-						cp := acc
-						cp.H3EnableSolAttn = solOn
-						m.Svc.UpdateAccount(cp)
-					}
-				})
-				ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
-			}
-
-			autoOpen := acc.AutoOpenComfyUI
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Column(c).Grow(1).Gap(2).Children(func() {
-					ui.Text(c, "装好后自动通过本机加密通道打开 ComfyUI（推荐）").FontSize(13.5).FontWeight(500).TextColor(pal.TextPrimary)
-					ui.Text(c, "直连 127.0.0.1:8188 弹出浏览器，不暴露公网网址、不易黑屏断流。").FontSize(12).TextColor(pal.TextMuted)
-				})
-				if ui.Switch(c, &autoOpen).Clicked() || autoOpen != acc.AutoOpenComfyUI {
-					cp := acc
-					cp.AutoOpenComfyUI = autoOpen
-					m.Svc.UpdateAccount(cp)
-				}
-			})
-
-			cfOn := acc.EnableCloudflared
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Column(c).Grow(1).Gap(2).Children(func() {
-					ui.Text(c, "同时生成 cloudflared 跨设备临时链接（可选）").FontSize(13.5).FontWeight(500).TextColor(pal.TextPrimary)
-					ui.Text(c, "方便在手机或另一台电脑看进度（临时网址无密码，请勿外传）。").FontSize(12).TextColor(pal.TextMuted)
-				})
-				if ui.Switch(c, &cfOn).Clicked() || cfOn != acc.EnableCloudflared {
-					cp := acc
-					cp.EnableCloudflared = cfOn
 					m.Svc.UpdateAccount(cp)
 				}
 			})
 		})
 	}
-
-	// Block C: Single Unified Auto-Shutdown Setting (eliminates 3 conflicting places across the app)
-	SectionCard(c, pal, "跑完自动关机省点（全应用统一设置）", acc.DisplayName, func() {
-		autoShut := acc.AutoShutdownEnabled
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
-			ui.Column(c).Grow(1).Gap(2).Children(func() {
-				ui.Text(c, "任务空闲后自动停卡止损").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
-				ui.Text(c, "下载大模型或合成音视频时绝不误关；队列清空且持续空闲后自动停机并复查官网。").FontSize(12).TextColor(pal.TextMuted)
-			})
-			if autoShut {
-				presets := []int{15, 40, 60}
-				curMins := acc.IdleTimeoutMinutes
-				if isVideo {
-					presets = []int{10, 15, 30}
-					if acc.StopAfterQueueDrained {
-						curMins = acc.QueueDrainMinutes
-					}
-				}
-				for _, mins := range presets {
-					mv := mins
-					var mt *ui.Color
-					if curMins == mv {
-						t := pal.Emerald
-						mt = &t
-					}
-					SmallActionButton(c, pal, fmt.Sprintf("%d分钟", mv), mt, false, func() {
-						cp := acc
-						cp.AutoShutdownEnabled = true
-						cp.IdleTimeoutMinutes = mv
-						if isVideo {
-							cp.StopAfterQueueDrained = true
-							cp.QueueDrainMinutes = mv
-						}
-						m.Svc.UpdateAccount(cp)
-					})
-				}
-			}
-			if ui.Switch(c, &autoShut).Clicked() || autoShut != acc.AutoShutdownEnabled {
-				cp := acc
-				cp.AutoShutdownEnabled = autoShut
-				if isVideo {
-					cp.StopAfterQueueDrained = autoShut
-				}
-				m.Svc.UpdateAccount(cp)
-			}
-		})
-	})
 
 	// Allow switching/redeploying quickly when opened from a running dashboard
 	if rt.Phase.IsRunning() && acc.DeployRecipe.IsVideoComfy() {

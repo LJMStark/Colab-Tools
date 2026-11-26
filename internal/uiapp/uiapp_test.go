@@ -276,7 +276,26 @@ func renderPNG(t *testing.T, view func(*ui.Context), width, height int, outPath 
 }
 
 func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
-	// 1. Offline Standby 4x2 Bento: zero-config task switching + centered Overlay options + cooldown clear
+	// 1. Offline Standby 3x2 Bento (single account, zero bottom table, zero duplicates)
+	cleanIdleSvc := makeDemoService(app.SectionHome, false, true)
+	cleanIdleUI := uiapp.NewMainUI(cleanIdleSvc)
+	cleanIdleUI.ForceTheme = "dark"
+	cleanIdleTester := ui.NewTester(cleanIdleUI.View, 1160, 760)
+	for _, want := range []string{
+		"CU 余额与速率", "实时负载", "当前任务", "空闲自动关机", "挑卡与守候",
+		"调整策略与进阶选项", "›", "点击开机", "账单 ›", "H3 Flash 极速版",
+	} {
+		if !cleanIdleTester.HasText(want) {
+			t.Fatalf("missing %q on standby 3x2 dashboard: %q", want, cleanIdleTester.Texts())
+		}
+	}
+	for _, unwanted := range []string{"算力续航", "本机通道", "更多玩法", "账号与活跃会话 (1)"} {
+		if cleanIdleTester.HasText(unwanted) {
+			t.Fatalf("unexpected redundant element %q on single-account standby dashboard: %q", unwanted, cleanIdleTester.Texts())
+		}
+	}
+
+	// Cooldown clear + task switching + simplified options overlay
 	idleSvc := makeDemoService(app.SectionHome, false, true)
 	accID := idleSvc.Settings.SelectedAccountID
 	until := time.Now().Add(12 * time.Minute)
@@ -290,8 +309,8 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	idleUI := uiapp.NewMainUI(idleSvc)
 	idleUI.ForceTheme = "dark"
 	idleTester := ui.NewTester(idleUI.View, 1160, 760)
-	if !idleTester.HasText("当前任务") || !idleTester.HasText("H3 Flash 极速版") || !idleTester.HasText("一键开机并运行") || !idleTester.HasText("解除等待") {
-		t.Fatalf("missing standby bento or cooldown clear controls: %q", idleTester.Texts())
+	if !idleTester.HasText("解除等待") {
+		t.Fatalf("missing cooldown clear button: %q", idleTester.Texts())
 	}
 	if err := idleTester.Click("解除等待"); err != nil {
 		t.Fatalf("click 解除等待 failed: %v", err)
@@ -305,11 +324,28 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if acc, _ := idleSvc.SelectedAccount(); acc.H3Variant != core.H3VariantOriginal {
 		t.Fatalf("expected H3 original variant, got %q", acc.H3Variant)
 	}
-	if err := idleTester.Click("调整显卡与选项"); err != nil {
+	if err := idleTester.Click("调整策略与进阶选项"); err != nil {
 		t.Fatalf("click open overlay options failed: %v", err)
 	}
-	if !idleTester.HasText("智能挑卡") || !idleTester.HasText("省点模式") || !idleTester.HasText("高级自定义") {
-		t.Fatalf("missing simplified 3-mode GPU picker in overlay: %q", idleTester.Texts())
+	for _, want := range []string{
+		"任务玩法", "其他进阶玩法：", "自定义 HF / 网盘模型", "通用 ComfyUI", "纯开机",
+		"智能挑卡", "省点模式", "高级自定义", "成片自动存进 Google Drive",
+	} {
+		if !idleTester.HasText(want) {
+			t.Fatalf("missing %q in simplified options overlay: %q", want, idleTester.Texts())
+		}
+	}
+	for _, unwanted := range []string{
+		"跑完自动关机省点（全应用统一设置）",
+		"同时生成 cloudflared 跨设备临时链接（可选）",
+		"开启 sol-attn 稀疏加速（推荐）",
+		"去 Drive 看成片",
+		"装好后自动通过本机加密通道打开 ComfyUI（推荐）",
+		"首次下载完 21.5GB 底座后，顺手存一份回 Drive",
+	} {
+		if idleTester.HasText(unwanted) {
+			t.Fatalf("unexpected removed option %q in overlay: %q", unwanted, idleTester.Texts())
+		}
 	}
 	if err := idleTester.Click("省点模式"); err != nil {
 		t.Fatalf("click 省点模式 failed: %v", err)
@@ -322,6 +358,12 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	}
 	if acc, _ := idleSvc.SelectedAccount(); acc.GPUStrategy != core.GPUStrategyCustom {
 		t.Fatalf("expected Custom GPU strategy, got %q", acc.GPUStrategy)
+	}
+	if idleTester.HasText("目标显卡缺货时自动排队重试") {
+		t.Fatalf("removed EnablePoliteQueue toggle should not appear in custom GPU strategy: %q", idleTester.Texts())
+	}
+	if !idleTester.HasText("定时预约适合明天低峰自动开，持续守候适合现在挂着等卡（错过超 10 分钟自动过期不误启）") {
+		t.Fatalf("missing mutual-exclusion hint next to scheduled start: %q", idleTester.Texts())
 	}
 	if err := idleTester.Click("智能挑卡"); err != nil {
 		t.Fatalf("click 智能挑卡 failed: %v", err)
@@ -364,14 +406,25 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("missing 31B shortage fallback recovery actions: %q", shortTester.Texts())
 	}
 
-	// 2. Running Live Bento Console + 4-tab navigation (主页 / 记录 / 账号 / 设置)
+	// 2. Running Live 3x2 Bento Console + Multi-Account Table + Confirm-Stop Modal + 4-tab navigation
 	svc := makeDemoService(app.SectionHome, false, false)
 	mui := uiapp.NewMainUI(svc)
 	mui.ForceTheme = "dark"
 	tt := ui.NewTester(mui.View, 1160, 760)
 
-	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → A100") || !tt.HasText("2轮保底 L4") || !tt.HasText("开 ComfyUI") {
-		t.Fatalf("missing primary live dashboard text: %q", tt.Texts())
+	for _, want := range []string{
+		"2374.8", "Personal", "G4 → A100", "2轮保底 L4", "开 ComfyUI",
+		"CU 余额与速率", "实时负载", "当前任务", "空闲自动关机", "挑卡与守候",
+		"调整策略与进阶选项", "点此关机", "账单 ›", "账号与活跃会话 (3)",
+	} {
+		if !tt.HasText(want) {
+			t.Fatalf("missing %q on running 3x2 dashboard: %q", want, tt.Texts())
+		}
+	}
+	for _, unwanted := range []string{"算力续航", "本机通道", "更多玩法"} {
+		if tt.HasText(unwanted) {
+			t.Fatalf("unexpected removed element %q on running dashboard: %q", unwanted, tt.Texts())
+		}
 	}
 	if err := tt.Click("40m"); err != nil {
 		t.Fatalf("click 40m failed: %v", err)
@@ -379,6 +432,22 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 40 || acc.QueueDrainMinutes != 40 {
 		t.Fatalf("expected 40m after click, got idle=%d drain=%d", acc.IdleTimeoutMinutes, acc.QueueDrainMinutes)
 	}
+	if err := tt.Click("点此关机"); err != nil {
+		t.Fatalf("click 点此关机 failed: %v", err)
+	}
+	if p := svc.CurrentActionPrompt(); p == nil || p.Kind != core.PromptConfirmStop {
+		t.Fatalf("expected PromptConfirmStop modal after clicking 点此关机, got %+v", p)
+	}
+	if !tt.HasText("确认关机止损") || !tt.HasText("继续运行") {
+		t.Fatalf("missing confirm-stop modal buttons: %q", tt.Texts())
+	}
+	if err := tt.Click("继续运行"); err != nil {
+		t.Fatalf("click 继续运行 failed: %v", err)
+	}
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatalf("expected PromptConfirmStop dismissed after clicking 继续运行")
+	}
+
 	if err := tt.Click("记录"); err != nil {
 		t.Fatalf("click tab 记录 failed: %v", err)
 	}
@@ -392,10 +461,50 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 			t.Fatalf("click history filter %q failed: %v", filterBtn, err)
 		}
 	}
-	for _, tab := range []string{"账号", "设置", "主页"} {
-		if err := tt.Click(tab); err != nil {
-			t.Fatalf("click tab %s failed: %v", tab, err)
+	if err := tt.Click("账号"); err != nil {
+		t.Fatalf("click tab 账号 failed: %v", err)
+	}
+	if tt.HasText("导入终端已登账号") {
+		t.Fatalf("导入终端已登账号 must be collapsed inside + 绑定新账号 panel initially: %q", tt.Texts())
+	}
+	if err := tt.Click("+ 绑定新账号"); err != nil {
+		t.Fatalf("click + 绑定新账号 failed: %v", err)
+	}
+	if !tt.HasText("导入终端已登账号") {
+		t.Fatalf("expected 导入终端已登账号 inside expanded + 绑定新账号 panel: %q", tt.Texts())
+	}
+
+	if err := tt.Click("设置"); err != nil {
+		t.Fatalf("click tab 设置 failed: %v", err)
+	}
+	if err := tt.Click("展开高级参数 ▾"); err != nil {
+		t.Fatalf("click 展开高级参数 ▾ failed: %v", err)
+	}
+	if !tt.HasText("Drive 成片目录") {
+		t.Fatalf("expected Drive 成片目录 in settings advanced section: %q", tt.Texts())
+	}
+	for _, unwanted := range []string{
+		"解除冷静等待 / 清空报错",
+		"非 LLM 场景开启 GPU(<5%) + CPU(<25%) 双低载兜底关机（下载/转码防误杀）",
+	} {
+		if tt.HasText(unwanted) {
+			t.Fatalf("unexpected removed settings control %q: %q", unwanted, tt.Texts())
 		}
+	}
+	if !tt.HasText("远端端口") || !tt.HasText("本地通道端口") {
+		t.Fatalf("expected port inputs when DriveScriptPath is non-empty: %q", tt.Texts())
+	}
+	if acc, ok := svc.SelectedAccount(); ok {
+		acc.DriveScriptPath = ""
+		svc.UpdateAccount(acc)
+		tt.Frame()
+	}
+	if tt.HasText("远端端口") || tt.HasText("本地通道端口") {
+		t.Fatalf("port inputs must hide when DriveScriptPath is empty: %q", tt.Texts())
+	}
+
+	if err := tt.Click("主页"); err != nil {
+		t.Fatalf("click tab 主页 failed: %v", err)
 	}
 
 	// 3. Onboarding wizard renders cleanly
@@ -407,12 +516,43 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("missing onboarding elements: %q", obTester.Texts())
 	}
 
-	// 4. Popover companion HUD renders cleanly
+	// 4. Popover companion HUD renders cleanly (idle hides 0% cards; running shows 续命 only when AutoShutdownEnabled; zero SSH/Browser/大屏)
+	idlePop := uiapp.NewPopoverUI(cleanIdleSvc)
+	idlePop.ForceTheme = "dark"
+	idlePopTester := ui.NewTester(idlePop.View, 420, 560)
+	for _, want := range []string{"Colab Tools", "已关机 · 0.00 CU/h", "一键开机", "主控制台", "记录", "设置", "退出"} {
+		if !idlePopTester.HasText(want) {
+			t.Fatalf("missing %q on idle popover: %q", want, idlePopTester.Texts())
+		}
+	}
+	for _, unwanted := range []string{"SSH 隧道", "断隧道", "浏览器", "大屏", "显存", "GPU", "续命"} {
+		if idlePopTester.HasText(unwanted) {
+			t.Fatalf("unexpected element %q on idle popover: %q", unwanted, idlePopTester.Texts())
+		}
+	}
+
 	pop := uiapp.NewPopoverUI(svc)
 	pop.ForceTheme = "dark"
 	popTester := ui.NewTester(pop.View, 420, 620)
-	if !popTester.HasText("Colab Tools") || !popTester.HasText("2374.8") || !popTester.HasText("记录") {
-		t.Fatalf("missing popover elements: %q", popTester.Texts())
+	for _, want := range []string{"Colab Tools", "2374.8", "⏻ 关机止损", "显存", "GPU", "续命", "记录"} {
+		if !popTester.HasText(want) {
+			t.Fatalf("missing %q on running popover: %q", want, popTester.Texts())
+		}
+	}
+	for _, unwanted := range []string{"SSH 隧道", "断隧道", "浏览器", "大屏"} {
+		if popTester.HasText(unwanted) {
+			t.Fatalf("unexpected removed button %q on running popover: %q", unwanted, popTester.Texts())
+		}
+	}
+	popNoAutoSvc := makeDemoService(app.SectionHome, false, false)
+	popNoAutoAcc := popNoAutoSvc.Settings.Accounts[0]
+	popNoAutoAcc.AutoShutdownEnabled = false
+	popNoAutoSvc.UpdateAccount(popNoAutoAcc)
+	popNoAuto := uiapp.NewPopoverUI(popNoAutoSvc)
+	popNoAuto.ForceTheme = "dark"
+	popNoAutoTester := ui.NewTester(popNoAuto.View, 420, 620)
+	if popNoAutoTester.HasText("续命") {
+		t.Fatalf("续命 must be hidden when AutoShutdownEnabled=false: %q", popNoAutoTester.Texts())
 	}
 
 	// 5. Bare running L4 machine with H3 Original (31B): must show truthful "未部署", VRAM mismatch alert, "立即部署" & deploy log overlay — NEVER fake "启动中"
@@ -457,7 +597,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("missing deploy log overlay content: %q", logTester.Texts())
 	}
 
-	// 6. Persistent queue toggle in options drawer, ComfyOpening disabled feedback, and persistent queuing labels (never 7/5)
+	// 6. Persistent queue toggle in options drawer (single 8h toggle, zero 4h/12h buttons), ComfyOpening disabled feedback, and persistent queuing labels (never 7/5)
 	pqSvc := makeDemoService(app.SectionHome, false, true)
 	pqAcc := pqSvc.Settings.Accounts[0]
 	pqAcc.AutoShutdownEnabled = false
@@ -465,33 +605,29 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	pqUI := uiapp.NewMainUI(pqSvc)
 	pqUI.ForceTheme = "dark"
 	pqTester := ui.NewTester(pqUI.View, 1160, 760)
-	if err := pqTester.Click("调整显卡与选项"); err != nil {
-		t.Fatalf("click 调整显卡与选项 failed: %v", err)
+	if err := pqTester.Click("调整策略与进阶选项"); err != nil {
+		t.Fatalf("click 调整策略与进阶选项 failed: %v", err)
 	}
-	if !pqTester.HasText("抢不到就持续守候（低频挂机，直到抢到为止）") {
+	if !pqTester.HasText("抢不到就持续守候（低频挂机，最长 8 小时）") {
 		t.Fatalf("missing persistent queue switch in options drawer: %q", pqTester.Texts())
 	}
-	if err := pqTester.Click("抢不到就持续守候（低频挂机，直到抢到为止）"); err != nil {
+	if err := pqTester.Click("抢不到就持续守候（低频挂机，最长 8 小时）"); err != nil {
 		t.Fatalf("click persistent queue switch failed: %v", err)
 	}
 	if gotAcc, _ := pqSvc.SelectedAccount(); !gotAcc.QueuePersistentMode || !gotAcc.AutoShutdownEnabled || gotAcc.QueuePersistentMaxHours != 8 {
 		t.Fatalf("expected persistent mode + auto-shutdown + default 8h enabled, got persistent=%v autoShutdown=%v maxH=%d",
 			gotAcc.QueuePersistentMode, gotAcc.AutoShutdownEnabled, gotAcc.QueuePersistentMaxHours)
 	}
-	if !pqTester.HasText("4 小时") || !pqTester.HasText("8 小时（推荐）") || !pqTester.HasText("12 小时") {
-		t.Fatalf("missing persistent max-hours pills: %q", pqTester.Texts())
-	}
-	if err := pqTester.Click("12 小时"); err != nil {
-		t.Fatalf("click 12 小时 failed: %v", err)
-	}
-	if gotAcc, _ := pqSvc.SelectedAccount(); gotAcc.QueuePersistentMaxHours != 12 {
-		t.Fatalf("expected QueuePersistentMaxHours=12, got %d", gotAcc.QueuePersistentMaxHours)
+	for _, unwanted := range []string{"4 小时", "8 小时（推荐）", "12 小时"} {
+		if pqTester.HasText(unwanted) {
+			t.Fatalf("unexpected redundant persistent duration button %q: %q", unwanted, pqTester.Texts())
+		}
 	}
 	if err := pqTester.Click("完成"); err != nil {
 		t.Fatalf("click 完成 failed: %v", err)
 	}
-	if !pqTester.HasText("守候 12h") {
-		t.Fatalf("expected 守候 12h badge on strategy card: %q", pqTester.Texts())
+	if !pqTester.HasText("守候 8h") {
+		t.Fatalf("expected 守候 8h badge on strategy card: %q", pqTester.Texts())
 	}
 
 	// Standard queue banner quick switch to persistent queue
@@ -825,5 +961,28 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		runHeroQA.PreviewMode = true
 		runHeroQA.ForceTheme = "dark"
 		renderPNG(t, runHeroQA.View, 1160, 860, filepath.Join(qaDir, "qa-power-strip-running-dark.png"))
+
+		// v0.3.16 key QA screenshots
+		v0316OffUI := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, true))
+		v0316OffUI.PreviewMode = true
+		v0316OffUI.ForceTheme = "dark"
+		renderPNG(t, v0316OffUI.View, 1160, 760, filepath.Join(qaDir, "qa-v0316-offline-dark.png"))
+
+		v0316RunSvc := makeDemoService(app.SectionHome, false, false)
+		v0316RunUI := uiapp.NewMainUI(v0316RunSvc)
+		v0316RunUI.PreviewMode = true
+		v0316RunUI.ForceTheme = "dark"
+		renderPNG(t, v0316RunUI.View, 1160, 760, filepath.Join(qaDir, "qa-v0316-running-dark.png"))
+
+		v0316ConfirmSvc := makeDemoService(app.SectionHome, false, false)
+		v0316ConfirmSvc.RequestConfirmStop(v0316ConfirmSvc.Settings.SelectedAccountID)
+		v0316ConfirmUI := uiapp.NewMainUI(v0316ConfirmSvc)
+		v0316ConfirmUI.PreviewMode = true
+		v0316ConfirmUI.ForceTheme = "dark"
+		renderPNG(t, v0316ConfirmUI.View, 1160, 760, filepath.Join(qaDir, "qa-v0316-confirm-stop.png"))
+
+		v0316IdlePop := uiapp.NewPopoverUI(makeDemoService(app.SectionHome, false, true))
+		v0316IdlePop.ForceTheme = "dark"
+		renderPNG(t, v0316IdlePop.View, 420, 520, filepath.Join(qaDir, "qa-v0316-popover-idle.png"))
 	}
 }

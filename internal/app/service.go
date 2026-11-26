@@ -25,7 +25,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.15"
+const AppVersion = "0.3.16"
 
 // tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
 type tunnelStderrBuffer struct {
@@ -625,8 +625,24 @@ func (s *Service) SelectAccount(accountID string) {
 
 func (s *Service) UpdateAccount(updated core.AccountProfile) {
 	updated.Sanitize()
-	if updated.QueuePersistentMode && !updated.AutoShutdownEnabled {
-		updated.AutoShutdownEnabled = true
+	// 系统托管以下底层技术参数为最优默认，避免冗余配置与用户误关
+	updated.AutoOpenComfyUI = true
+	updated.EnablePoliteQueue = true
+	updated.EnableHardwareIdle = true
+	updated.H3EnableSolAttn = true
+	if updated.UseGoogleDrive {
+		updated.CacheBaseToDrive = true
+	}
+	if updated.QueuePersistentMode {
+		updated.QueuePersistentMaxHours = core.QueuePersistentDefaultHours
+		if !updated.AutoShutdownEnabled {
+			updated.AutoShutdownEnabled = true
+		}
+	}
+	// 统一空闲关机单一字段，防止旧配置中 IdleTimeoutMinutes 与 QueueDrainMinutes 打架
+	updated.QueueDrainMinutes = updated.IdleTimeoutMinutes
+	if !updated.EnableLLMModule && updated.DeployRecipe.IsVideoComfy() {
+		updated.StopAfterQueueDrained = true
 	}
 	s.mu.Lock()
 	for i := range s.Settings.Accounts {
@@ -2417,11 +2433,38 @@ func (s *Service) ResolveActionPrompt(action string) {
 				go s.launchVideoDeployFlow(acc)
 			}
 		}
+	case core.PromptConfirmStop:
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if action == "primary" && promptCopy.AccountID != "" {
+			go s.StopAccountSession(promptCopy.AccountID, "", "")
+		}
 	default:
 		s.actionPrompt = nil
 		s.mu.Unlock()
 		s.notifyUI()
 	}
+}
+
+// RequestConfirmStop 弹出防误触二次确认弹窗，仅在目标账号处于运行态时触发。
+func (s *Service) RequestConfirmStop(accountID string) {
+	if _, ok := s.accountByID(accountID); !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		return
+	}
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:           uuid.New().String(),
+		Kind:         core.PromptConfirmStop,
+		AccountID:    accountID,
+		Title:        fmt.Sprintf("确认关闭当前 %s 云端机器？", rt.ShortGPUName()),
+		Message:      fmt.Sprintf("本次已运行 %s（当前约 %.2f CU/h）。确认关机后会立即释放云端显卡并停止计费。", core.FormatStopwatch(rt.SessionUptimeSec), rt.CURatePerHour),
+		PrimaryLabel: "确认关机止损",
+		CancelLabel:  "继续运行",
+	})
 }
 
 func (s *Service) ClearAccountError(accountID string) {
@@ -2561,6 +2604,7 @@ func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) 
 	if !ok {
 		return
 	}
+	prevLLM := acc.EnableLLMModule
 	acc.DeployRecipe = recipe
 	switch recipe {
 	case core.RecipeH3Video, core.RecipeComfyUIGeneral:
@@ -2568,12 +2612,11 @@ func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) 
 		acc.EnableLLMModule = false
 		acc.RemoteServicePort = 8188
 		acc.LocalSSHTunnelPort = 8188
-		if acc.QueueDrainMinutes < 5 {
-			acc.QueueDrainMinutes = 10
+		if prevLLM && acc.IdleTimeoutMinutes == 40 {
+			acc.IdleTimeoutMinutes = 10
 		}
-		if acc.IdleTimeoutMinutes == 40 {
-			acc.IdleTimeoutMinutes = acc.QueueDrainMinutes
-		}
+		acc.StopAfterQueueDrained = true
+		acc.QueueDrainMinutes = acc.IdleTimeoutMinutes
 	case core.RecipeLLMProxy:
 		acc.WorkloadKind = core.WorkloadLLM
 		acc.EnableLLMModule = true
@@ -2582,6 +2625,7 @@ func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) 
 		if acc.IdleTimeoutMinutes <= 15 {
 			acc.IdleTimeoutMinutes = 40
 		}
+		acc.QueueDrainMinutes = acc.IdleTimeoutMinutes
 	default:
 		acc.WorkloadKind = core.WorkloadGeneral
 		acc.EnableLLMModule = false
@@ -3527,16 +3571,120 @@ func (s *Service) OpenColabInBrowser(accountID string) {
 }
 
 func (s *Service) OpenWorkloadWebUI(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
 	rt := s.StateFor(accountID)
-	if rt.DisplayUIURL != "" && s.URLOpener != nil {
-		s.URLOpener(rt.DisplayUIURL)
+	if rt.DisplayUIURL != "" {
+		if s.URLOpener != nil {
+			s.URLOpener(rt.DisplayUIURL)
+		}
 		return
 	}
-	if rt.ActiveSSHTunnelPort != nil && s.URLOpener != nil {
-		s.URLOpener(fmt.Sprintf("http://127.0.0.1:%d", *rt.ActiveSSHTunnelPort))
+	if rt.ActiveSSHTunnelPort != nil && rt.SSHTunnelActive {
+		port := *rt.ActiveSSHTunnelPort
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		if conn, err := net.DialTimeout("tcp", addr, 350*time.Millisecond); err == nil {
+			_ = conn.Close()
+			if s.URLOpener != nil {
+				s.URLOpener("http://" + addr)
+			}
+			return
+		}
+		s.StopSSHTunnel(accountID)
+	} else if rt.ActiveSSHTunnelPort != nil {
+		if s.URLOpener != nil {
+			s.URLOpener(fmt.Sprintf("http://127.0.0.1:%d", *rt.ActiveSSHTunnelPort))
+		}
 		return
 	}
-	s.ShowToast("请先建立 SSH 隧道或等待远端 WebUI 报告地址")
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("请先开机后再打开 WebUI")
+		return
+	}
+	if acc.DeployRecipe.IsVideoComfy() && !acc.EnableLLMModule {
+		go s.OpenComfyUI(accountID)
+		return
+	}
+	if acc.EnableLLMModule {
+		s.ShowToast("大模型代理模式请直接使用「同步工具」或「Claude 终端」")
+		return
+	}
+	if rt.IsFreeRuntimeRestricted(acc) {
+		s.ShowToast("免费版不支持本机加密通道，请等待远端 WebUI 报告公网地址")
+		return
+	}
+
+	s.mu.Lock()
+	cur := s.Runtime[accountID]
+	if cur.ComfyOpening {
+		s.mu.Unlock()
+		s.ShowToast("正在为你建立本机加密通道，请稍等几秒…")
+		return
+	}
+	cur.ComfyOpening = true
+	s.Runtime[accountID] = cur
+	waitTimeout := s.comfyTunnelWaitTimeout
+	s.mu.Unlock()
+	s.notifyUI()
+	if waitTimeout <= 0 {
+		waitTimeout = 22 * time.Second
+	}
+
+	s.ShowToast("正在自动建立本机加密通道并打开 WebUI…")
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			if st, exists := s.Runtime[accountID]; exists {
+				st.ComfyOpening = false
+				s.Runtime[accountID] = st
+			}
+			s.mu.Unlock()
+			s.notifyUI()
+		}()
+
+		port, errBuf, startErr := s.startSSHTunnelInternal(accountID)
+		if startErr != nil {
+			s.ShowToast("WebUI 本机通道启动失败：" + startErr.Error())
+			return
+		}
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		deadline := time.Now().Add(waitTimeout)
+		for time.Now().Before(deadline) {
+			select {
+			case <-s.stopLoops:
+				return
+			default:
+			}
+			s.mu.RLock()
+			_, stillAlive := s.sshTunnels[accountID]
+			s.mu.RUnlock()
+			if !stillAlive {
+				break
+			}
+			if conn, dialErr := net.DialTimeout("tcp", addr, 350*time.Millisecond); dialErr == nil {
+				_ = conn.Close()
+				if s.URLOpener != nil {
+					s.URLOpener("http://" + addr)
+				}
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+
+		errText := ""
+		if errBuf != nil {
+			errText = errBuf.String()
+		}
+		cleanupStaleColabSSH(acc.SessionName)
+		s.StopSSHTunnel(accountID)
+		if strings.Contains(strings.ToLower(errText), "already-active ssh session") || strings.Contains(errText, "429") {
+			s.ShowToast("检测到旧 SSH 连接占坑，已清理旧连接，请稍等十几秒后再点一次「打开 WebUI」")
+		} else {
+			s.ShowToast("WebUI 本机通道暂未连通，请确认云端服务已在对应端口启动")
+		}
+	}()
 }
 
 func (s *Service) OpenColabPayPage() {

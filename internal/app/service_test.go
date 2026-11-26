@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -678,7 +680,9 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 	accDirect.GPUStrategy = core.GPUStrategyCustom
 	accDirect.EnablePoliteQueue = false
 	accDirect.QueueTargets = []core.AcceleratorOption{core.AccG4}
-	svc.UpdateAccount(accDirect)
+	svc.mu.Lock()
+	svc.Settings.Accounts[0] = accDirect
+	svc.mu.Unlock()
 
 	frShortage := &fakeRunner{}
 	frShortage.onShell = func(cmd string) runner.Result {
@@ -1122,5 +1126,272 @@ exit 0
 	svcComfy.ResolveActionPrompt("cancel")
 	if svcComfy.CurrentActionPrompt() != nil {
 		t.Fatal("cancel must dismiss PromptComfyHelp")
+	}
+}
+
+func TestRequestConfirmStopAndResolveLifecycle(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	acc := core.NewDefaultAccountProfile("ConfirmStop", "cs@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
+
+	serverAlive := true
+	stopCalls := 0
+	var mu sync.Mutex
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		switch {
+		case strings.Contains(cmd, "rm") || strings.Contains(cmd, "stop"):
+			mu.Lock()
+			stopCalls++
+			serverAlive = false
+			mu.Unlock()
+			return runner.Result{ExitCode: 0}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 800.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		case strings.Contains(cmd, "sessions"):
+			mu.Lock()
+			alive := serverAlive
+			mu.Unlock()
+			if alive {
+				return runner.Result{ExitCode: 0, Stdout: "[" + acc.SessionName + "] m-s-stop1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	// 1. Offline / non-running phase must NOT open PromptConfirmStop
+	svc.RequestConfirmStop(acc.ID)
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatal("RequestConfirmStop must be ignored when account is not running")
+	}
+
+	// 2. Running phase opens PromptConfirmStop with expected GPU / duration / rate details
+	svc.mu.Lock()
+	rt := svc.Runtime[acc.ID]
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "m-s-stop1"
+	rt.ActiveHardware = "A100"
+	rt.GPUName = "NVIDIA A100"
+	rt.SessionUptimeSec = 3661 // 01:01:01
+	rt.CURatePerHour = 12.0
+	svc.Runtime[acc.ID] = rt
+	svc.mu.Unlock()
+
+	svc.RequestConfirmStop(acc.ID)
+	prompt := svc.CurrentActionPrompt()
+	if prompt == nil || prompt.Kind != core.PromptConfirmStop {
+		t.Fatalf("expected PromptConfirmStop, got %+v", prompt)
+	}
+	if !strings.Contains(prompt.Title, "A100") ||
+		!strings.Contains(prompt.Message, "01:01:01") ||
+		!strings.Contains(prompt.Message, "12.00 CU/h") ||
+		prompt.PrimaryLabel != "确认关机止损" ||
+		prompt.CancelLabel != "继续运行" {
+		t.Fatalf("unexpected PromptConfirmStop payload: %+v", prompt)
+	}
+
+	// 3. Cancel closes prompt without triggering stop
+	svc.ResolveActionPrompt("cancel")
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatal("cancel must dismiss PromptConfirmStop")
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	callsAfterCancel := stopCalls
+	mu.Unlock()
+	if callsAfterCancel != 0 || !svc.StateFor(acc.ID).Phase.IsRunning() {
+		t.Fatalf("cancel must not stop session, stopCalls=%d phase=%+v", callsAfterCancel, svc.StateFor(acc.ID).Phase)
+	}
+
+	// 4. Primary closes prompt and triggers StopAccountSession with verification to PhaseOffline
+	svc.RequestConfirmStop(acc.ID)
+	if svc.CurrentActionPrompt() == nil {
+		t.Fatal("expected PromptConfirmStop before primary confirm")
+	}
+	svc.ResolveActionPrompt("primary")
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatal("primary must dismiss PromptConfirmStop immediately")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.StateFor(acc.ID).Phase.Kind == core.PhaseOffline {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if got := svc.StateFor(acc.ID); got.Phase.Kind != core.PhaseOffline {
+		t.Fatalf("expected PhaseOffline after primary confirm stop, got %+v", got.Phase)
+	}
+	mu.Lock()
+	callsAfterPrimary := stopCalls
+	mu.Unlock()
+	if callsAfterPrimary == 0 {
+		t.Fatal("expected StopAccountSession to execute CLI stop command")
+	}
+}
+
+func TestUpdateAccountNormalizesManagedOptionsAndSyncsIdle(t *testing.T) {
+	svc := NewService(true)
+	acc := core.NewDefaultAccountProfile("Normalize", "norm@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+
+	// Simulate legacy/manual disables across all managed options and mismatched idle timers
+	dirty := acc
+	dirty.DeployRecipe = core.RecipeH3Video
+	dirty.EnableLLMModule = false
+	dirty.AutoOpenComfyUI = false
+	dirty.EnablePoliteQueue = false
+	dirty.EnableHardwareIdle = false
+	dirty.H3EnableSolAttn = false
+	dirty.UseGoogleDrive = true
+	dirty.CacheBaseToDrive = false
+	dirty.QueuePersistentMode = true
+	dirty.QueuePersistentMaxHours = 12
+	dirty.AutoShutdownEnabled = false
+	dirty.IdleTimeoutMinutes = 15
+	dirty.QueueDrainMinutes = 40
+	dirty.StopAfterQueueDrained = false
+
+	svc.UpdateAccount(dirty)
+	got, ok := svc.accountByID(acc.ID)
+	if !ok {
+		t.Fatal("expected account to exist after UpdateAccount")
+	}
+	if !got.AutoOpenComfyUI || !got.EnablePoliteQueue || !got.EnableHardwareIdle || !got.H3EnableSolAttn || !got.CacheBaseToDrive {
+		t.Fatalf("expected all managed technical options normalized to true, got %+v", got)
+	}
+	if got.QueuePersistentMaxHours != 8 || !got.AutoShutdownEnabled {
+		t.Fatalf("expected persistent mode normalized to maxHours=8 and AutoShutdownEnabled=true, got maxHours=%d autoShut=%v", got.QueuePersistentMaxHours, got.AutoShutdownEnabled)
+	}
+	if got.IdleTimeoutMinutes != 15 || got.QueueDrainMinutes != 15 || !got.StopAfterQueueDrained {
+		t.Fatalf("expected unified idle sync (15/15/true), got idle=%d drain=%d stopDrain=%v", got.IdleTimeoutMinutes, got.QueueDrainMinutes, got.StopAfterQueueDrained)
+	}
+	rtBusy := core.NewAccountRuntimeState()
+	rtBusy.SawQueueBusyThisRun = true
+	if eff := core.EffectiveIdleTimeoutMinutes(got, rtBusy); eff != 15 {
+		t.Fatalf("expected EffectiveIdleTimeoutMinutes=15 after sync, got %d", eff)
+	}
+
+	// Without UseGoogleDrive, CacheBaseToDrive should not be forced true
+	noDrive := got
+	noDrive.UseGoogleDrive = false
+	noDrive.CacheBaseToDrive = false
+	noDrive.IdleTimeoutMinutes = 40
+	svc.UpdateAccount(noDrive)
+	got2, _ := svc.accountByID(acc.ID)
+	if got2.CacheBaseToDrive {
+		t.Fatal("CacheBaseToDrive must stay false when UseGoogleDrive is false")
+	}
+	if got2.QueueDrainMinutes != 40 {
+		t.Fatalf("expected QueueDrainMinutes synced to 40, got %d", got2.QueueDrainMinutes)
+	}
+}
+
+func TestOpenWorkloadWebUIAutoSSHTunnel(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+	svc.comfyTunnelWaitTimeout = 2 * time.Second
+
+	acc := core.NewDefaultAccountProfile("WebUIUser", "webui@example.com", core.TierColabPro, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeNone
+	acc.WorkloadKind = core.WorkloadGeneral
+	acc.EnableLLMModule = false
+	acc.RemoteServicePort = 8888
+	acc.Sanitize()
+
+	// Reserve a local free port for test, close it right before startSSHTunnelInternal picks it, then listen inside sshStarter
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	acc.LocalSSHTunnelPort = targetPort
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-webui-1"
+	rt.CUBalance = 100
+	svc.Runtime[acc.ID] = rt
+
+	var lnMu sync.Mutex
+	var mockTunnelLn net.Listener
+	defer func() {
+		lnMu.Lock()
+		if mockTunnelLn != nil {
+			_ = mockTunnelLn.Close()
+		}
+		lnMu.Unlock()
+	}()
+
+	svc.sshStarter = func(_ *runner.OSRunner, _ core.AccountProfile, localPort, _ int, _ string) (*exec.Cmd, *tunnelStderrBuffer, error) {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+		if err != nil {
+			return nil, nil, err
+		}
+		lnMu.Lock()
+		mockTunnelLn = ln
+		lnMu.Unlock()
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = c.Close()
+			}
+		}()
+		cmd := exec.Command("sh", "-c", "sleep 5")
+		if err := cmd.Start(); err != nil {
+			return nil, nil, err
+		}
+		return cmd, &tunnelStderrBuffer{}, nil
+	}
+
+	var openedMu sync.Mutex
+	var openedURLs []string
+	svc.URLOpener = func(u string) {
+		openedMu.Lock()
+		openedURLs = append(openedURLs, u)
+		openedMu.Unlock()
+	}
+
+	svc.OpenWorkloadWebUI(acc.ID)
+
+	wantURL := fmt.Sprintf("http://127.0.0.1:%d", targetPort)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		openedMu.Lock()
+		gotLen := len(openedURLs)
+		openedMu.Unlock()
+		if gotLen > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	openedMu.Lock()
+	var gotURL string
+	if len(openedURLs) > 0 {
+		gotURL = openedURLs[0]
+	}
+	openedMu.Unlock()
+	if gotURL != wantURL {
+		t.Fatalf("expected OpenWorkloadWebUI to auto-tunnel and open %q, got %v", wantURL, openedURLs)
+	}
+	if !svc.StateFor(acc.ID).SSHTunnelActive {
+		t.Fatal("expected SSHTunnelActive=true after auto-tunnel")
 	}
 }

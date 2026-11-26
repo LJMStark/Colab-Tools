@@ -130,18 +130,8 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 			ui.Text(c, pill).FontSize(11).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
 		})
 		ui.Spacer(c)
-		SmallActionButton(c, pal, "大屏", nil, false, func() {
-			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionStatus)
-			}
-		})
 		popoverIconButton(c, pal, "refresh", func() {
 			go p.Svc.RefreshAllAccounts(true, false)
-		})
-		popoverIconButton(c, pal, "settings", func() {
-			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionSettings)
-			}
 		})
 	})
 }
@@ -322,7 +312,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 				p.Svc.CancelQueue(acc.ID)
 			})
 		} else {
-			popoverLaunchButton(c, pal, "启动", !p.Svc.CLIInstalled, func() {
+			popoverLaunchButton(c, pal, "一键开机", !p.Svc.CLIInstalled, func() {
 				p.Svc.DeployNow(acc.ID)
 			})
 		}
@@ -339,50 +329,79 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		})
 	}
 
-	// 2x2 Compact HUD Cards
-	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
-		BentoCard(c, pal, 126, func() {
-			pct := int(math.Round(rt.VRAMRatio() * 100))
-			TileHeader(c, pal, pal.Emerald, "显存", fmt.Sprintf("%d%%", pct), nil)
-			DrawVRAMSegments(c, pal, rt.VRAMRatio(), pal.Amber, 22)
-			ui.Spacer(c)
-			ui.Textf(c, "%.1f / %.1f GB", float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0).FontSize(11.5).FontFeatures("tnum").TextColor(pal.TextMuted)
-		})
-		BentoCard(c, pal, 126, func() {
-			TileHeader(c, pal, pal.Amber, "GPU", rt.ShortGPUName(), nil)
-			DrawSparkline(c, pal, rt.GPUUtilHistory, pal.Amber, 26)
-			ui.Spacer(c)
-			ui.Textf(c, "%d%% · %.2f/h", rt.GPUUtilPercent, rt.CURatePerHour).FontSize(11.5).FontFeatures("tnum").TextColor(pal.TextMuted)
-		})
-	})
-
-	// Quota + active scheme summary
-	hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
-	energyRatio := 0.0
-	if ok {
-		capHours := float64(max(24, acc.Tier.MaxSessionHours()))
-		energyRatio = math.Min(1.0, math.Max(0.05, hrs/capHours))
+	taskLabel := acc.DeployRecipe.DisplayName()
+	if acc.DeployRecipe == core.RecipeH3Video {
+		taskLabel = acc.H3Variant.DisplayName()
 	}
-	SectionCard(c, pal, "算力续航与方案", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), func() {
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-			ui.Column(c).Grow(1).Gap(2).Children(func() {
-				if ok {
-					ui.Textf(c, "%.0f 小时（按 %s）", hrs, basis).FontSize(15.5).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-				} else {
-					ui.Text(c, acc.Tier.DisplayName()).FontSize(15).Bold().TextColor(pal.TextPrimary)
-				}
-				ui.Text(c, core.EffectiveGPUPlanSummary(acc)).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+
+	if rt.Phase.IsRunning() {
+		// 2-column Live HUD Cards (only when running)
+		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
+			BentoCard(c, pal, 126, func() {
+				pct := int(math.Round(rt.VRAMRatio() * 100))
+				TileHeader(c, pal, pal.Emerald, "显存", fmt.Sprintf("%d%%", pct), nil)
+				DrawVRAMSegments(c, pal, rt.VRAMRatio(), pal.Amber, 22)
+				ui.Spacer(c)
+				ui.Textf(c, "%.1f / %.1f GB", float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0).FontSize(11.5).FontFeatures("tnum").TextColor(pal.TextMuted)
 			})
-			SmallActionButton(c, pal, "换方案 ›", nil, false, func() {
-				if p.OnOpenMain != nil {
-					p.OnOpenMain(app.SectionHome)
-				}
+			BentoCard(c, pal, 126, func() {
+				TileHeader(c, pal, pal.Amber, "GPU", rt.ShortGPUName(), nil)
+				DrawSparkline(c, pal, rt.GPUUtilHistory, pal.Amber, 26)
+				ui.Spacer(c)
+				ui.Textf(c, "%d%% · %.2f/h", rt.GPUUtilPercent, rt.CURatePerHour).FontSize(11.5).FontFeatures("tnum").TextColor(pal.TextMuted)
 			})
 		})
-		drawPopoverAmberEnergyBar(c, pal, energyRatio, !ok)
-	})
 
-	// Idle Watchdog + Quick Actions card
+		// Quota + active scheme summary when running
+		hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
+		energyRatio := 0.0
+		if ok {
+			capHours := float64(max(24, acc.Tier.MaxSessionHours()))
+			energyRatio = math.Min(1.0, math.Max(0.05, hrs/capHours))
+		}
+		SectionCard(c, pal, "算力续航与方案", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					if ok {
+						ui.Textf(c, "%.0f 小时（按 %s）", hrs, basis).FontSize(15.5).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+					} else {
+						ui.Text(c, acc.Tier.DisplayName()).FontSize(15).Bold().TextColor(pal.TextPrimary)
+					}
+					ui.Text(c, fmt.Sprintf("%s · %s", taskLabel, core.EffectiveGPUPlanSummary(acc))).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+				})
+				SmallActionButton(c, pal, "换方案 ›", nil, false, func() {
+					if p.OnOpenMain != nil {
+						p.OnOpenMain(app.SectionHome)
+					}
+				})
+			})
+			drawPopoverAmberEnergyBar(c, pal, energyRatio, !ok)
+		})
+	} else {
+		// Compact standby summary replaces 0% VRAM / 0% GPU empty cards
+		rateSummary := "已关机 · 0.00 CU/h"
+		rateColor := pal.TextMuted
+		if rt.CURatePerHour > 0 {
+			rateSummary = fmt.Sprintf("有其他会话计费 · %.2f CU/h", rt.CURatePerHour)
+			rateColor = pal.Amber
+		}
+		SectionCard(c, pal, "当前状态与方案", acc.Tier.ShortBadge(), func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
+				ui.Column(c).Grow(1).Gap(3).Children(func() {
+					ui.Text(c, rateSummary).FontSize(14.5).Bold().FontFeatures("tnum").TextColor(rateColor)
+					ui.Text(c, fmt.Sprintf("当前任务：%s", taskLabel)).FontSize(12).TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
+					ui.Text(c, fmt.Sprintf("挑卡策略：%s", core.EffectiveGPUPlanSummary(acc))).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+				})
+				SmallActionButton(c, pal, "换方案 ›", nil, false, func() {
+					if p.OnOpenMain != nil {
+						p.OnOpenMain(app.SectionHome)
+					}
+				})
+			})
+		})
+	}
+
+	// Idle Watchdog + Golden Quick Actions card (no SSH tunnel / browser clutter)
 	effMins := core.EffectiveIdleTimeoutMinutes(acc, rt)
 	remMin := max(0, (rt.RemainingIdleSeconds(effMins)+59)/60)
 	guardStatus := "未开启"
@@ -393,7 +412,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 			guardStatus = fmt.Sprintf("%d 分钟自动关机", effMins)
 		}
 	}
-	SectionCard(c, pal, "空闲守护与快捷操作", guardStatus, func() {
+	SectionCard(c, pal, "快捷操作", guardStatus, func() {
 		hasTargets := acc.AutoSyncCCSwitch || acc.AutoSyncOpenCode || acc.AutoSyncCodex
 		allSynced := hasTargets && (!acc.AutoSyncCCSwitch || rt.CCSwitchSynced) && (!acc.AutoSyncOpenCode || rt.OpenCodeSynced) && (!acc.AutoSyncCodex || rt.CodexSynced)
 		isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
@@ -450,21 +469,11 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 						p.Svc.LaunchClaudeTerminal(acc.ID)
 					})
 				}
-			})
-			ui.Row(c).FillWidth().Gap(7).Children(func() {
-				p.popoverQuickBtn(c, pal, "续命", false, !rt.Phase.IsRunning() || !acc.AutoShutdownEnabled, func() {
-					p.Svc.ResetIdleTimer(acc.ID)
-				})
-				sshLbl := "SSH 隧道"
-				if rt.SSHTunnelActive {
-					sshLbl = "断隧道"
+				if rt.Phase.IsRunning() && acc.AutoShutdownEnabled {
+					p.popoverQuickBtn(c, pal, "续命", false, false, func() {
+						p.Svc.ResetIdleTimer(acc.ID)
+					})
 				}
-				p.popoverQuickBtn(c, pal, sshLbl, rt.SSHTunnelActive, (!rt.Phase.IsRunning() && !rt.SSHTunnelActive) || rt.IsFreeRuntimeRestricted(acc), func() {
-					p.Svc.ToggleSSHTunnel(acc.ID)
-				})
-				p.popoverQuickBtn(c, pal, "浏览器", false, !rt.Phase.IsRunning(), func() {
-					p.Svc.OpenColabInBrowser(acc.ID)
-				})
 			})
 		})
 	})

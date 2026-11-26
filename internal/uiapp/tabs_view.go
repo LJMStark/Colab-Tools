@@ -63,19 +63,6 @@ func (m *MainUI) renderSmartStrategyDetails(c *ui.Context, pal Palette, acc core
 }
 
 func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc core.AccountProfile) {
-	enableQueue := acc.EnablePoliteQueue
-	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-		ui.Column(c).Grow(1).Gap(2).Children(func() {
-			ui.Text(c, "目标显卡缺货时自动排队重试").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
-			ui.Text(c, "遇到官方暂无库存 (503) 自动按低频合规节奏等待，不必反复手动点启动").FontSize(11.5).TextColor(pal.TextMuted)
-		})
-		if ui.Switch(c, &enableQueue).Clicked() || enableQueue != acc.EnablePoliteQueue {
-			cp := acc
-			cp.EnablePoliteQueue = enableQueue
-			m.Svc.UpdateAccount(cp)
-		}
-	})
-
 	targets := core.SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 		ui.Text(c, "点击卡片勾选目标显卡，用 ↑ ↓ 调整尝试顺位").FontSize(12).TextColor(pal.TextMuted)
@@ -220,7 +207,7 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
 			ui.Text(c, "清晨错峰定时预约（推荐 06:30–07:30）").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
-			ui.Text(c, "到点自动开始抢卡开机（错过超过 10 分钟自动过期不误启）").FontSize(11.5).TextColor(pal.TextMuted)
+			ui.Text(c, "定时预约适合明天低峰自动开，持续守候适合现在挂着等卡（错过超 10 分钟自动过期不误启）").FontSize(11.5).TextColor(pal.TextMuted)
 		})
 		if ui.Switch(c, &schOn).Clicked() || schOn != acc.ScheduledStartEnabled {
 			cp := acc
@@ -349,9 +336,7 @@ func (m *MainUI) renderPersistentQueueSection(c *ui.Context, pal Palette, acc co
 	applyToggle := func(next bool) {
 		cp := acc
 		cp.QueuePersistentMode = next
-		if cp.QueuePersistentMaxHours <= 0 {
-			cp.QueuePersistentMaxHours = 8
-		}
+		cp.QueuePersistentMaxHours = 8
 		if next && !cp.AutoShutdownEnabled {
 			cp.AutoShutdownEnabled = true
 			if isVideo {
@@ -366,38 +351,13 @@ func (m *MainUI) renderPersistentQueueSection(c *ui.Context, pal Palette, acc co
 		ui.Column(c).Grow(1).Gap(2).Cursor(ui.CursorPointer).OnClick(func() {
 			applyToggle(!acc.QueuePersistentMode)
 		}).Children(func() {
-			ui.Text(c, "抢不到就持续守候（低频挂机，直到抢到为止）").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
+			ui.Text(c, "抢不到就持续守候（低频挂机，最长 8 小时）").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
 			ui.Text(c, "前 3 轮快速试，之后每 8–12 分钟探一次防风控；遇限流立刻停，抢到自动开启闲置关机").FontSize(11.5).TextColor(pal.TextMuted)
 		})
 		if ui.Switch(c, &persistentOn).Clicked() || persistentOn != acc.QueuePersistentMode {
 			applyToggle(persistentOn)
 		}
 	})
-
-	if acc.QueuePersistentMode {
-		curHours := acc.QueuePersistentMaxHours
-		if curHours <= 0 {
-			curHours = 8
-		}
-		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "守候封顶时长：").FontSize(12).TextColor(pal.TextMuted)
-			for _, opt := range []struct {
-				hours int
-				label string
-			}{
-				{4, "4 小时"},
-				{8, "8 小时（推荐）"},
-				{12, "12 小时"},
-			} {
-				hOpt := opt
-				m.compactOverlayChip(c, pal, hOpt.label, curHours == hOpt.hours, func() {
-					cp := acc
-					cp.QueuePersistentMaxHours = hOpt.hours
-					m.Svc.UpdateAccount(cp)
-				})
-			}
-		})
-	}
 }
 
 func (m *MainUI) adjustScheduleMinutes(acc core.AccountProfile, delta int) {
@@ -603,22 +563,23 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 			ui.Text(c, "账号").FontSize(22).Bold().TextColor(pal.TextPrimary)
 			ui.Text(c, "账号凭证加密存在本机系统凭据库（macOS 钥匙串 / Windows 凭据管理器），多账号点数完全隔离。").FontSize(13).TextColor(pal.TextMuted)
 		})
-		ui.Row(c).Gap(8).Children(func() {
-			SmallActionButton(c, pal, "导入终端已登账号", nil, !m.Svc.CLIInstalled || m.Svc.IsImportingDefault, func() {
-				go func() {
-					if !m.Svc.TryImportSystemDefaultAccount() {
-						m.Svc.ShowToast("未检测到终端默认 colab 登录，请点右侧走 Google 官方授权")
-					}
-				}()
-			})
-			PillButton(c, pal, "+ 绑定新账号", true, !m.Svc.CLIInstalled, func() {
-				m.ShowAddAccPanel = !m.ShowAddAccPanel
-			})
+		PillButton(c, pal, "+ 绑定新账号", true, !m.Svc.CLIInstalled, func() {
+			m.ShowAddAccPanel = !m.ShowAddAccPanel
 		})
 	})
 
 	if m.ShowAddAccPanel {
 		SectionCard(c, pal, "通过 Google 官方 OAuth2 绑定新账号", "", func() {
+			ui.Row(c).FillWidth().Padding(8, 12).Radius(9).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).AlignItems(ui.Center).Gap(10).Children(func() {
+				ui.Text(c, "本机终端若已登录过 google-colab-cli，可直接一键导入：").FontSize(12).TextColor(pal.TextMuted).Grow(1)
+				SmallActionButton(c, pal, "导入终端已登账号", nil, !m.Svc.CLIInstalled || m.Svc.IsImportingDefault, func() {
+					go func() {
+						if !m.Svc.TryImportSystemDefaultAccount() {
+							m.Svc.ShowToast("未检测到终端默认 colab 登录，请按下方步骤完成 Google 官方授权")
+						}
+					}()
+				})
+			})
 			m.renderEmbeddedOAuthBinder(c, pal, func() {
 				m.ShowAddAccPanel = false
 			})
@@ -629,7 +590,7 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 	selAcc, _ := m.Svc.SelectedAccount()
 	SectionCard(c, pal, fmt.Sprintf("已绑定账号 (%d)", len(accounts)), "", func() {
 		if len(accounts) == 0 {
-			ui.Text(c, "还没有绑定账号，点上方「+ 绑定新账号」或「导入终端已登账号」即可开始。").FontSize(13).TextColor(pal.TextMuted)
+			ui.Text(c, "还没有绑定账号，点上方「+ 绑定新账号」即可开始（展开后也支持导入终端已登账号）。").FontSize(13).TextColor(pal.TextMuted)
 			return
 		}
 		for idx, acc := range accounts {
@@ -921,19 +882,12 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 
 	// 3. Collapsible Advanced & Troubleshooting (hidden by default so beginners are never overwhelmed)
 	if acc, ok := m.Svc.SelectedAccount(); ok {
-		rt := m.Svc.StateFor(acc.ID)
-		SectionCard(c, pal, "高级选项与一键重置", "平时不用动，折腾自定义脚本或排障时再展开", func() {
+		SectionCard(c, pal, "高级选项与一键重置", "平时不用动，折腾自定义脚本或目录时再展开", func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
 				e := pal.Emerald
 				neutralPrecisionButton(c, pal, &e, "", "恢复小白推荐默认", false, func() {
 					m.Svc.ResetAccountToRecommendedDefaults(acc.ID)
 				})
-				if (rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(time.Now())) || rt.LastError != "" {
-					a := pal.Amber
-					neutralPrecisionButton(c, pal, &a, "", "解除冷静等待 / 清空报错", false, func() {
-						m.Svc.ClearCooldown(acc.ID)
-					})
-				}
 				ui.Spacer(c)
 				advLbl := "展开高级参数 ▾"
 				if m.ShowAdvancedSettings {
@@ -947,12 +901,17 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 			if m.ShowAdvancedSettings {
 				ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
-				hwFallback := acc.EnableHardwareIdle
-				if ui.Checkbox(c, &hwFallback, "非 LLM 场景开启 GPU(<5%) + CPU(<25%) 双低载兜底关机（下载/转码防误杀）").Clicked() || hwFallback != acc.EnableHardwareIdle {
-					cp := acc
-					cp.EnableHardwareIdle = hwFallback
-					m.Svc.UpdateAccount(cp)
-				}
+				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "Drive 成片目录").FontSize(12.5).TextColor(pal.TextMuted).Width(96)
+					ui.TextInput(c, &m.DriveOutputDraft).Placeholder("/content/drive/MyDrive/ColabTools/outputs").Grow(1)
+					SmallActionButton(c, pal, "保存目录", nil, false, func() {
+						cp := acc
+						cp.DriveModelsDir = core.SanitizeDriveSubpath(m.DriveModelsDraft, "")
+						cp.DriveOutputDir = core.SanitizeDriveSubpath(m.DriveOutputDraft, "/content/drive/MyDrive/ColabTools/outputs")
+						m.Svc.UpdateAccount(cp)
+						m.Svc.ShowToast("已保存 Google Drive 成片目录")
+					})
+				})
 
 				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, "自定义启动脚本").FontSize(12.5).TextColor(pal.TextMuted).Width(96)
@@ -968,28 +927,30 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 					})
 				})
 
-				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "远端端口").FontSize(12.5).TextColor(pal.TextMuted).Width(96)
-					ui.TextInput(c, &m.RemotePortDraft).Width(90)
-					ui.Text(c, "本地通道端口").FontSize(12.5).TextColor(pal.TextMuted)
-					ui.TextInput(c, &m.LocalPortDraft).Width(90)
-					SmallActionButton(c, pal, "校验并保存", nil, false, func() {
-						rp, err1 := strconv.Atoi(strings.TrimSpace(m.RemotePortDraft))
-						lp, err2 := strconv.Atoi(strings.TrimSpace(m.LocalPortDraft))
-						if err1 != nil || err2 != nil || rp < 1024 || rp > 65535 || lp < 1024 || lp > 65535 {
-							m.PortValidationErr = "端口必须是 1024–65535 之间的整数"
-							return
-						}
-						m.PortValidationErr = ""
-						cp := acc
-						cp.RemoteServicePort = rp
-						cp.LocalSSHTunnelPort = lp
-						m.Svc.UpdateAccount(cp)
-						m.Svc.ShowToast(fmt.Sprintf("端口已保存（远端 :%d / 本地 :%d）", rp, lp))
+				if strings.TrimSpace(acc.DriveScriptPath) != "" {
+					ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, "远端端口").FontSize(12.5).TextColor(pal.TextMuted).Width(96)
+						ui.TextInput(c, &m.RemotePortDraft).Width(90)
+						ui.Text(c, "本地通道端口").FontSize(12.5).TextColor(pal.TextMuted)
+						ui.TextInput(c, &m.LocalPortDraft).Width(90)
+						SmallActionButton(c, pal, "校验并保存", nil, false, func() {
+							rp, err1 := strconv.Atoi(strings.TrimSpace(m.RemotePortDraft))
+							lp, err2 := strconv.Atoi(strings.TrimSpace(m.LocalPortDraft))
+							if err1 != nil || err2 != nil || rp < 1024 || rp > 65535 || lp < 1024 || lp > 65535 {
+								m.PortValidationErr = "端口必须是 1024–65535 之间的整数"
+								return
+							}
+							m.PortValidationErr = ""
+							cp := acc
+							cp.RemoteServicePort = rp
+							cp.LocalSSHTunnelPort = lp
+							m.Svc.UpdateAccount(cp)
+							m.Svc.ShowToast(fmt.Sprintf("端口已保存（远端 :%d / 本地 :%d）", rp, lp))
+						})
 					})
-				})
-				if m.PortValidationErr != "" {
-					ui.Text(c, "⚠ "+m.PortValidationErr).FontSize(12).TextColor(pal.Coral)
+					if m.PortValidationErr != "" {
+						ui.Text(c, "⚠ "+m.PortValidationErr).FontSize(12).TextColor(pal.Coral)
+					}
 				}
 			}
 		})

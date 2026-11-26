@@ -1149,6 +1149,16 @@ func normalizeLegacySettingsJSON(raw []byte) ([]byte, bool, error) {
 					}
 				}
 			}
+			for k, v := range map[string]any{
+				"enablePoliteQueue":          true,
+				"enableHardwareIdleFallback": true,
+				"enableCloudflared":          false,
+				"queuePersistentMaxHours":    QueuePersistentDefaultHours,
+			} {
+				if _, exists := m[k]; !exists {
+					m[k] = v
+				}
+			}
 			// Populate v0.3.10 unified GPU strategy cleanly when upgrading from earlier configs
 			if _, hasStrat := m["gpuStrategy"]; !hasStrat {
 				if pq, ok := m["enablePoliteQueue"].(bool); ok && pq {
@@ -1286,8 +1296,9 @@ type InstancePhase struct {
 type ActionPromptKind string
 
 const (
-	PromptDriveAuth ActionPromptKind = "drive_auth"
-	PromptComfyHelp ActionPromptKind = "comfy_help"
+	PromptDriveAuth   ActionPromptKind = "drive_auth"
+	PromptComfyHelp   ActionPromptKind = "comfy_help"
+	PromptConfirmStop ActionPromptKind = "confirm_stop"
 )
 
 // UserActionPrompt 描述需要用户在桌面弹窗中确认或处理的小白向引导操作。
@@ -1395,16 +1406,16 @@ type AccountRuntimeState struct {
 	DisplayUIURL        string
 	ServerHealthy       bool
 
-	DetectedWorkloadKind *WorkloadKind
-	WorkloadName         string
-	WorkloadMetricLabel  string
-	WorkloadMetricValue  string
-	WorkloadMetricUnit   string
-	WorkloadMetricRatio  *float64
-	WorkloadDetail       string
-	QueueRunning         int
-	QueuePending         int
-	DetectedServicePort  *int
+	DetectedWorkloadKind       *WorkloadKind
+	WorkloadName               string
+	WorkloadMetricLabel        string
+	WorkloadMetricValue        string
+	WorkloadMetricUnit         string
+	WorkloadMetricRatio        *float64
+	WorkloadDetail             string
+	QueueRunning               int
+	QueuePending               int
+	DetectedServicePort        *int
 	QueueInFlight              bool
 	DeployRunning              bool
 	DeployFailed               bool
