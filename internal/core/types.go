@@ -831,6 +831,8 @@ type AccountProfile struct {
 
 	// Polite queue & off-peak scheduling
 	EnablePoliteQueue        bool                `json:"enablePoliteQueue"`
+	QueuePersistentMode      bool                `json:"queuePersistentMode,omitempty"`
+	QueuePersistentMaxHours  int                 `json:"queuePersistentMaxHours,omitempty"`
 	QueueTargets             []AcceleratorOption `json:"queueTargets"`
 	QueueFallbackEnabled     bool                `json:"queueFallbackEnabled"`
 	QueueFallbackAfterRounds int                 `json:"queueFallbackAfterRounds"`
@@ -902,6 +904,8 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		StopAfterQueueDrained:     true,
 		QueueDrainMinutes:         10,
 		EnablePoliteQueue:         true,
+		QueuePersistentMode:       false,
+		QueuePersistentMaxHours:   QueuePersistentDefaultHours,
 		QueueTargets:              defaultTargets,
 		QueueFallbackEnabled:      false,
 		QueueFallbackAfterRounds:  2,
@@ -989,6 +993,11 @@ func (a *AccountProfile) Sanitize() {
 		a.QueueDrainMinutes = 60
 	}
 	a.QueueTargets = SanitizedQueueTargets(a.QueueTargets, a.Tier)
+	if a.QueuePersistentMaxHours <= 0 {
+		a.QueuePersistentMaxHours = QueuePersistentDefaultHours
+	} else {
+		a.QueuePersistentMaxHours = clampInt(a.QueuePersistentMaxHours, 1, 24)
+	}
 	if a.QueueFallbackAfterRounds < 1 {
 		a.QueueFallbackAfterRounds = 1
 	}
@@ -1264,12 +1273,34 @@ const (
 )
 
 type InstancePhase struct {
-	Kind           InstancePhaseKind
-	Detail         string
-	QueueAttempt   int
-	QueueMax       int
-	NextRetryAt    *time.Time
-	TargetsSummary string
+	Kind            InstancePhaseKind
+	Detail          string
+	QueueAttempt    int
+	QueueMax        int
+	QueuePersistent bool
+	QueueMaxHours   int
+	NextRetryAt     *time.Time
+	TargetsSummary  string
+}
+
+type ActionPromptKind string
+
+const (
+	PromptDriveAuth ActionPromptKind = "drive_auth"
+	PromptComfyHelp ActionPromptKind = "comfy_help"
+)
+
+// UserActionPrompt 描述需要用户在桌面弹窗中确认或处理的小白向引导操作。
+type UserActionPrompt struct {
+	ID             string
+	Kind           ActionPromptKind
+	AccountID      string
+	Title          string
+	Message        string
+	URL            string
+	PrimaryLabel   string
+	SecondaryLabel string
+	CancelLabel    string
 }
 
 func (p InstancePhase) IsRunning() bool { return p.Kind == PhaseRunning }
@@ -1383,6 +1414,7 @@ type AccountRuntimeState struct {
 	RenderedVideoCount         int
 	SawQueueBusyThisRun        bool
 	AutoOpenedEndpoint         string
+	ComfyOpening               bool
 
 	ActivitySignal ActivitySignal
 	SignalSource   ActivitySignalSource

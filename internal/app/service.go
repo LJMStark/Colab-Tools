@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +25,38 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.13"
+const AppVersion = "0.3.14"
+
+// tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
+type tunnelStderrBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (b *tunnelStderrBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	const maxBytes = 4096
+	if len(p) >= maxBytes {
+		b.buf = append(b.buf[:0], p[len(p)-maxBytes:]...)
+		return len(p), nil
+	}
+	if len(b.buf)+len(p) > maxBytes {
+		drop := len(b.buf) + len(p) - maxBytes
+		b.buf = append([]byte(nil), b.buf[drop:]...)
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *tunnelStderrBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.TrimSpace(runner.StripCR(string(b.buf)))
+}
 
 type MainSection int
 
@@ -86,12 +118,18 @@ type Service struct {
 	cliInstallCancel context.CancelFunc
 	cliInstallToken  string
 
-	refreshing         map[string]bool
-	lastManualFetch    time.Time
-	sshTunnels         map[string]*exec.Cmd
-	sshADCPaths        map[string]string
-	deployWatchCancels map[string]deployWatchHandle
-	pendingOAuth       *colab.OAuthSessionTicket
+	refreshing             map[string]bool
+	lastManualFetch        time.Time
+	sshTunnels             map[string]*exec.Cmd
+	sshADCPaths            map[string]string
+	sshStderrs             map[string]*tunnelStderrBuffer
+	deployWatchCancels     map[string]deployWatchHandle
+	pendingOAuth           *colab.OAuthSessionTicket
+	actionPrompt           *core.UserActionPrompt
+	driveAuthResultCh      chan bool
+	comfyTunnelWaitTimeout time.Duration
+	comfyRetryPause        time.Duration
+	sshStarter             func(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error)
 
 	OSRunner *runner.OSRunner
 	Engine   *colab.Engine
@@ -133,7 +171,9 @@ func NewService(skipBootstrap bool) *Service {
 		refreshing:         map[string]bool{},
 		sshTunnels:         map[string]*exec.Cmd{},
 		sshADCPaths:        map[string]string{},
+		sshStderrs:         map[string]*tunnelStderrBuffer{},
 		deployWatchCancels: map[string]deployWatchHandle{},
+		sshStarter:         startSSHTunnelProcess,
 		OSRunner:           r,
 		Engine:             colab.NewEngine(r, v),
 		Vault:              v,
@@ -400,18 +440,20 @@ func sendMacOSAppleScriptNotification(title, body string) {
 
 // TrayStatusSnapshot summarizes live account phases for the menu bar tray title and tooltip.
 type TrayStatusSnapshot struct {
-	StatusBarMode  string
-	RunningCount   int
-	TotalBalance   float64
-	Queuing        bool
-	QueueAttempt   int
-	QueueMax       int
-	TargetsSummary string
-	Deploying      bool
-	Starting       bool
-	HardwareLabel  string
-	FocusHasError  bool
-	FocusErrorText string
+	StatusBarMode   string
+	RunningCount    int
+	TotalBalance    float64
+	Queuing         bool
+	QueueAttempt    int
+	QueueMax        int
+	QueuePersistent bool
+	QueueMaxHours   int
+	TargetsSummary  string
+	Deploying       bool
+	Starting        bool
+	HardwareLabel   string
+	FocusHasError   bool
+	FocusErrorText  string
 }
 
 // TrayLiveStatus returns a lock-safe point-in-time snapshot of all accounts for tray updates.
@@ -436,7 +478,16 @@ func (s *Service) TrayLiveStatus() TrayStatusSnapshot {
 		if !st.Queuing && rt.Phase.IsQueuing() {
 			st.Queuing = true
 			st.QueueAttempt = max(1, rt.Phase.QueueAttempt)
-			st.QueueMax = max(1, rt.Phase.QueueMax)
+			st.QueuePersistent = rt.Phase.QueuePersistent
+			st.QueueMaxHours = rt.Phase.QueueMaxHours
+			if rt.Phase.QueuePersistent {
+				st.QueueMax = rt.Phase.QueueMax
+				if st.QueueMaxHours <= 0 {
+					st.QueueMaxHours = core.EffectivePersistentHours(acc)
+				}
+			} else {
+				st.QueueMax = max(1, rt.Phase.QueueMax)
+			}
 			st.TargetsSummary = rt.Phase.TargetsSummary
 		}
 		hwLabel := ""
@@ -574,12 +625,25 @@ func (s *Service) SelectAccount(accountID string) {
 
 func (s *Service) UpdateAccount(updated core.AccountProfile) {
 	updated.Sanitize()
+	if updated.QueuePersistentMode && !updated.AutoShutdownEnabled {
+		updated.AutoShutdownEnabled = true
+	}
 	s.mu.Lock()
 	for i := range s.Settings.Accounts {
 		if s.Settings.Accounts[i].ID == updated.ID {
 			s.Settings.Accounts[i] = updated
 			break
 		}
+	}
+	if rt, ok := s.Runtime[updated.ID]; ok && rt.Phase.IsQueuing() {
+		rt.Phase.QueuePersistent = updated.QueuePersistentMode
+		rt.Phase.QueueMaxHours = core.EffectivePersistentHours(updated)
+		if updated.QueuePersistentMode {
+			rt.Phase.QueueMax = 0
+		} else if rt.Phase.QueueMax <= 0 {
+			rt.Phase.QueueMax = core.QueueMaxAttempts
+		}
+		s.Runtime[updated.ID] = rt
 	}
 	s.saveSettingsLocked()
 	s.mu.Unlock()
@@ -1624,15 +1688,15 @@ func (s *Service) pollRunningLLMSlots() {
 func (s *Service) StartAccountSession(accountID string) {
 	s.mu.Lock()
 	var acc core.AccountProfile
-	found := false
-	for _, a := range s.Settings.Accounts {
+	accIdx := -1
+	for i, a := range s.Settings.Accounts {
 		if a.ID == accountID {
 			acc = a
-			found = true
+			accIdx = i
 			break
 		}
 	}
-	if !found || !s.CLIInstalled {
+	if accIdx < 0 || !s.CLIInstalled {
 		s.mu.Unlock()
 		return
 	}
@@ -1646,6 +1710,15 @@ func (s *Service) StartAccountSession(accountID string) {
 		s.mu.Unlock()
 		s.ShowToast(fmt.Sprintf("正在冷静等待中（约 %d 分钟），如已切换显卡可点横幅右侧「解除等待」", remMin))
 		return
+	}
+	// 开启持续守候时自动补开空闲自动关机，防止半夜抢到后无人看管烧光点数
+	if acc.QueuePersistentMode && !acc.AutoShutdownEnabled {
+		acc.AutoShutdownEnabled = true
+		if acc.IdleTimeoutMinutes < 5 {
+			acc.IdleTimeoutMinutes = 40
+		}
+		s.Settings.Accounts[accIdx] = acc
+		s.saveSettingsLocked()
 	}
 	// Clear stale error banner when starting a fresh attempt
 	rt.LastError = ""
@@ -1665,6 +1738,11 @@ func (s *Service) StartAccountSession(accountID string) {
 		targets := core.EffectiveQueueTargets(acc)
 		targetsSummary := core.QueueTargetsSummary(targets)
 		now := time.Now()
+		maxHours := core.EffectivePersistentHours(acc)
+		queueMax := core.QueueMaxAttempts
+		if acc.QueuePersistentMode {
+			queueMax = 0
+		}
 		s.ActiveQueueAccountID = accountID
 		s.activeQueueToken = token
 		s.queueCancels[accountID] = queueHandle{
@@ -1675,10 +1753,12 @@ func (s *Service) StartAccountSession(accountID string) {
 			rounds:         1,
 		}
 		rt.Phase = core.InstancePhase{
-			Kind:           core.PhaseQueuing,
-			QueueAttempt:   1,
-			QueueMax:       core.QueueMaxAttempts,
-			TargetsSummary: targetsSummary,
+			Kind:            core.PhaseQueuing,
+			QueueAttempt:    1,
+			QueueMax:        queueMax,
+			QueuePersistent: acc.QueuePersistentMode,
+			QueueMaxHours:   maxHours,
+			TargetsSummary:  targetsSummary,
 		}
 		s.Runtime[accountID] = rt
 		s.mu.Unlock()
@@ -1813,7 +1893,6 @@ func (s *Service) markQueueAllocLoggedLocked(accountID, token string) bool {
 
 func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, token string) {
 	startedAt := time.Now()
-	deadline := startedAt.Add(core.QueueMaxTotalWait)
 	pruned := map[string]bool{}
 	roundsCompleted := 0
 	lastTargetsSummary := core.QueueTargetsSummary(core.EffectiveQueueTargets(acc))
@@ -1863,7 +1942,21 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		s.notifyUI()
 	}()
 
-	for attempt := 1; attempt <= core.QueueMaxAttempts; attempt++ {
+	for attempt := 1; ; attempt++ {
+		if latest, ok := s.accountByID(acc.ID); ok {
+			acc = latest
+		}
+		maxHours := core.EffectivePersistentHours(acc)
+		if !acc.QueuePersistentMode && attempt > core.QueueMaxAttempts {
+			return
+		}
+		deadline := startedAt.Add(core.QueueMaxTotalWait)
+		queueMax := core.QueueMaxAttempts
+		if acc.QueuePersistentMode {
+			deadline = startedAt.Add(time.Duration(maxHours) * time.Hour)
+			queueMax = 0
+		}
+
 		if ctx.Err() != nil {
 			logQueueOnce("", false, false, core.AllocTagCancelled, "排队已取消")
 			return
@@ -1932,10 +2025,12 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		cur := s.Runtime[acc.ID]
 		cur.QueueInFlight = true
 		cur.Phase = core.InstancePhase{
-			Kind:           core.PhaseQueuing,
-			QueueAttempt:   attempt,
-			QueueMax:       core.QueueMaxAttempts,
-			TargetsSummary: lastTargetsSummary,
+			Kind:            core.PhaseQueuing,
+			QueueAttempt:    attempt,
+			QueueMax:        queueMax,
+			QueuePersistent: acc.QueuePersistentMode,
+			QueueMaxHours:   maxHours,
+			TargetsSummary:  lastTargetsSummary,
 		}
 		s.Runtime[acc.ID] = cur
 		s.mu.Unlock()
@@ -1985,15 +2080,31 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 			logQueueOnce("", false, false, core.AllocTagCancelled, "排队已取消")
 			return
 		}
+		// 遇 429 / abusive / 401 / 403 / 真多机 412 立即熔断停手，绝不顶风继续
 		if res.Outcome.Kind != core.OutcomeCapacity503 {
 			logQueueOnce(res.Outcome.Hardware, false, false, mapAllocOutcomeTag(res.Outcome), res.Outcome.Message)
 			s.handleProvisionFailure(acc, res.Outcome)
 			return
 		}
 
-		delay, ok := core.NextQueueDelay(attempt, startedAt, time.Now(), rand.Float64())
+		// 若用户在排队期间点击了「切持续守候」，这里重新同步最新账户配置
+		if latest, ok := s.accountByID(acc.ID); ok {
+			acc = latest
+			maxHours = core.EffectivePersistentHours(acc)
+			if acc.QueuePersistentMode {
+				queueMax = 0
+			} else {
+				queueMax = core.QueueMaxAttempts
+			}
+		}
+
+		delay, ok := core.NextQueueDelayForMode(attempt, startedAt, time.Now(), rand.Float64(), acc.QueuePersistentMode, maxHours)
 		if !ok {
-			outcome := core.ProvisionOutcome{Kind: core.OutcomeBudgetExhausted, Message: "已达 5 轮 / 40 分钟合规排队上限，暂未拿到目标卡"}
+			msg := "已达 5 轮 / 40 分钟合规排队上限，暂未拿到目标卡"
+			if acc.QueuePersistentMode {
+				msg = fmt.Sprintf("已达 %d 小时持续守候上限（共试 %d 轮），暂未拿到目标卡", maxHours, attempt)
+			}
+			outcome := core.ProvisionOutcome{Kind: core.OutcomeBudgetExhausted, Message: msg}
 			logQueueOnce("", false, false, core.AllocTagShortage, outcome.Message)
 			s.handleProvisionFailure(acc, outcome)
 			return
@@ -2006,11 +2117,13 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		}
 		c := s.Runtime[acc.ID]
 		c.Phase = core.InstancePhase{
-			Kind:           core.PhaseQueuing,
-			QueueAttempt:   attempt,
-			QueueMax:       core.QueueMaxAttempts,
-			NextRetryAt:    &nextAt,
-			TargetsSummary: lastTargetsSummary,
+			Kind:            core.PhaseQueuing,
+			QueueAttempt:    attempt,
+			QueueMax:        queueMax,
+			QueuePersistent: acc.QueuePersistentMode,
+			QueueMaxHours:   maxHours,
+			NextRetryAt:     &nextAt,
+			TargetsSummary:  lastTargetsSummary,
 		}
 		s.Runtime[acc.ID] = c
 		s.mu.Unlock()
@@ -2194,6 +2307,91 @@ func (s *Service) ClearCooldown(accountID string) {
 }
 
 // ClearAccountError dismisses the visible error notice on the home screen.
+func (s *Service) CurrentActionPrompt() *core.UserActionPrompt {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.actionPrompt == nil {
+		return nil
+	}
+	cp := *s.actionPrompt
+	return &cp
+}
+
+// PresentActionPrompt 展示一个用户行动弹窗并触发界面重绘（主要用于内置流程与测试注入）。
+func (s *Service) PresentActionPrompt(prompt *core.UserActionPrompt) {
+	s.mu.Lock()
+	if prompt == nil {
+		s.actionPrompt = nil
+	} else {
+		cp := *prompt
+		s.actionPrompt = &cp
+	}
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
+// ResolveActionPrompt 处理用户在行动弹窗上的点击操作（open_url / primary / secondary / cancel）。
+func (s *Service) ResolveActionPrompt(action string) {
+	s.mu.Lock()
+	prompt := s.actionPrompt
+	if prompt == nil {
+		s.mu.Unlock()
+		return
+	}
+	promptCopy := *prompt
+	opener := s.URLOpener
+
+	switch promptCopy.Kind {
+	case core.PromptDriveAuth:
+		if action == "open_url" {
+			s.mu.Unlock()
+			if promptCopy.URL != "" && opener != nil {
+				opener(promptCopy.URL)
+			}
+			return
+		}
+		ch := s.driveAuthResultCh
+		s.actionPrompt = nil
+		s.driveAuthResultCh = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if ch != nil {
+			proceed := action == "primary"
+			select {
+			case ch <- proceed:
+			default:
+			}
+		}
+	case core.PromptComfyHelp:
+		if action == "open_url" {
+			s.mu.Unlock()
+			if promptCopy.URL != "" && opener != nil {
+				opener(promptCopy.URL)
+			} else if promptCopy.AccountID != "" {
+				s.OpenColabInBrowser(promptCopy.AccountID)
+			}
+			return
+		}
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		switch action {
+		case "primary":
+			if promptCopy.AccountID != "" {
+				go s.OpenComfyUI(promptCopy.AccountID)
+			}
+		case "secondary":
+			if acc, ok := s.accountByID(promptCopy.AccountID); ok {
+				go s.launchVideoDeployFlow(acc)
+			}
+		}
+	default:
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+	}
+}
+
 func (s *Service) ClearAccountError(accountID string) {
 	s.mu.Lock()
 	rt := s.Runtime[accountID]
@@ -2433,7 +2631,45 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 
 	if acc.UseGoogleDrive {
 		s.ShowToast("正在挂载 Google Drive（复用模型并自动存成片）…")
-		if mounted, reason := s.Engine.EnsureDriveMountedWithReason(context.Background(), acc); !mounted {
+		driveCtx, cancelDrive := s.serviceContext()
+		mounted, reason := s.Engine.EnsureDriveMountedInteractive(driveCtx, acc, func(authURL string) bool {
+			ch := make(chan bool, 1)
+			s.mu.Lock()
+			if oldCh := s.driveAuthResultCh; oldCh != nil {
+				select {
+				case oldCh <- false:
+				default:
+				}
+			}
+			s.driveAuthResultCh = ch
+			s.actionPrompt = &core.UserActionPrompt{
+				ID:             uuid.New().String(),
+				Kind:           core.PromptDriveAuth,
+				AccountID:      acc.ID,
+				Title:          "需要你点一下『允许』连接 Google Drive",
+				Message:        "已为你打开 Google Drive 授权网页，请在网页里点击「允许」，把云端模型和成片目录挂上。点完后回到这里点击下方绿色按钮继续。",
+				URL:            authURL,
+				PrimaryLabel:   "我已点完允许，继续",
+				SecondaryLabel: "先不挂，纯云端跑",
+				CancelLabel:    "取消",
+			}
+			opener := s.URLOpener
+			s.mu.Unlock()
+			s.notifyUI()
+			if authURL != "" && opener != nil {
+				opener(authURL)
+			}
+			s.SendNotification("需要你点一下「允许」", "请到浏览器点击允许挂载 Google Drive，点完后回来点「我已点完允许，继续」", true)
+
+			select {
+			case proceed := <-ch:
+				return proceed
+			case <-s.stopLoops:
+				return false
+			}
+		})
+		cancelDrive()
+		if !mounted {
 			if reason == "" {
 				reason = "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
 			}
@@ -2819,29 +3055,39 @@ func pickAvailableLocalPort(preferred int, used map[int]bool) int {
 	return preferred
 }
 
-func (s *Service) ToggleSSHTunnel(accountID string) {
+func (s *Service) serviceContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.stopLoops:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func (s *Service) startSSHTunnelInternal(accountID string) (int, *tunnelStderrBuffer, error) {
 	s.mu.RLock()
-	_, active := s.sshTunnels[accountID]
 	usedPorts := map[int]bool{}
 	for id, rt := range s.Runtime {
 		if id != accountID && rt.SSHTunnelActive && rt.ActiveSSHTunnelPort != nil {
 			usedPorts[*rt.ActiveSSHTunnelPort] = true
 		}
 	}
+	starter := s.sshStarter
 	s.mu.RUnlock()
-	if active {
-		s.StopSSHTunnel(accountID)
-		s.ShowToast("本机加密通道已断开")
-		return
+	if starter == nil {
+		starter = startSSHTunnelProcess
 	}
+
 	acc, ok := s.accountByID(accountID)
 	if !ok {
-		return
+		return 0, nil, fmt.Errorf("未找到账号")
 	}
 	rt := s.StateFor(accountID)
 	if !rt.Phase.IsRunning() || rt.IsFreeRuntimeRestricted(acc) {
-		s.ShowToast("当前实例未运行或受免费版配额限制")
-		return
+		return 0, nil, fmt.Errorf("当前实例未运行或受免费版配额限制")
 	}
 	remotePort := acc.RemoteServicePort
 	if rt.DetectedServicePort != nil {
@@ -2856,18 +3102,20 @@ func (s *Service) ToggleSSHTunnel(accountID string) {
 			}
 		}
 	}
-	proc, err := startSSHTunnelProcess(s.OSRunner, acc, localPort, remotePort, adcPath)
+	proc, errBuf, err := starter(s.OSRunner, acc, localPort, remotePort, adcPath)
 	if err != nil {
 		if adcPath != "" {
 			vault.ShredAndRemove(adcPath)
 		}
-		s.ShowToast("启动 SSH 隧道失败：" + err.Error())
-		return
+		return 0, errBuf, err
 	}
 	s.mu.Lock()
 	s.sshTunnels[accountID] = proc
 	if adcPath != "" {
 		s.sshADCPaths[accountID] = adcPath
+	}
+	if errBuf != nil {
+		s.sshStderrs[accountID] = errBuf
 	}
 	cur := s.Runtime[accountID]
 	cur.SSHTunnelActive = true
@@ -2876,12 +3124,40 @@ func (s *Service) ToggleSSHTunnel(accountID string) {
 	s.Runtime[accountID] = cur
 	s.mu.Unlock()
 	s.notifyUI()
-	s.ShowToast(fmt.Sprintf("SSH 隧道已建立：127.0.0.1:%d → :%d", localPort, remotePort))
 
-	go func() {
-		_ = proc.Wait()
-		s.stopSSHTunnelIfMatches(accountID, proc)
-	}()
+	if proc != nil {
+		go func() {
+			_ = proc.Wait()
+			s.stopSSHTunnelIfMatches(accountID, proc)
+		}()
+	}
+	return localPort, errBuf, nil
+}
+
+func (s *Service) ToggleSSHTunnel(accountID string) {
+	s.mu.RLock()
+	_, active := s.sshTunnels[accountID]
+	s.mu.RUnlock()
+	if active {
+		s.StopSSHTunnel(accountID)
+		s.ShowToast("本机加密通道已断开")
+		return
+	}
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	remotePort := acc.RemoteServicePort
+	if rt.DetectedServicePort != nil {
+		remotePort = *rt.DetectedServicePort
+	}
+	localPort, _, err := s.startSSHTunnelInternal(accountID)
+	if err != nil {
+		s.ShowToast("启动 SSH 隧道失败：" + err.Error())
+		return
+	}
+	s.ShowToast(fmt.Sprintf("SSH 隧道已建立：127.0.0.1:%d → :%d", localPort, remotePort))
 }
 
 func (s *Service) stopSSHTunnelIfMatches(accountID string, proc *exec.Cmd) {
@@ -2893,15 +3169,62 @@ func (s *Service) stopSSHTunnelIfMatches(accountID string, proc *exec.Cmd) {
 	}
 }
 
-// OpenComfyUI ensures a local encrypted SSH tunnel to ComfyUI (:8188) is live, waits briefly for localhost port readiness, and opens the default browser.
+func probeLocalComfyHTTP(port int) bool {
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, path := range []string{"/queue", "/"} {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, path))
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// OpenComfyUI 一键直达 ComfyUI：自动补开机/补部署、防连点、最多 2 次 SSH 隧道重连（含残留清理与 HTTP 探活）、cloudflared 云端兜底、白话助手机制。
 func (s *Service) OpenComfyUI(accountID string) {
 	acc, ok := s.accountByID(accountID)
 	if !ok {
 		return
 	}
-	rt := s.StateFor(accountID)
+
+	// 防并发连点
+	s.mu.Lock()
+	rt := s.Runtime[accountID]
+	if rt.ComfyOpening {
+		s.mu.Unlock()
+		s.ShowToast("正在为你连接 ComfyUI，请稍等几秒…")
+		return
+	}
+	rt.ComfyOpening = true
+	s.Runtime[accountID] = rt
+	waitTimeout := s.comfyTunnelWaitTimeout
+	retryPause := s.comfyRetryPause
+	s.mu.Unlock()
+	s.notifyUI()
+
+	if waitTimeout <= 0 {
+		waitTimeout = 22 * time.Second
+	}
+	if retryPause <= 0 {
+		retryPause = 4 * time.Second
+	}
+
+	defer func() {
+		s.mu.Lock()
+		if cur, exists := s.Runtime[accountID]; exists {
+			cur.ComfyOpening = false
+			s.Runtime[accountID] = cur
+		}
+		s.mu.Unlock()
+		s.notifyUI()
+	}()
+
+	// 未开机时帮小白直接一键开机并部署
 	if !rt.Phase.IsRunning() {
-		s.ShowToast("请先开机并部署后再打开 ComfyUI")
+		s.DeployNow(accountID)
 		return
 	}
 	if rt.DeployRunning {
@@ -2914,11 +3237,13 @@ func (s *Service) OpenComfyUI(accountID string) {
 		return
 	}
 	if rt.DeployFailed {
-		s.ShowToast("上次云端部署中断，请先点「查看日志」排查或点「重新部署」")
+		s.ShowToast("上次云端部署中断，请点「查看日志」排查或点「重新部署」")
 		return
 	}
+	// 裸机未安装 ComfyUI 时直接自动拉起部署，装好后自动打开
 	if !rt.ServerHealthy {
-		s.ShowToast("云端机器尚未安装 ComfyUI，请先点「立即部署」")
+		s.ShowToast("正在为你自动安装 ComfyUI，装好后会自动弹出浏览器")
+		go s.launchVideoDeployFlow(acc)
 		return
 	}
 	if rt.IsFreeRuntimeRestricted(acc) {
@@ -2926,44 +3251,127 @@ func (s *Service) OpenComfyUI(accountID string) {
 			s.URLOpener(rt.DisplayUIURL)
 			return
 		}
+		remotePort := acc.RemoteServicePort
+		if rt.DetectedServicePort != nil {
+			remotePort = *rt.DetectedServicePort
+		}
+		if cfURL, err := s.Engine.EnsureCloudflaredFallbackURL(context.Background(), acc, remotePort); err == nil && cfURL != "" {
+			if s.URLOpener != nil {
+				s.URLOpener(cfURL)
+			}
+			s.ShowToast("已自动切换云端临时通道打开 ComfyUI")
+			return
+		}
 		s.ShowToast("免费版不支持本机加密通道，请打开「cloudflared 临时链接」或直接点 Colab 网页")
 		return
 	}
-	if !rt.SSHTunnelActive {
-		s.ToggleSSHTunnel(accountID)
+
+	// 若已有现成隧道且本地 HTTP 探活直接通，立刻打开
+	if rt.SSHTunnelActive && rt.ActiveSSHTunnelPort != nil {
+		existingPort := *rt.ActiveSSHTunnelPort
+		if probeLocalComfyHTTP(existingPort) {
+			if s.URLOpener != nil {
+				s.URLOpener(fmt.Sprintf("http://127.0.0.1:%d", existingPort))
+			}
+			return
+		}
+		// 现有隧道已失活，清理后再走 2 次重连
+		s.StopSSHTunnel(accountID)
 	}
-	rt = s.StateFor(accountID)
-	if !rt.SSHTunnelActive || rt.ActiveSSHTunnelPort == nil {
-		s.ShowToast("本机加密通道未能启动，请检查本机 OpenSSH 或重试")
+
+	var lastErrText string
+	for attempt := 1; attempt <= 2; attempt++ {
+		port, errBuf, startErr := s.startSSHTunnelInternal(accountID)
+		if startErr != nil {
+			lastErrText = startErr.Error()
+		} else {
+			addr := fmt.Sprintf("127.0.0.1:%d", port)
+			deadline := time.Now().Add(waitTimeout)
+			for time.Now().Before(deadline) {
+				s.mu.RLock()
+				_, stillAlive := s.sshTunnels[accountID]
+				s.mu.RUnlock()
+				if !stillAlive {
+					break
+				}
+				conn, dialErr := net.DialTimeout("tcp", addr, 350*time.Millisecond)
+				if dialErr == nil {
+					_ = conn.Close()
+					if probeLocalComfyHTTP(port) {
+						if s.URLOpener != nil {
+							s.URLOpener("http://" + addr)
+						}
+						return
+					}
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			if errBuf != nil {
+				if msg := errBuf.String(); msg != "" {
+					lastErrText = msg
+				}
+			}
+		}
+
+		// 清理残留并准备重连
+		cleanupStaleColabSSH(acc.SessionName)
+		s.StopSSHTunnel(accountID)
+
+		if attempt == 1 {
+			if strings.Contains(strings.ToLower(lastErrText), "already-active ssh session") || strings.Contains(lastErrText, "429") {
+				s.ShowToast("检测到旧 SSH 连接占坑，正在自动清理并在 4 秒后重连…")
+			} else {
+				s.ShowToast("本机通道暂未连通，正在清理旧连接并自动重试…")
+			}
+			select {
+			case <-time.After(retryPause):
+			case <-s.stopLoops:
+				return
+			}
+		}
+	}
+
+	// 本机 SSH 2 次失败：全自动尝试 cloudflared 云端安全临时链接兜底
+	remotePort := acc.RemoteServicePort
+	if rt.DetectedServicePort != nil {
+		remotePort = *rt.DetectedServicePort
+	}
+	s.ShowToast("本机通道未连通，正在自动开启云端临时安全通道…")
+	svcCtx, cancelSvcCtx := s.serviceContext()
+	defer cancelSvcCtx()
+	if cfURL, err := s.Engine.EnsureCloudflaredFallbackURL(svcCtx, acc, remotePort); err == nil && cfURL != "" {
+		s.mu.Lock()
+		if cur, exists := s.Runtime[accountID]; exists && cur.ActiveEndpoint == rt.ActiveEndpoint {
+			cur.DisplayUIURL = cfURL
+			s.Runtime[accountID] = cur
+		}
+		s.mu.Unlock()
+		s.notifyUI()
+		if s.URLOpener != nil {
+			s.URLOpener(cfURL)
+		}
+		s.ShowToast("已自动切换云端临时通道打开 ComfyUI")
 		return
 	}
-	port := *rt.ActiveSSHTunnelPort
-	// Verify BOTH that this account's own tunnel process stays alive AND its bound localhost port accepts TCP connections
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	deadline := time.Now().Add(8 * time.Second)
-	connected := false
-	for time.Now().Before(deadline) {
-		s.mu.RLock()
-		_, stillAlive := s.sshTunnels[accountID]
-		s.mu.RUnlock()
-		if !stillAlive {
-			break
-		}
-		conn, err := net.DialTimeout("tcp", addr, 350*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			connected = true
-			break
-		}
-		time.Sleep(350 * time.Millisecond)
+
+	// 所有通道均失败：弹出小白友好白话向导，绝不吐技术报错天书
+	colabURL := s.Engine.ResolveColabURL(svcCtx, acc, acc.SessionName)
+	reasonHint := "本机加密通道和云端临时通道这次都没连上。"
+	if strings.Contains(strings.ToLower(lastErrText), "already-active ssh session") || strings.Contains(lastErrText, "429") {
+		reasonHint = "Google 检测到云端还有一个没关干净的旧 SSH 连接（通常等十几秒会自动释放），刚才自动重连与云端临时通道也暂未连上。"
 	}
-	if !connected {
-		s.ShowToast(fmt.Sprintf("本机通道 127.0.0.1:%d 暂未连通，请点「查看日志」核对 8188 端口", port))
-		return
-	}
-	if s.URLOpener != nil {
-		s.URLOpener("http://" + addr)
-	}
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:             uuid.New().String(),
+		Kind:           core.PromptComfyHelp,
+		AccountID:      acc.ID,
+		Title:          "ComfyUI 通道暂时没连上",
+		Message:        reasonHint + "你可以点「重新连接」再试一次，或者点「重启云端画布」重新拉起服务。",
+		URL:            colabURL,
+		PrimaryLabel:   "重新连接",
+		SecondaryLabel: "重启云端画布",
+		CancelLabel:    "关闭",
+	})
+	s.ShowToast("ComfyUI 通道暂未连上，已弹出快捷处理向导")
 }
 
 // RefreshDeployLog fetches recent remote deploy/ComfyUI logs asynchronously into runtime state for the log viewer overlay.
@@ -3039,6 +3447,7 @@ func (s *Service) StopSSHTunnel(accountID string) {
 	adc := s.sshADCPaths[accountID]
 	delete(s.sshTunnels, accountID)
 	delete(s.sshADCPaths, accountID)
+	delete(s.sshStderrs, accountID)
 	if cur, ok := s.Runtime[accountID]; ok {
 		cur.SSHTunnelActive = false
 		cur.ActiveSSHTunnelPort = nil

@@ -137,6 +137,10 @@ func TestPoliteQueueEqualJitterFallbackAndScheduleGrace(t *testing.T) {
 	if len(r3) != 3 || r3[2] != core.AccL4 {
 		t.Fatalf("round 3 must append L4 fallback: %v", r3)
 	}
+	r6 := core.QueueTargetsForRound(6, []core.AcceleratorOption{core.AccG4, core.AccH100}, true, 2, core.AccL4, core.TierAIUltra)
+	if len(r6) != 3 || r6[2] != core.AccL4 {
+		t.Fatalf("round 6+ in persistent mode must keep L4 fallback active: %v", r6)
+	}
 
 	// Real google-colab-cli 0.8.x error classification (never misclassify single-card rejection or timeout as 15m rate-limit)
 	if core.ClassifyProvisionFailure(1, false, "", "HTTP 503 Service Unavailable", "G4").Kind != core.OutcomeCapacity503 {
@@ -522,5 +526,74 @@ func TestVRAMProtectionCrossModelFallbackAndEcoSaver(t *testing.T) {
 	acc31B.EnableLLMModule = true
 	if core.ShouldCrossModelDowngrade(acc31B, "L4") {
 		t.Fatal("ShouldCrossModelDowngrade must be false when EnableLLMModule=true")
+	}
+}
+
+func TestNextQueueDelayForModeAndPersistentHours(t *testing.T) {
+	now := time.Date(2026, 11, 26, 2, 0, 0, 0, time.Local)
+
+	// EffectivePersistentHours normalizes invalid/default to 8 and clamps to 1..24
+	acc := core.NewDefaultAccountProfile("Persist", "p@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	if acc.QueuePersistentMode {
+		t.Fatal("QueuePersistentMode must default to false")
+	}
+	if got := core.EffectivePersistentHours(acc); got != 8 {
+		t.Fatalf("expected default persistent hours 8, got %d", got)
+	}
+	acc.QueuePersistentMaxHours = -3
+	if got := core.EffectivePersistentHours(acc); got != 8 {
+		t.Fatalf("expected <=0 persistent hours to normalize to 8, got %d", got)
+	}
+	acc.QueuePersistentMaxHours = 99
+	if got := core.EffectivePersistentHours(acc); got != 24 {
+		t.Fatalf("expected >24 persistent hours to clamp to 24, got %d", got)
+	}
+	acc.QueuePersistentMaxHours = 12
+	if got := core.EffectivePersistentHours(acc); got != 12 {
+		t.Fatalf("expected 12 persistent hours, got %d", got)
+	}
+
+	// Standard mode (!persistent) stays capped at 5 rounds / 40 minutes
+	dStd, ok := core.NextQueueDelayForMode(1, now, now, 0.5, false, 8)
+	if !ok || dStd != 135*time.Second {
+		t.Fatalf("standard mode round 1 expected 135s, got (%v, %v)", dStd, ok)
+	}
+	if _, ok := core.NextQueueDelayForMode(core.QueueMaxAttempts, now, now, 0.5, false, 8); ok {
+		t.Fatal("standard mode must stop at QueueMaxAttempts")
+	}
+	if _, ok := core.NextQueueDelayForMode(1, now.Add(-39*time.Minute), now, 1.0, false, 8); ok {
+		t.Fatal("standard mode must stop past 40m")
+	}
+
+	// Persistent mode: rounds 1..3 keep 3m/6m/9m Equal Jitter, rounds 4+ strictly stay in 8~12m (480s..720s)
+	d1Min, ok := core.NextQueueDelayForMode(1, now, now, 0.0, true, 8)
+	if !ok || d1Min != 90*time.Second {
+		t.Fatalf("persistent round 1 min expected 90s, got (%v, %v)", d1Min, ok)
+	}
+	d3Max, ok := core.NextQueueDelayForMode(3, now, now, 1.0, true, 8)
+	if !ok || d3Max != 540*time.Second {
+		t.Fatalf("persistent round 3 max expected 540s, got (%v, %v)", d3Max, ok)
+	}
+	for _, attempt := range []int{4, 5, 6, 15} {
+		dMin, okMin := core.NextQueueDelayForMode(attempt, now, now, 0.0, true, 8)
+		dMax, okMax := core.NextQueueDelayForMode(attempt, now, now, 1.0, true, 8)
+		dMid, okMid := core.NextQueueDelayForMode(attempt, now, now, 0.5, true, 8)
+		if !okMin || dMin != 480*time.Second {
+			t.Fatalf("attempt %d min expected 480s (8m), got (%v, %v)", attempt, dMin, okMin)
+		}
+		if !okMax || dMax != 720*time.Second {
+			t.Fatalf("attempt %d max expected 720s (12m), got (%v, %v)", attempt, dMax, okMax)
+		}
+		if !okMid || dMid != 600*time.Second {
+			t.Fatalf("attempt %d mid expected 600s (10m), got (%v, %v)", attempt, dMid, okMid)
+		}
+	}
+
+	// Persistent 8h cap & wake-from-sleep resilience (checks total elapsed, stops cleanly past cap)
+	if _, ok := core.NextQueueDelayForMode(10, now.Add(-7*time.Hour-55*time.Minute), now, 1.0, true, 8); ok {
+		t.Fatal("persistent mode must stop when elapsed + delay exceeds 8h")
+	}
+	if d, ok := core.NextQueueDelayForMode(10, now.Add(-7*time.Hour-40*time.Minute), now, 0.0, true, 8); !ok || d != 480*time.Second {
+		t.Fatalf("persistent mode within 8h expected 480s, got (%v, %v)", d, ok)
 	}
 }

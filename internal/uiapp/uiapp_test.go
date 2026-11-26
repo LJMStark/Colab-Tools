@@ -454,6 +454,160 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if !logTester.HasText("云端部署日志与状态核查") || !logTester.HasText("端口 :8188: 未监听") {
 		t.Fatalf("missing deploy log overlay content: %q", logTester.Texts())
 	}
+
+	// 6. Persistent queue toggle in options drawer, ComfyOpening disabled feedback, and persistent queuing labels (never 7/5)
+	pqSvc := makeDemoService(app.SectionHome, false, true)
+	pqAcc := pqSvc.Settings.Accounts[0]
+	pqAcc.AutoShutdownEnabled = false
+	pqSvc.Settings.Accounts[0] = pqAcc
+	pqUI := uiapp.NewMainUI(pqSvc)
+	pqUI.ForceTheme = "dark"
+	pqTester := ui.NewTester(pqUI.View, 1160, 760)
+	if err := pqTester.Click("调整显卡与选项"); err != nil {
+		t.Fatalf("click 调整显卡与选项 failed: %v", err)
+	}
+	if !pqTester.HasText("抢不到就持续守候（低频挂机，直到抢到为止）") {
+		t.Fatalf("missing persistent queue switch in options drawer: %q", pqTester.Texts())
+	}
+	if err := pqTester.Click("抢不到就持续守候（低频挂机，直到抢到为止）"); err != nil {
+		t.Fatalf("click persistent queue switch failed: %v", err)
+	}
+	if gotAcc, _ := pqSvc.SelectedAccount(); !gotAcc.QueuePersistentMode || !gotAcc.AutoShutdownEnabled || gotAcc.QueuePersistentMaxHours != 8 {
+		t.Fatalf("expected persistent mode + auto-shutdown + default 8h enabled, got persistent=%v autoShutdown=%v maxH=%d",
+			gotAcc.QueuePersistentMode, gotAcc.AutoShutdownEnabled, gotAcc.QueuePersistentMaxHours)
+	}
+	if !pqTester.HasText("4 小时") || !pqTester.HasText("8 小时（推荐）") || !pqTester.HasText("12 小时") {
+		t.Fatalf("missing persistent max-hours pills: %q", pqTester.Texts())
+	}
+	if err := pqTester.Click("12 小时"); err != nil {
+		t.Fatalf("click 12 小时 failed: %v", err)
+	}
+	if gotAcc, _ := pqSvc.SelectedAccount(); gotAcc.QueuePersistentMaxHours != 12 {
+		t.Fatalf("expected QueuePersistentMaxHours=12, got %d", gotAcc.QueuePersistentMaxHours)
+	}
+	if err := pqTester.Click("完成"); err != nil {
+		t.Fatalf("click 完成 failed: %v", err)
+	}
+	if !pqTester.HasText("守候 12h") {
+		t.Fatalf("expected 守候 12h badge on strategy card: %q", pqTester.Texts())
+	}
+
+	// Standard queue banner quick switch to persistent queue
+	stdQSvc := makeDemoService(app.SectionHome, false, true)
+	stdQAcc := stdQSvc.Settings.Accounts[0]
+	stdQAcc.QueuePersistentMode = false
+	stdQSvc.Settings.Accounts[0] = stdQAcc
+	stdQRT := stdQSvc.Runtime[stdQAcc.ID]
+	stdQRT.Phase = core.InstancePhase{
+		Kind:           core.PhaseQueuing,
+		QueueAttempt:   2,
+		QueueMax:       5,
+		TargetsSummary: "G4 → A100",
+	}
+	stdQSvc.Runtime[stdQAcc.ID] = stdQRT
+	stdQUI := uiapp.NewMainUI(stdQSvc)
+	stdQUI.ForceTheme = "dark"
+	stdQTester := ui.NewTester(stdQUI.View, 1160, 760)
+	if !stdQTester.HasText("切持续守候") {
+		t.Fatalf("missing quick 切持续守候 button on standard queue banner: %q", stdQTester.Texts())
+	}
+	if err := stdQTester.Click("切持续守候"); err != nil {
+		t.Fatalf("click 切持续守候 failed: %v", err)
+	}
+	if gotAcc, _ := stdQSvc.SelectedAccount(); !gotAcc.QueuePersistentMode {
+		t.Fatalf("expected QueuePersistentMode enabled after clicking 切持续守候")
+	}
+
+	// Persistent queuing state must display 守候 / 第 7 轮 and NEVER 7/5
+	perQSvc := makeDemoService(app.SectionHome, false, true)
+	perQAcc := perQSvc.Settings.Accounts[0]
+	perQAcc.QueuePersistentMode = true
+	perQAcc.QueuePersistentMaxHours = 8
+	perQSvc.Settings.Accounts[0] = perQAcc
+	perQRT := perQSvc.Runtime[perQAcc.ID]
+	nextTry := time.Now().Add(9*time.Minute + 25*time.Second)
+	perQRT.Phase = core.InstancePhase{
+		Kind:            core.PhaseQueuing,
+		QueueAttempt:    7,
+		QueueMax:        5,
+		QueuePersistent: true,
+		QueueMaxHours:   8,
+		NextRetryAt:     &nextTry,
+		TargetsSummary:  "G4 → A100",
+	}
+	perQSvc.Runtime[perQAcc.ID] = perQRT
+	perQUI := uiapp.NewMainUI(perQSvc)
+	perQUI.ForceTheme = "dark"
+	perQTester := ui.NewTester(perQUI.View, 1160, 760)
+	if !perQTester.HasText("守候") || !perQTester.HasText("第 7 轮") || !perQTester.HasText("守候 第7轮") {
+		t.Fatalf("missing persistent queue labels: %q", perQTester.Texts())
+	}
+	if perQTester.HasText("7/5") {
+		t.Fatalf("persistent queue UI must never display 7/5: %q", perQTester.Texts())
+	}
+
+	// ComfyOpening=true shows 连接中… on both MainUI and PopoverUI
+	openSvc := makeDemoService(app.SectionHome, false, false)
+	openAccID := openSvc.Settings.SelectedAccountID
+	openRT := openSvc.Runtime[openAccID]
+	openRT.ComfyOpening = true
+	openSvc.Runtime[openAccID] = openRT
+	openUI := uiapp.NewMainUI(openSvc)
+	openUI.ForceTheme = "dark"
+	openTester := ui.NewTester(openUI.View, 1160, 760)
+	if !openTester.HasText("连接中…") {
+		t.Fatalf("expected 连接中… on MainUI when ComfyOpening=true: %q", openTester.Texts())
+	}
+	openPop := uiapp.NewPopoverUI(openSvc)
+	openPop.ForceTheme = "dark"
+	openPopTester := ui.NewTester(openPop.View, 420, 620)
+	if !openPopTester.HasText("连接中…") {
+		t.Fatalf("expected 连接中… on PopoverUI when ComfyOpening=true: %q", openPopTester.Texts())
+	}
+
+	// 7. Action prompt modal overlay (PromptDriveAuth): title, message, open_url & primary resolve callbacks
+	promptSvc := makeDemoService(app.SectionHome, false, false)
+	var openedURL string
+	promptSvc.URLOpener = func(u string) {
+		openedURL = u
+	}
+	promptSvc.PresentActionPrompt(&core.UserActionPrompt{
+		ID:             "drive-auth-test",
+		Kind:           core.PromptDriveAuth,
+		AccountID:      promptSvc.Settings.SelectedAccountID,
+		Title:          "需要你点一下「允许」连接 Google Drive",
+		Message:        "已在浏览器中打开 Google 授权页。请在网页里点「允许」挂载云盘后，回来点击下方绿色/琥珀主按钮继续部署。",
+		URL:            "https://accounts.google.com/o/oauth2/auth?mock=1",
+		PrimaryLabel:   "我已点完允许，继续",
+		SecondaryLabel: "这次先不挂，纯云端跑",
+		CancelLabel:    "取消",
+	})
+	promptUI := uiapp.NewMainUI(promptSvc)
+	promptUI.ForceTheme = "dark"
+	promptTester := ui.NewTester(promptUI.View, 1160, 760)
+	for _, want := range []string{
+		"需要你点一下「允许」连接 Google Drive",
+		"浏览器没弹出？点此重新打开授权页",
+		"我已点完允许，继续",
+		"这次先不挂，纯云端跑",
+		"取消",
+	} {
+		if !promptTester.HasText(want) {
+			t.Fatalf("missing action prompt modal text %q: %q", want, promptTester.Texts())
+		}
+	}
+	if err := promptTester.Click("浏览器没弹出？点此重新打开授权页"); err != nil {
+		t.Fatalf("click reopen url failed: %v", err)
+	}
+	if openedURL != "https://accounts.google.com/o/oauth2/auth?mock=1" || promptSvc.CurrentActionPrompt() == nil {
+		t.Fatalf("expected open_url callback without closing prompt, got url=%q prompt=%v", openedURL, promptSvc.CurrentActionPrompt())
+	}
+	if err := promptTester.Click("我已点完允许，继续"); err != nil {
+		t.Fatalf("click primary button failed: %v", err)
+	}
+	if promptSvc.CurrentActionPrompt() != nil {
+		t.Fatalf("expected action prompt cleared after clicking primary button")
+	}
 }
 
 // TestExportOfficialShowcasePreviews exports all Retina @2x previews when COLABTOOLS_EXPORT_DIR is set.
@@ -591,5 +745,44 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 
 		bareUI.ShowDeployLog = true
 		renderPNG(t, bareUI.View, 1160, 760, filepath.Join(qaDir, "qa-deploy-log-overlay.png"))
+
+		perQSvc := makeDemoService(app.SectionHome, false, true)
+		pAcc := perQSvc.Settings.Accounts[0]
+		pAcc.QueuePersistentMode = true
+		pAcc.QueuePersistentMaxHours = 8
+		perQSvc.Settings.Accounts[0] = pAcc
+		pRT := perQSvc.Runtime[pAcc.ID]
+		nextTry := time.Now().Add(9*time.Minute + 25*time.Second)
+		pRT.Phase = core.InstancePhase{
+			Kind:            core.PhaseQueuing,
+			QueueAttempt:    7,
+			QueueMax:        5,
+			QueuePersistent: true,
+			QueueMaxHours:   8,
+			NextRetryAt:     &nextTry,
+			TargetsSummary:  "G4 → A100",
+		}
+		perQSvc.Runtime[pAcc.ID] = pRT
+		perQUI := uiapp.NewMainUI(perQSvc)
+		perQUI.PreviewMode = true
+		perQUI.ForceTheme = "dark"
+		renderPNG(t, perQUI.View, 1160, 760, filepath.Join(qaDir, "qa-persistent-queue-dark.png"))
+
+		promptSvc := makeDemoService(app.SectionHome, false, false)
+		promptSvc.PresentActionPrompt(&core.UserActionPrompt{
+			ID:             "qa-drive-auth",
+			Kind:           core.PromptDriveAuth,
+			AccountID:      promptSvc.Settings.SelectedAccountID,
+			Title:          "需要你点一下「允许」连接 Google Drive",
+			Message:        "已在浏览器中打开 Google 授权页。请在网页里点「允许」把 Google Drive 挂载进云端机器，完成后回来点下方按钮继续安装 ComfyUI。",
+			URL:            "https://accounts.google.com/o/oauth2/auth?demo=1",
+			PrimaryLabel:   "我已点完允许，继续",
+			SecondaryLabel: "这次先不挂，纯云端跑",
+			CancelLabel:    "取消",
+		})
+		promptUI := uiapp.NewMainUI(promptSvc)
+		promptUI.PreviewMode = true
+		promptUI.ForceTheme = "dark"
+		renderPNG(t, promptUI.View, 1160, 760, filepath.Join(qaDir, "qa-drive-auth-modal-dark.png"))
 	}
 }

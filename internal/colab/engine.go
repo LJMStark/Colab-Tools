@@ -11,10 +11,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LJMStark/Colab-Tools/internal/core"
@@ -887,6 +890,365 @@ func (e *Engine) EnsureDriveMountedWithReason(ctx context.Context, profile core.
 		}
 		return false, "Google Drive 暂未挂载成功，先直接云端运行（成片请记得保存）"
 	}
+	verify := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, checkPy, 20*time.Second)
+	if verify.ExitCode == 0 && strings.Contains(verify.Stdout, "DRIVE_MOUNTED=1") {
+		return true, ""
+	}
+	return false, "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
+}
+
+var (
+	cloudflaredURLRegex = regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
+	driveAuthURLRegex   = regexp.MustCompile(`https://accounts\.google\.com/[^\s"'<>]+`)
+)
+
+// EnsureCloudflaredFallbackURL 在云端按需安装并后台拉起 cloudflared 临时隧道指向本地端口，最多等待 20 秒提取安全链接。
+func (e *Engine) EnsureCloudflaredFallbackURL(ctx context.Context, profile core.AccountProfile, remotePort int) (string, error) {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return "", errors.New("会话名不合法")
+	}
+	if remotePort <= 0 || remotePort > 65535 {
+		remotePort = 8188
+	}
+
+	py := fmt.Sprintf(`import os, pathlib, platform, re, shutil, signal, subprocess, time, urllib.request
+
+port = %d
+log_path = pathlib.Path("/tmp/colab-tools-cloudflared.log")
+pid_path = pathlib.Path("/tmp/colab-tools-cloudflared.pid")
+url_pat = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+def alive_for_port():
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text().strip())
+        cmd_p = pathlib.Path(f"/proc/{pid}/cmdline")
+        if not cmd_p.exists():
+            return False
+        cmd = cmd_p.read_bytes().decode("utf-8", errors="ignore")
+        return "cloudflared" in cmd and f"127.0.0.1:{port}" in cmd
+    except Exception:
+        return False
+
+if alive_for_port() and log_path.exists():
+    m = url_pat.search(log_path.read_text(errors="ignore"))
+    if m:
+        print("CLOUDFLARED_URL=" + m.group(0))
+        raise SystemExit(0)
+
+cf_bin = shutil.which("cloudflared") or ""
+if not cf_bin:
+    cand = pathlib.Path("/tmp/cloudflared")
+    if cand.exists() and os.access(cand, os.X_OK):
+        cf_bin = str(cand)
+    else:
+        arch = platform.machine().lower()
+        suffix = "arm64" if ("aarch64" in arch or "arm64" in arch) else "amd64"
+        dl_url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{suffix}"
+        tmp_dl = pathlib.Path("/tmp/cloudflared.dl")
+        urllib.request.urlretrieve(dl_url, str(tmp_dl))
+        os.chmod(tmp_dl, 0o755)
+        tmp_dl.replace(cand)
+        cf_bin = str(cand)
+
+if pid_path.exists():
+    try:
+        old_pid = int(pid_path.read_text().strip())
+        if pathlib.Path(f"/proc/{old_pid}/cmdline").exists():
+            os.killpg(old_pid, signal.SIGTERM)
+    except Exception:
+        pass
+
+logf = open(log_path, "wb")
+proc = subprocess.Popen(
+    [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
+    stdout=logf,
+    stderr=subprocess.STDOUT,
+    stdin=subprocess.DEVNULL,
+    start_new_session=True,
+)
+pid_path.write_text(str(proc.pid))
+
+deadline = time.time() + 20.0
+found = ""
+while time.time() < deadline:
+    if log_path.exists():
+        m = url_pat.search(log_path.read_text(errors="ignore"))
+        if m:
+            found = m.group(0)
+            break
+    if proc.poll() is not None:
+        break
+    time.sleep(0.5)
+
+if found:
+    print("CLOUDFLARED_URL=" + found)
+else:
+    tail = log_path.read_text(errors="ignore")[-400:] if log_path.exists() else ""
+    print("CLOUDFLARED_ERR=" + tail.replace("\n", " "))
+`, remotePort)
+
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 50*time.Second)
+	for _, raw := range strings.Split(runner.StripCR(r.Stdout), "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "CLOUDFLARED_URL=") {
+			u := strings.TrimSpace(strings.TrimPrefix(line, "CLOUDFLARED_URL="))
+			if m := cloudflaredURLRegex.FindString(u); m != "" && core.IsValidEndpointURL(m) {
+				return m, nil
+			}
+		}
+	}
+	errMsg := strings.TrimSpace(r.Stderr)
+	if errMsg == "" {
+		errMsg = strings.TrimSpace(r.Stdout)
+	}
+	if errMsg == "" {
+		errMsg = "未能启动云端临时通道"
+	}
+	return "", errors.New(errMsg)
+}
+
+// EnsureDriveMountedInteractive 以交互管道运行 `colab drivemount`，遇到 Google Drive 浏览器授权提示时通过回调弹窗引导用户一步完成授权。
+func (e *Engine) EnsureDriveMountedInteractive(ctx context.Context, profile core.AccountProfile, onAuthRequired func(authURL string) (proceed bool)) (bool, string) {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return false, "会话名不合法"
+	}
+	checkPy := "import os\nprint('DRIVE_MOUNTED=1' if os.path.isdir('/content/drive/MyDrive') else 'DRIVE_MOUNTED=0')\n"
+	check := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, checkPy, 20*time.Second)
+	if check.ExitCode == 0 && strings.Contains(check.Stdout, "DRIVE_MOUNTED=1") {
+		return true, ""
+	}
+
+	var adcPath string
+	if profile.AuthMode == core.AuthIsolatedVaultADC {
+		var mounted bool
+		var reason string
+		err := e.Vault.WithEphemeralADCFile(profile.ID, func(p string) error {
+			adcPath = p
+			mounted, reason = e.runInteractiveDriveMount(ctx, profile, adcPath, checkPy, onAuthRequired)
+			return nil
+		})
+		if err != nil {
+			return false, "读取账号凭据失败，先直接云端运行（成片请记得保存）"
+		}
+		return mounted, reason
+	}
+	return e.runInteractiveDriveMount(ctx, profile, "", checkPy, onAuthRequired)
+}
+
+func (e *Engine) runInteractiveDriveMount(
+	ctx context.Context,
+	profile core.AccountProfile,
+	adcPath string,
+	checkPy string,
+	onAuthRequired func(authURL string) (proceed bool),
+) (bool, string) {
+	nativeWin := e.useWindowsNativeExec()
+	useWSLPaths := runtime.GOOS == "windows" && !nativeWin
+	prefix, err := e.colabPrefixArgs(profile, useWSLPaths)
+	if err != nil {
+		return false, err.Error()
+	}
+	cliArgs := append(prefix, "drivemount", "-s", profile.SessionName, "/content/drive")
+
+	colabExe := "colab"
+	if e.Runner != nil {
+		if p := e.Runner.LookPath("colab"); p != "" {
+			colabExe = p
+		}
+	}
+
+	mountCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	extraEnv := map[string]string{}
+	if adcPath != "" {
+		extraEnv["GOOGLE_APPLICATION_CREDENTIALS"] = adcPath
+	}
+
+	if useWSLPaths {
+		allArgs := append([]string{"colab"}, cliArgs...)
+		escaped := make([]string, len(allArgs))
+		for i, a := range allArgs {
+			escaped[i] = runner.ShellEscapePOSIX(a)
+		}
+		distro := ""
+		if osr, ok := e.Runner.(*runner.OSRunner); ok {
+			distro = osr.WSLDistro
+		}
+		exe, wslArgs := runner.BuildWSLCommand(distro, strings.Join(escaped, " "), extraEnv)
+		cmd = exec.CommandContext(mountCtx, exe, wslArgs...)
+	} else {
+		cmd = exec.CommandContext(mountCtx, colabExe, cliArgs...)
+		cmd.Env = runner.BaseEnvironment(extraEnv)
+	}
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return false, "Google Drive 挂载启动失败，先直接云端运行（成片请记得保存）"
+	}
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		return false, "Google Drive 挂载启动失败，先直接云端运行（成片请记得保存）"
+	}
+
+	chunkCh := make(chan string, 32)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		defer close(chunkCh)
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := pr.Read(buf)
+			if n > 0 {
+				chunkCh <- string(buf[:n])
+			}
+			if rErr != nil {
+				return
+			}
+		}
+	}()
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitErr := cmd.Wait()
+		_ = pw.Close()
+		waitDone <- waitErr
+	}()
+
+	var (
+		accumulated     strings.Builder
+		accMu           sync.Mutex
+		authTriggered   bool
+		pendingURLFound string
+		pendingURLAt    time.Time
+		needAuthHintAt  time.Time
+		authDecisionCh  chan bool
+		timedOutMsg     string
+		waitErr         error
+		processDone     bool
+	)
+
+	preAuthTimeout := 35 * time.Second
+	postAuthTimeout := 45 * time.Second
+	timeoutTimer := time.NewTimer(preAuthTimeout)
+	defer timeoutTimer.Stop()
+
+	flushTicker := time.NewTicker(150 * time.Millisecond)
+	defer flushTicker.Stop()
+
+	triggerAuth := func(authURL string) {
+		authTriggered = true
+		if !timeoutTimer.Stop() {
+			select {
+			case <-timeoutTimer.C:
+			default:
+			}
+		}
+		if onAuthRequired == nil {
+			cancel()
+			timedOutMsg = "Google Drive 需要首次浏览器授权，本次已自动切纯云端继续部署"
+			return
+		}
+		ch := make(chan bool, 1)
+		authDecisionCh = ch
+		go func() {
+			ch <- onAuthRequired(authURL)
+		}()
+	}
+
+	checkAuthPrompt := func(now time.Time) {
+		if authTriggered {
+			return
+		}
+		accMu.Lock()
+		txt := runner.StripCR(accumulated.String())
+		accMu.Unlock()
+
+		if loc := driveAuthURLRegex.FindStringIndex(txt); loc != nil {
+			u := txt[loc[0]:loc[1]]
+			// 若 URL 后面已经出现空白/换行，或者已停顿超过 180ms 未再延长，说明完整 URL 已接收完毕
+			if loc[1] < len(txt) {
+				triggerAuth(u)
+				return
+			}
+			if pendingURLFound != u {
+				pendingURLFound = u
+				pendingURLAt = now
+			} else if now.Sub(pendingURLAt) >= 180*time.Millisecond {
+				triggerAuth(u)
+				return
+			}
+		}
+
+		lower := strings.ToLower(txt)
+		if strings.Contains(lower, "authorization needed") || strings.Contains(lower, "press enter") {
+			if needAuthHintAt.IsZero() {
+				needAuthHintAt = now
+			} else if now.Sub(needAuthHintAt) >= 1500*time.Millisecond && pendingURLFound == "" {
+				triggerAuth("")
+			}
+		}
+	}
+
+	for !processDone {
+		select {
+		case chunk, ok := <-chunkCh:
+			if ok {
+				accMu.Lock()
+				accumulated.WriteString(chunk)
+				accMu.Unlock()
+				checkAuthPrompt(time.Now())
+			}
+		case <-flushTicker.C:
+			checkAuthPrompt(time.Now())
+		case proceed := <-authDecisionCh:
+			authDecisionCh = nil
+			if !proceed {
+				cancel()
+				_ = stdinPipe.Close()
+				<-waitDone
+				_ = pr.Close()
+				<-readDone
+				return false, "已跳过 Google Drive，直接纯云端运行"
+			}
+			_, _ = io.WriteString(stdinPipe, "\n")
+			timeoutTimer.Reset(postAuthTimeout)
+		case <-timeoutTimer.C:
+			timedOutMsg = "Google Drive 挂载等待超时，已自动切纯云端继续部署"
+			cancel()
+		case waitErr = <-waitDone:
+			processDone = true
+		case <-ctx.Done():
+			cancel()
+		}
+	}
+
+	_ = pr.Close()
+	<-readDone
+
+	if timedOutMsg != "" {
+		return false, timedOutMsg
+	}
+
+	accMu.Lock()
+	combined := runner.StripCR(accumulated.String())
+	accMu.Unlock()
+
+	if waitErr != nil {
+		if strings.Contains(combined, "Authorization needed") || strings.Contains(combined, "Press Enter") {
+			return false, "Google Drive 需要首次浏览器授权，本次已自动切纯云端继续部署"
+		}
+		return false, "Google Drive 暂未挂载成功，先直接云端运行（成片请记得保存）"
+	}
+
 	verify := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, checkPy, 20*time.Second)
 	if verify.ExitCode == 0 && strings.Contains(verify.Stdout, "DRIVE_MOUNTED=1") {
 		return true, ""

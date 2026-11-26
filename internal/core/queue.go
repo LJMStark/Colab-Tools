@@ -11,6 +11,7 @@ import (
 const (
 	QueueMaxAttempts                  = 5
 	QueueMaxTotalWait                 = 40 * time.Minute
+	QueuePersistentDefaultHours       = 8
 	QueueMinProvisionBudget           = 15 * time.Second
 	QueueScheduledGraceWindow         = 10 * time.Minute
 	QueueCircuitBreakerCooldown       = 15 * time.Minute
@@ -164,6 +165,14 @@ func EvaluateSchedule(fireAt time.Time, repeatDaily bool, hour, minute int, now 
 	return ScheduleDecision{Kind: ScheduleMissedExpired, NextFireAt: nextDaily}
 }
 
+// EffectivePersistentHours 返回持续守候模式的有效最大守候时长（<=0 默认 8 小时，范围限制在 1..24 小时）。
+func EffectivePersistentHours(acc AccountProfile) int {
+	if acc.QueuePersistentMaxHours <= 0 {
+		return QueuePersistentDefaultHours
+	}
+	return clampInt(acc.QueuePersistentMaxHours, 1, 24)
+}
+
 // NextQueueDelay computes AWS/Google Equal Jitter backoff delay, returning (0, false) when caps are exhausted.
 func NextQueueDelay(completedAttempts int, startedAt, now time.Time, unitRandom float64) (time.Duration, bool) {
 	if completedAttempts < 1 || completedAttempts >= QueueMaxAttempts {
@@ -181,6 +190,35 @@ func NextQueueDelay(completedAttempts int, startedAt, now time.Time, unitRandom 
 		elapsed = 0
 	}
 	if elapsed+delaySec > QueueMaxTotalWait.Seconds() {
+		return 0, false
+	}
+	return time.Duration(delaySec) * time.Second, true
+}
+
+// NextQueueDelayForMode 根据标准模式或持续守候模式计算下一轮排队退避时间。
+// 休眠唤醒后只检查实际总经过时长 elapsed，不补发积压请求。
+func NextQueueDelayForMode(completedAttempts int, startedAt, now time.Time, unitRandom float64, persistent bool, maxHours int) (time.Duration, bool) {
+	if !persistent {
+		return NextQueueDelay(completedAttempts, startedAt, now, unitRandom)
+	}
+	if completedAttempts < 1 {
+		return 0, false
+	}
+	r := math.Min(1.0, math.Max(0.0, unitRandom))
+	var delaySec float64
+	if completedAttempts <= 3 {
+		capSec := QueueRoundBaseDelays[completedAttempts-1].Seconds()
+		delaySec = math.Round((capSec / 2.0) + r*(capSec/2.0))
+	} else {
+		// 第 4 轮及之后：采用 8~12 分钟/轮（480s..720s）随机间隔
+		delaySec = math.Round(480.0 + r*240.0)
+	}
+	maxWait := time.Duration(clampInt(maxHours, 1, 24)) * time.Hour
+	elapsed := now.Sub(startedAt).Seconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	if elapsed+delaySec > maxWait.Seconds() {
 		return 0, false
 	}
 	return time.Duration(delaySec) * time.Second, true

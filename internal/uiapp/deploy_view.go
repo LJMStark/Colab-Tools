@@ -196,6 +196,9 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 			m.renderCustomGPUStrategyDetails(c, pal, acc)
 		}
+
+		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+		m.renderPersistentQueueSection(c, pal, acc)
 	})
 
 	// Block B: Video Drive & ComfyUI Options or LLM Coding Tool Integrations

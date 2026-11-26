@@ -73,11 +73,24 @@ func main() {
 		var tooltip string
 		switch {
 		case st.Queuing:
-			title = fmt.Sprintf(" 抢卡 %d/%d", st.QueueAttempt, st.QueueMax)
-			if st.TargetsSummary != "" {
-				tooltip = fmt.Sprintf("Colab Tools v%s — 正在抢卡第 %d/%d 轮（%s）", app.AppVersion, st.QueueAttempt, st.QueueMax, st.TargetsSummary)
+			if st.QueuePersistent {
+				maxH := st.QueueMaxHours
+				if maxH <= 0 {
+					maxH = 8
+				}
+				title = fmt.Sprintf(" 守候 第%d轮", st.QueueAttempt)
+				if st.TargetsSummary != "" {
+					tooltip = fmt.Sprintf("Colab Tools v%s — 持续守候第 %d 轮（上限 %dh · %s）", app.AppVersion, st.QueueAttempt, maxH, st.TargetsSummary)
+				} else {
+					tooltip = fmt.Sprintf("Colab Tools v%s — 持续守候第 %d 轮（上限 %dh）", app.AppVersion, st.QueueAttempt, maxH)
+				}
 			} else {
-				tooltip = fmt.Sprintf("Colab Tools v%s — 正在抢卡第 %d/%d 轮", app.AppVersion, st.QueueAttempt, st.QueueMax)
+				title = fmt.Sprintf(" 抢卡 %d/%d", st.QueueAttempt, st.QueueMax)
+				if st.TargetsSummary != "" {
+					tooltip = fmt.Sprintf("Colab Tools v%s — 正在抢卡第 %d/%d 轮（%s）", app.AppVersion, st.QueueAttempt, st.QueueMax, st.TargetsSummary)
+				} else {
+					tooltip = fmt.Sprintf("Colab Tools v%s — 正在抢卡第 %d/%d 轮", app.AppVersion, st.QueueAttempt, st.QueueMax)
+				}
 			}
 		case st.Deploying || st.Starting:
 			if st.Deploying && st.HardwareLabel != "" {

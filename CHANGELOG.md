@@ -3,6 +3,22 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.14] - 2026-11-26
+
+### Fixed
+- **彻底修复 ComfyUI 本机加密通道打不开 / 卡死占坑（4 秒直通 + 自动兜底）**:
+  - 修复 `startSSHTunnelProcess` 缺失 `root@` 与 `BatchMode=yes` 导致 OpenSSH 默认拿本机 Mac 用户名登录云端并卡死在密码提示、且僵尸连接占据 Google 唯一 SSH 名额（`Already-active SSH session HTTP 429`）的根本缺陷；
+  - 建隧道前自动检测本机 SSH 密钥（若小白电脑无密钥自动静默生成 `ed25519` 密钥对，绝不覆盖已有密钥），连接超时放宽至 22 秒并实测 HTTP `/queue` 穿透畅通后再弹出浏览器；
+  - 按钮进入「连接中…」防连点，遇旧隧道残留自动清理同会话残留进程并重连；若本机 SSH 隧道二次仍不通，自动在云端拉起 `cloudflared` 安全临时链接直接替用户打开 ComfyUI。
+
+### Added
+- **小白直达操作弹窗（需要用户操作直接弹窗，绝不甩晦涩报错）**:
+  - Google Drive 挂载需要浏览器点击「允许」时，自动弹出居中操作向导并打开 Google 授权页，点完允许按「我已点完允许，继续」自动完成挂载（或一键跳过纯云端跑）；
+  - 仅在所有通道全失败时弹出大白话修复弹窗（一键重连 / 重启画布 / 打开 Colab 网页）；点「开 ComfyUI」若机器未开机或裸机未装好，直接替用户一键拉起开机或自动部署。
+- **低频持续守候模式（默认 8 小时封顶 · 8–12 分钟/轮防风控）**:
+  - 挑卡策略与排队横幅新增 **「抢不到就持续守候」** 开关，支持 `4h / 8h（推荐）/ 12h` 封顶；前 3 轮沿用 `3m / 6m / 9m` 探路，第 4 轮起平稳保持 **8–12 分钟/轮** 随机低频探测；
+  - 内置四道硬安全阀：遇 `429` / `abusive` 立刻熔断停手、遇 `401/403`/多机 `412` 立刻停手、休眠唤醒不补发积压、开启持续守候自动补开「空闲自动关机」防半夜抢到无人看管烧点。
+
 ## [0.3.13] - 2026-11-26
 
 ### Added

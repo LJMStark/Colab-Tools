@@ -344,6 +344,62 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 	}
 }
 
+func (m *MainUI) renderPersistentQueueSection(c *ui.Context, pal Palette, acc core.AccountProfile) {
+	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
+	applyToggle := func(next bool) {
+		cp := acc
+		cp.QueuePersistentMode = next
+		if cp.QueuePersistentMaxHours <= 0 {
+			cp.QueuePersistentMaxHours = 8
+		}
+		if next && !cp.AutoShutdownEnabled {
+			cp.AutoShutdownEnabled = true
+			if isVideo {
+				cp.StopAfterQueueDrained = true
+			}
+		}
+		m.Svc.UpdateAccount(cp)
+	}
+
+	persistentOn := acc.QueuePersistentMode
+	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+		ui.Column(c).Grow(1).Gap(2).Cursor(ui.CursorPointer).OnClick(func() {
+			applyToggle(!acc.QueuePersistentMode)
+		}).Children(func() {
+			ui.Text(c, "抢不到就持续守候（低频挂机，直到抢到为止）").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
+			ui.Text(c, "前 3 轮快速试，之后每 8–12 分钟探一次防风控；遇限流立刻停，抢到自动开启闲置关机").FontSize(11.5).TextColor(pal.TextMuted)
+		})
+		if ui.Switch(c, &persistentOn).Clicked() || persistentOn != acc.QueuePersistentMode {
+			applyToggle(persistentOn)
+		}
+	})
+
+	if acc.QueuePersistentMode {
+		curHours := acc.QueuePersistentMaxHours
+		if curHours <= 0 {
+			curHours = 8
+		}
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "守候封顶时长：").FontSize(12).TextColor(pal.TextMuted)
+			for _, opt := range []struct {
+				hours int
+				label string
+			}{
+				{4, "4 小时"},
+				{8, "8 小时（推荐）"},
+				{12, "12 小时"},
+			} {
+				hOpt := opt
+				m.compactOverlayChip(c, pal, hOpt.label, curHours == hOpt.hours, func() {
+					cp := acc
+					cp.QueuePersistentMaxHours = hOpt.hours
+					m.Svc.UpdateAccount(cp)
+				})
+			}
+		})
+	}
+}
+
 func (m *MainUI) adjustScheduleMinutes(acc core.AccountProfile, delta int) {
 	total := (acc.ScheduledStartHour*60 + acc.ScheduledStartMinute + delta) % (24 * 60)
 	if total < 0 {

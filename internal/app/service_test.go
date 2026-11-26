@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -460,18 +461,23 @@ func TestDeployTruthfulnessAndOpenComfyUIGuards(t *testing.T) {
 			}
 			return runner.Result{ExitCode: 0}
 		},
-		onShell: func(cmd string) runner.Result {
+		onShellOpts: func(cmd string, opts runner.RunOptions) runner.Result {
 			if strings.Contains(cmd, "exec") {
+				if strings.Contains(opts.Stdin, "DEPLOY_LAUNCHED") {
+					return runner.Result{ExitCode: 0, Stdout: "DEPLOY_LAUNCHED=1\n"}
+				}
 				return runner.Result{ExitCode: 0, Stdout: telStdout}
 			}
 			return runner.Result{ExitCode: 0}
 		},
 	}
 	svc := NewService(true)
+	defer svc.Shutdown()
 	svc.Engine = colab.NewEngine(fr, svc.Vault)
 	acc := core.NewDefaultAccountProfile("VideoUser", "video@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
 	acc.DeployRecipe = core.RecipeH3Video
 	acc.H3Variant = core.H3VariantOriginal
+	acc.UseGoogleDrive = false
 	svc.Settings.Accounts = []core.AccountProfile{acc}
 	svc.Settings.SelectedAccountID = acc.ID
 
@@ -483,7 +489,7 @@ func TestDeployTruthfulnessAndOpenComfyUIGuards(t *testing.T) {
 		mu.Unlock()
 	}
 
-	// 1. Bare running L4 machine (uninstalled) -> OpenComfyUI refuses immediately with clear Chinese hint, never tries SSH tunnel
+	// 1. Bare running L4 machine (uninstalled) -> OpenComfyUI automatically kicks off deploy instead of just hinting
 	rt := core.NewAccountRuntimeState()
 	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
 	rt.ActiveEndpoint = "ep-l4-bare"
@@ -495,21 +501,38 @@ func TestDeployTruthfulnessAndOpenComfyUIGuards(t *testing.T) {
 	svc.Runtime[acc.ID] = rt
 
 	svc.OpenComfyUI(acc.ID)
-	if !strings.Contains(svc.ToastMessage, "尚未安装 ComfyUI") {
-		t.Fatalf("expected bare-machine OpenComfyUI hint, got %q", svc.ToastMessage)
+	svc.mu.RLock()
+	bareToast := svc.ToastMessage
+	svc.mu.RUnlock()
+	if !strings.Contains(bareToast, "自动安装 ComfyUI") {
+		t.Fatalf("expected bare-machine OpenComfyUI to auto-start install, got %q", bareToast)
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !svc.StateFor(acc.ID).DeployRunning {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !svc.StateFor(acc.ID).DeployRunning {
+		t.Fatalf("expected bare-machine OpenComfyUI to set DeployRunning=true, got %+v", svc.StateFor(acc.ID))
+	}
+	svc.cancelDeployWatcher(acc.ID)
 	if hasWarn, warn := rt.HasVRAMWarningForRecipe(acc); !hasWarn || !strings.Contains(warn, "轻量 GGUF") {
 		t.Fatalf("expected L4+31B VRAM warning, got (%v, %q)", hasWarn, warn)
 	}
 
 	// 2. Actively deploying -> OpenComfyUI reports live percentage instead of opening tunnel
+	svc.mu.Lock()
+	rt = svc.Runtime[acc.ID]
 	rt.DeployRunning = true
 	rt.WorkloadMetricValue = "35%"
 	rt.WorkloadMetricUnit = "装环境"
 	svc.Runtime[acc.ID] = rt
+	svc.mu.Unlock()
 	svc.OpenComfyUI(acc.ID)
-	if !strings.Contains(svc.ToastMessage, "正在自动部署中") || !strings.Contains(svc.ToastMessage, "35%") {
-		t.Fatalf("expected deploying OpenComfyUI progress hint, got %q", svc.ToastMessage)
+	svc.mu.RLock()
+	depToast := svc.ToastMessage
+	svc.mu.RUnlock()
+	if !strings.Contains(depToast, "正在自动部署中") || !strings.Contains(depToast, "35%") {
+		t.Fatalf("expected deploying OpenComfyUI progress hint, got %q", depToast)
 	}
 
 	// 3. Remote status.json reports deploy failure -> ServerHealthy MUST remain false, DeployFailed becomes true, notified once
@@ -530,8 +553,11 @@ func TestDeployTruthfulnessAndOpenComfyUIGuards(t *testing.T) {
 	mu.Unlock()
 
 	svc.OpenComfyUI(acc.ID)
-	if !strings.Contains(svc.ToastMessage, "部署中断") {
-		t.Fatalf("expected deploy-failed OpenComfyUI hint, got %q", svc.ToastMessage)
+	svc.mu.RLock()
+	failToast := svc.ToastMessage
+	svc.mu.RUnlock()
+	if !strings.Contains(failToast, "部署中断") {
+		t.Fatalf("expected deploy-failed OpenComfyUI hint, got %q", failToast)
 	}
 }
 
@@ -839,4 +865,262 @@ func TestCrossModelFallbackDoesNotMutateAccountAndQuickActions(t *testing.T) {
 		t.Fatalf("expected SwitchToLightGGUFAndStart to clear error, got %q", svc.StateFor(acc.ID).LastError)
 	}
 	svc.CancelQueue(acc.ID)
+}
+
+type fakeInteractiveColabRunner struct {
+	mu       sync.Mutex
+	colabExe string
+	mounted  bool
+	cfURL    string
+}
+
+func (f *fakeInteractiveColabRunner) Run(_ context.Context, _ string, _ []string, _ runner.RunOptions) runner.Result {
+	return runner.Result{}
+}
+
+func (f *fakeInteractiveColabRunner) RunShell(_ context.Context, shellCmd string, opts runner.RunOptions) runner.Result {
+	f.mu.Lock()
+	mounted := f.mounted
+	cfURL := f.cfURL
+	f.mu.Unlock()
+	if strings.Contains(opts.Stdin, "DRIVE_MOUNTED=1") || strings.Contains(shellCmd, "DRIVE_MOUNTED=1") {
+		if mounted {
+			return runner.Result{ExitCode: 0, Stdout: "DRIVE_MOUNTED=1\n"}
+		}
+		return runner.Result{ExitCode: 0, Stdout: "DRIVE_MOUNTED=0\n"}
+	}
+	if strings.Contains(opts.Stdin, "CLOUDFLARED_URL=") || strings.Contains(shellCmd, "CLOUDFLARED_URL=") {
+		if cfURL != "" {
+			return runner.Result{ExitCode: 0, Stdout: "CLOUDFLARED_URL=" + cfURL + "\n"}
+		}
+		return runner.Result{ExitCode: 1, Stderr: "cloudflared unavailable"}
+	}
+	if strings.Contains(shellCmd, "'url'") || strings.Contains(shellCmd, " url ") {
+		return runner.Result{ExitCode: 0, Stdout: "https://colab.research.google.com/drive/demo\n"}
+	}
+	return runner.Result{ExitCode: 0, Stdout: "DEPLOY_LAUNCHED=1\n"}
+}
+
+func (f *fakeInteractiveColabRunner) RunStreamingShell(_ context.Context, _ string, _ time.Duration, _ func(string)) runner.Result {
+	return runner.Result{}
+}
+
+func (f *fakeInteractiveColabRunner) LookPath(name string) string {
+	if name == "colab" {
+		return f.colabExe
+	}
+	return ""
+}
+
+func TestActionPromptLifecycle_PersistentAutoShutdown_AndComfyFallback(t *testing.T) {
+	// 1. ActionPrompt lifecycle for Drive Auth (open_url keeps modal, primary confirms, secondary skips)
+	tmpDir := t.TempDir()
+	fakeColab := filepath.Join(tmpDir, "colab")
+	script := `#!/bin/sh
+echo "REQUIRED: Google Drive Authorization needed"
+echo "https://accounts.google.com/o/oauth2/auth?client_id=drive123"
+echo "Press Enter to continue"
+read line
+exit 0
+`
+	if err := os.WriteFile(fakeColab, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeInteractiveColabRunner{colabExe: fakeColab}
+
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	var openedMu sync.Mutex
+	var openedURLs []string
+	svc.URLOpener = func(u string) {
+		openedMu.Lock()
+		openedURLs = append(openedURLs, u)
+		openedMu.Unlock()
+	}
+
+	acc := core.NewDefaultAccountProfile("DriveUser", "drive@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.UseGoogleDrive = true
+	acc.DeployRecipe = core.RecipeH3Video
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-drive"
+	svc.Runtime[acc.ID] = rt
+
+	doneDeploy := make(chan struct{})
+	go func() {
+		defer close(doneDeploy)
+		svc.launchVideoDeployFlow(acc)
+	}()
+
+	var prompt *core.UserActionPrompt
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if prompt = svc.CurrentActionPrompt(); prompt != nil {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if prompt == nil || prompt.Kind != core.PromptDriveAuth || !strings.Contains(prompt.URL, "accounts.google.com") {
+		t.Fatalf("expected PromptDriveAuth to pop up, got %+v", prompt)
+	}
+
+	// open_url re-opens URL without dismissing modal
+	svc.ResolveActionPrompt("open_url")
+	if svc.CurrentActionPrompt() == nil {
+		t.Fatal("open_url must not dismiss PromptDriveAuth modal")
+	}
+	openedMu.Lock()
+	if len(openedURLs) < 2 {
+		t.Fatalf("expected URLOpener called on popup and open_url, got %+v", openedURLs)
+	}
+	openedMu.Unlock()
+
+	// primary proceeds and finishes mount
+	fr.mu.Lock()
+	fr.mounted = true
+	fr.mu.Unlock()
+	svc.ResolveActionPrompt("primary")
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatal("primary must dismiss PromptDriveAuth modal")
+	}
+	<-doneDeploy
+	svc.cancelDeployWatcher(acc.ID)
+
+	// Skip branch ("secondary")
+	fr.mu.Lock()
+	fr.mounted = false
+	fr.mu.Unlock()
+	svc.mu.Lock()
+	rt = svc.Runtime[acc.ID]
+	rt.DeployRunning = false
+	svc.Runtime[acc.ID] = rt
+	svc.mu.Unlock()
+
+	doneSkip := make(chan struct{})
+	go func() {
+		defer close(doneSkip)
+		svc.launchVideoDeployFlow(acc)
+	}()
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && svc.CurrentActionPrompt() == nil {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if svc.CurrentActionPrompt() == nil {
+		t.Fatal("expected second PromptDriveAuth before skip")
+	}
+	svc.ResolveActionPrompt("secondary")
+	<-doneSkip
+	svc.cancelDeployWatcher(acc.ID)
+
+	// 2. Persistent mode auto-enables AutoShutdownEnabled & populates PhaseQueuing
+	pAcc := core.NewDefaultAccountProfile("NightGuard", "ng@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	pAcc.AutoShutdownEnabled = false
+	pAcc.QueuePersistentMode = true
+	pAcc.QueuePersistentMaxHours = 8
+	svc.Settings.Accounts = append(svc.Settings.Accounts, pAcc)
+	svc.Runtime[pAcc.ID] = core.NewAccountRuntimeState()
+
+	blockQueue := make(chan struct{})
+	qRunner := &fakeRunner{}
+	qRunner.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "--gpu") {
+			<-blockQueue
+			return runner.Result{ExitCode: 1, Stderr: "503 Service Unavailable"}
+		}
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		}
+		return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+	}
+	svc.Engine = colab.NewEngine(qRunner, svc.Vault)
+	svc.StartAccountSession(pAcc.ID)
+
+	gotAcc, _ := svc.accountByID(pAcc.ID)
+	if !gotAcc.AutoShutdownEnabled {
+		t.Fatal("QueuePersistentMode must automatically enable AutoShutdownEnabled on start")
+	}
+	qRT := svc.StateFor(pAcc.ID)
+	if !qRT.Phase.IsQueuing() || !qRT.Phase.QueuePersistent || qRT.Phase.QueueMaxHours != 8 {
+		t.Fatalf("expected persistent PhaseQueuing metadata, got %+v", qRT.Phase)
+	}
+	tray := svc.TrayLiveStatus()
+	if !tray.Queuing || !tray.QueuePersistent || tray.QueueMaxHours != 8 {
+		t.Fatalf("expected persistent queue fields in TrayLiveStatus, got %+v", tray)
+	}
+	svc.CancelQueue(pAcc.ID)
+	close(blockQueue)
+
+	// 3. OpenComfyUI: SSH 2 failures -> auto cloudflared fallback; all fail -> PromptComfyHelp
+	svcComfy := NewService(true)
+	defer svcComfy.Shutdown()
+	svcComfy.NotifySender = func(_, _ string) {}
+	svcComfy.URLOpener = func(u string) {
+		openedMu.Lock()
+		openedURLs = append(openedURLs, u)
+		openedMu.Unlock()
+	}
+	svcComfy.comfyTunnelWaitTimeout = 60 * time.Millisecond
+	svcComfy.comfyRetryPause = 10 * time.Millisecond
+	svcComfy.sshStarter = func(_ *runner.OSRunner, _ core.AccountProfile, _ int, _ int, _ string) (*exec.Cmd, *tunnelStderrBuffer, error) {
+		buf := &tunnelStderrBuffer{}
+		_, _ = buf.Write([]byte("Already-active SSH session (HTTP 429)"))
+		cmd := exec.Command("sh", "-c", "exit 1")
+		_ = cmd.Start()
+		return cmd, buf, nil
+	}
+
+	fr.mu.Lock()
+	fr.cfURL = "https://auto-rescue-comfy.trycloudflare.com"
+	fr.mu.Unlock()
+	svcComfy.Engine = colab.NewEngine(fr, svcComfy.Vault)
+	svcComfy.Settings.Accounts = []core.AccountProfile{acc}
+	svcComfy.Settings.SelectedAccountID = acc.ID
+
+	openedMu.Lock()
+	openedURLs = nil
+	openedMu.Unlock()
+	svcComfy.mu.Lock()
+	rt = core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-ssh-fail"
+	rt.ServerHealthy = true
+	rt.DeployRunning = false
+	rt.DeployFailed = false
+	rt.SSHTunnelActive = false
+	rt.ActiveSSHTunnelPort = nil
+	svcComfy.Runtime[acc.ID] = rt
+	svcComfy.mu.Unlock()
+
+	svcComfy.OpenComfyUI(acc.ID)
+	openedMu.Lock()
+	hasCF := len(openedURLs) > 0 && openedURLs[len(openedURLs)-1] == "https://auto-rescue-comfy.trycloudflare.com"
+	openedMu.Unlock()
+	if !hasCF {
+		t.Fatalf("expected OpenComfyUI to fall back to cloudflared URL, got openedURLs=%+v", openedURLs)
+	}
+	if svcComfy.StateFor(acc.ID).ComfyOpening {
+		t.Fatal("ComfyOpening must reset to false after OpenComfyUI finishes")
+	}
+
+	// All channels fail -> PromptComfyHelp with plain-Chinese guidance (never 8188 jargon)
+	fr.mu.Lock()
+	fr.cfURL = ""
+	fr.mu.Unlock()
+	svcComfy.OpenComfyUI(acc.ID)
+	helpPrompt := svcComfy.CurrentActionPrompt()
+	if helpPrompt == nil || helpPrompt.Kind != core.PromptComfyHelp {
+		t.Fatalf("expected PromptComfyHelp when both SSH and cloudflared fail, got %+v", helpPrompt)
+	}
+	if strings.Contains(helpPrompt.Message, "8188") {
+		t.Fatalf("PromptComfyHelp must avoid technical 8188 port jargon, got %q", helpPrompt.Message)
+	}
+	svcComfy.ResolveActionPrompt("cancel")
+	if svcComfy.CurrentActionPrompt() != nil {
+		t.Fatal("cancel must dismiss PromptComfyHelp")
+	}
 }

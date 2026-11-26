@@ -295,6 +295,13 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 						st = "运行良好"
 						col = pal.Emerald
 					}
+				} else if rt.Phase.IsQueuing() {
+					if rt.Phase.QueuePersistent {
+						st = fmt.Sprintf("守候 第%d轮", rt.Phase.QueueAttempt)
+					} else {
+						st = fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
+					}
+					col = pal.Amber
 				}
 				ui.Text(c, st).FontSize(13).FontWeight(600).TextColor(col).Padding(0, 0, 4, 0)
 			})
@@ -414,7 +421,11 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 							})
 						}
 					} else {
-						p.popoverQuickBtn(c, pal, "打开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
+						comfyLabel := "打开 ComfyUI"
+						if rt.ComfyOpening {
+							comfyLabel = "连接中…"
+						}
+						p.popoverQuickBtn(c, pal, comfyLabel, (rt.Phase.IsRunning() && rt.ServerHealthy) || rt.ComfyOpening, !rt.Phase.IsRunning() || rt.ComfyOpening, func() {
 							go p.Svc.OpenComfyUI(acc.ID)
 						})
 					}

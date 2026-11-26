@@ -2,6 +2,8 @@ package colab_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -250,5 +252,87 @@ func TestProvisionSession_HighMem503FallbackToStandardRAM(t *testing.T) {
 	res2 := eng2.ProvisionSession(context.Background(), acc, nil, nil, nil, nil)
 	if res2.Outcome.Kind != core.OutcomeAllocated || res2.Outcome.Hardware != "L4" || res2.UsedStandardRAM {
 		t.Fatalf("expected L4 --high-mem allocation after G4 standard fallback 503, got %+v", res2)
+	}
+}
+
+type driveTestRunner struct {
+	colabExe string
+	mounted  bool
+}
+
+func (d *driveTestRunner) Run(_ context.Context, _ string, _ []string, _ runner.RunOptions) runner.Result {
+	return runner.Result{}
+}
+
+func (d *driveTestRunner) RunShell(_ context.Context, shellCmd string, _ runner.RunOptions) runner.Result {
+	if strings.Contains(shellCmd, "exec") {
+		if d.mounted {
+			return runner.Result{ExitCode: 0, Stdout: "DRIVE_MOUNTED=1\n"}
+		}
+		return runner.Result{ExitCode: 0, Stdout: "DRIVE_MOUNTED=0\n"}
+	}
+	return runner.Result{}
+}
+
+func (d *driveTestRunner) RunStreamingShell(_ context.Context, _ string, _ time.Duration, _ func(string)) runner.Result {
+	return runner.Result{}
+}
+
+func (d *driveTestRunner) LookPath(name string) string {
+	if name == "colab" {
+		return d.colabExe
+	}
+	return ""
+}
+
+func TestEnsureCloudflaredFallbackURLAndDriveMountInteractive(t *testing.T) {
+	// 1. EnsureCloudflaredFallbackURL extracts valid trycloudflare URL
+	mr := &mockRunner{}
+	mr.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "exec") {
+			return runner.Result{ExitCode: 0, Stdout: "CLOUDFLARED_URL=https://comfy-fallback-demo.trycloudflare.com\n"}
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	eng := colab.NewEngine(mr, vault.New(vault.NewMemoryBackend()))
+	acc := core.NewDefaultAccountProfile("CF", "cf@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	cfURL, err := eng.EnsureCloudflaredFallbackURL(context.Background(), acc, 8188)
+	if err != nil || cfURL != "https://comfy-fallback-demo.trycloudflare.com" {
+		t.Fatalf("expected trycloudflare URL, got %q err=%v", cfURL, err)
+	}
+
+	// 2. EnsureDriveMountedInteractive triggers auth callback, writes Enter on proceed=true, and verifies mount
+	tmpDir := t.TempDir()
+	fakeColab := filepath.Join(tmpDir, "colab")
+	script := `#!/bin/sh
+echo "REQUIRED: Google Drive Authorization needed"
+echo "https://accounts.google.com/o/oauth2/auth?client_id=test123"
+echo "Press Enter to continue"
+read line
+exit 0
+`
+	if err := os.WriteFile(fakeColab, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dr := &driveTestRunner{colabExe: fakeColab, mounted: false}
+	engDrive := colab.NewEngine(dr, vault.New(vault.NewMemoryBackend()))
+
+	var gotURL string
+	ok, reason := engDrive.EnsureDriveMountedInteractive(context.Background(), acc, func(authURL string) bool {
+		gotURL = authURL
+		dr.mounted = true
+		return true
+	})
+	if !ok || reason != "" || gotURL != "https://accounts.google.com/o/oauth2/auth?client_id=test123" {
+		t.Fatalf("expected interactive drive mount success, got ok=%v reason=%q url=%q", ok, reason, gotURL)
+	}
+
+	// 3. EnsureDriveMountedInteractive skips cleanly when user returns false
+	dr.mounted = false
+	ok2, reason2 := engDrive.EnsureDriveMountedInteractive(context.Background(), acc, func(authURL string) bool {
+		return false
+	})
+	if ok2 || !strings.Contains(reason2, "跳过 Google Drive") {
+		t.Fatalf("expected interactive drive mount skip, got ok=%v reason=%q", ok2, reason2)
 	}
 }

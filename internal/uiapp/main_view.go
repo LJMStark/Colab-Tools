@@ -163,6 +163,9 @@ func (m *MainUI) View(c *ui.Context) {
 	if m.ShowDeployLog {
 		m.renderDeployLogOverlay(c, pal)
 	}
+	if prompt := m.Svc.CurrentActionPrompt(); prompt != nil {
+		m.renderActionPromptOverlay(c, pal, prompt)
+	}
 
 	// Floating bottom-right toast banner (non-blocking PassThrough so clicks underneath always work)
 	if toast := m.Svc.ToastMessage; toast != "" {
@@ -316,6 +319,88 @@ func (m *MainUI) renderDeployLogOverlay(c *ui.Context, pal Palette) {
 	})
 }
 
+func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *core.UserActionPrompt) {
+	if prompt == nil {
+		return
+	}
+	ui.Overlay(c, func() {
+		ui.Box(c).Absolute().Top(0).Left(0).Right(0).Bottom(0).
+			Background(ui.RGBA(0, 0, 0, 0.50))
+
+		ui.Column(c).Absolute().Top(0).Left(0).Right(0).Bottom(0).
+			PassThrough().
+			Padding(16, 24).
+			AlignItems(ui.Center).
+			Justify(ui.Center).
+			Children(func() {
+				PrecisionCard(c, pal, 20, 22, func() {
+					led := pal.Amber
+					if prompt.Kind == core.PromptComfyHelp {
+						led = pal.Sky
+					}
+					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+						DrawPrecisionLED(c, led, 13)
+						ui.Text(c, prompt.Title).FontSize(16.5).Bold().TextColor(pal.TextPrimary).Grow(1)
+					})
+
+					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+
+					ui.Column(c).FillWidth().Gap(10).Children(func() {
+						ui.Text(c, prompt.Message).FontSize(13.5).TextColor(pal.TextPrimary)
+						if prompt.URL != "" && prompt.Kind == core.PromptDriveAuth {
+							ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+								SmallActionButton(c, pal, "浏览器没弹出？点此重新打开授权页", &pal.Sky, false, func() {
+									m.Svc.ResolveActionPrompt("open_url")
+								})
+							})
+						}
+					})
+
+					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+
+					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+						if prompt.CancelLabel != "" {
+							SmallActionButton(c, pal, prompt.CancelLabel, nil, false, func() {
+								m.Svc.ResolveActionPrompt("cancel")
+							})
+						}
+						ui.Spacer(c)
+						if prompt.SecondaryLabel != "" {
+							PillButton(c, pal, prompt.SecondaryLabel, false, false, func() {
+								m.Svc.ResolveActionPrompt("secondary")
+							})
+						}
+						if prompt.PrimaryLabel != "" {
+							actionModalPrimaryButton(c, pal, prompt.PrimaryLabel, func() {
+								m.Svc.ResolveActionPrompt("primary")
+							})
+						}
+					})
+				}).Width(540).Gap(14).
+					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.45))
+			})
+	})
+}
+
+func actionModalPrimaryButton(c *ui.Context, pal Palette, label string, onClick func()) {
+	el := ui.Row(c).
+		Height(36).
+		Padding(0, 18).
+		Radius(9).
+		Gap(6).
+		Shrink(0).
+		AlignItems(ui.Center).
+		Justify(ui.Center)
+
+	if onClick != nil {
+		el.OnClick(onClick)
+	}
+	styleAmberMetallicButton(el, pal, false)
+	el.Children(func() {
+		ui.Text(c, label).FontSize(13.5).FontWeight(600).TextColor(pal.PrimaryBtnFg).MaxLines(1)
+	})
+}
+
 func (m *MainUI) centeredWorkbench(c *ui.Context, fn func()) {
 	ui.Column(c).FillWidth().AlignItems(ui.Center).Children(func() {
 		ui.Column(c).FillWidth().MaxWidth(920).Gap(16).Children(fn)
@@ -446,6 +531,9 @@ func (m *MainUI) topRightPill(pal Palette) (ui.Color, string) {
 	for _, a := range m.Svc.AccountsSnapshot() {
 		rt := m.Svc.StateFor(a.ID)
 		if rt.Phase.IsQueuing() {
+			if rt.Phase.QueuePersistent {
+				return pal.Amber, fmt.Sprintf("守候 第%d轮", rt.Phase.QueueAttempt)
+			}
 			return pal.Amber, fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
 		}
 	}
@@ -518,6 +606,19 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 			rem := max(0, int(math.Ceil(time.Until(*rt.Phase.NextRetryAt).Seconds())))
 			countdown = fmt.Sprintf("暂未有货，%02d:%02d 后自动再试下一轮", rem/60, rem%60)
 		}
+		headline := fmt.Sprintf("自动排队抢卡中 · 第 %d/%d 轮（%s）· %s", rt.Phase.QueueAttempt, rt.Phase.QueueMax, rt.Phase.TargetsSummary, countdown)
+		subline := "可以关掉或切走窗口去忙别的，顶部菜单栏会实时显示进度，抢到/装好或未抢到都会弹窗响铃通知你。"
+		if rt.Phase.QueuePersistent {
+			maxH := rt.Phase.QueueMaxHours
+			if maxH <= 0 {
+				maxH = acc.QueuePersistentMaxHours
+				if maxH <= 0 {
+					maxH = 8
+				}
+			}
+			headline = fmt.Sprintf("持续守候抢卡中 · 守候 第 %d 轮（上限 %dh）· %s · %s", rt.Phase.QueueAttempt, maxH, rt.Phase.TargetsSummary, countdown)
+			subline = "已进入低频防风控守候（约 8–12 分钟/轮），遇限流立刻保护停机，抢到后自动开启闲置关机并响铃通知你。"
+		}
 		ui.Row(c).FillWidth().Padding(11, 14, 11, 18).Radius(14).
 			Background(WithAlpha(pal.Amber, 0.11)).
 			Border(1, WithAlpha(pal.Amber, 0.30)).
@@ -528,11 +629,25 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 			AlignItems(ui.Center).Gap(10).Children(func() {
 			DrawPrecisionLED(c, pal.Amber, 12)
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
-				ui.Textf(c, "自动排队抢卡中 · 第 %d/%d 轮（%s）· %s", rt.Phase.QueueAttempt, rt.Phase.QueueMax, rt.Phase.TargetsSummary, countdown).
+				ui.Text(c, headline).
 					FontSize(13).FontWeight(500).FontFeatures("tnum").TextColor(pal.TextPrimary)
-				ui.Text(c, "可以关掉或切走窗口去忙别的，顶部菜单栏会实时显示进度，抢到/装好或未抢到都会弹窗响铃通知你。").
+				ui.Text(c, subline).
 					FontSize(11.5).TextColor(pal.TextMuted)
 			})
+			if !rt.Phase.QueuePersistent && !acc.QueuePersistentMode {
+				SmallActionButton(c, pal, "切持续守候", &pal.Amber, false, func() {
+					cp := acc
+					cp.QueuePersistentMode = true
+					if cp.QueuePersistentMaxHours <= 0 {
+						cp.QueuePersistentMaxHours = 8
+					}
+					if !cp.AutoShutdownEnabled {
+						cp.AutoShutdownEnabled = true
+					}
+					m.Svc.UpdateAccount(cp)
+					m.Svc.ShowToast(fmt.Sprintf("已切为持续守候，下轮起将延续至 %d 小时（无需取消重来）", cp.QueuePersistentMaxHours))
+				})
+			}
 			SmallActionButton(c, pal, "取消排队", &pal.Coral, false, func() {
 				m.Svc.CancelQueue(acc.ID)
 			})
@@ -734,9 +849,21 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 		}
 		sub = core.FormatDuration(rt.SessionUptimeSec)
 	case core.PhaseQueuing:
-		statusWord = fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
+		if rt.Phase.QueuePersistent {
+			maxH := rt.Phase.QueueMaxHours
+			if maxH <= 0 {
+				maxH = acc.QueuePersistentMaxHours
+				if maxH <= 0 {
+					maxH = 8
+				}
+			}
+			statusWord = fmt.Sprintf("守候 第 %d 轮（上限 %dh）", rt.Phase.QueueAttempt, maxH)
+			sub = ""
+		} else {
+			statusWord = fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
+			sub = rt.Phase.TargetsSummary
+		}
 		statusTint = pal.Amber
-		sub = rt.Phase.TargetsSummary
 	case core.PhaseStarting:
 		statusWord = "启动中"
 		statusTint = pal.Amber
@@ -764,12 +891,14 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 				ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
 				ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, statusWord).FontSize(12.5).FontWeight(600).TextColor(statusTint).MaxLines(1)
-					ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
-					subCol := pal.TextMuted
-					if offlineBilling {
-						subCol = pal.Amber
+					if sub != "" {
+						ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
+						subCol := pal.TextMuted
+						if offlineBilling {
+							subCol = pal.Amber
+						}
+						ui.Text(c, sub).FontSize(12).FontFeatures("tnum").TextColor(subCol).MaxLines(1).Ellipsis("…")
 					}
-					ui.Text(c, sub).FontSize(12).FontFeatures("tnum").TextColor(subCol).MaxLines(1).Ellipsis("…")
 				})
 			})
 			DrawAuraOrb(c, pal, rt.Phase, offlineBilling, 44)
@@ -1384,6 +1513,15 @@ func (m *MainUI) bentoStrategy(c *ui.Context, pal Palette, acc core.AccountProfi
 				hasTag = true
 				Badge(c, pal, fmt.Sprintf("%d轮保底 %s", fbRounds, fbTarget.ShortChipLabel()), nil)
 			}
+			if acc.QueuePersistentMode {
+				hasTag = true
+				hrs := acc.QueuePersistentMaxHours
+				if hrs <= 0 {
+					hrs = 8
+				}
+				a := pal.Amber
+				Badge(c, pal, fmt.Sprintf("守候 %dh", hrs), &a)
+			}
 			if acc.ScheduledStartEnabled {
 				hasTag = true
 				e := pal.Emerald
@@ -1468,7 +1606,11 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 					})
 				} else {
 					ui.Row(c).FillWidth().Gap(7).Children(func() {
-						m.quickCardBtn(c, pal, "开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
+						comfyLabel := "开 ComfyUI"
+						if rt.ComfyOpening {
+							comfyLabel = "连接中…"
+						}
+						m.quickCardBtn(c, pal, comfyLabel, (rt.Phase.IsRunning() && rt.ServerHealthy) || rt.ComfyOpening, !rt.Phase.IsRunning() || rt.ComfyOpening, func() {
 							go m.Svc.OpenComfyUI(acc.ID)
 						})
 						if rt.Phase.IsRunning() {

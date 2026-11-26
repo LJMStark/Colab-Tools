@@ -30,8 +30,11 @@ func openTerminalCommand(shellCmd string) error {
 	return cmd.Start()
 }
 
-func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, error) {
+func cleanupStaleColabSSH(_ string) {}
+
+func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error) {
 	useWSL := r == nil || r.UseWSLOnWindows
+	errBuf := &tunnelStderrBuffer{}
 	if useWSL {
 		proxyParts := []string{"colab"}
 		if profile.AuthMode == core.AuthIsolatedVaultADC {
@@ -49,13 +52,17 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 		sshParts := []string{
 			"ssh", "-N",
 			"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", localPort, remotePort),
+			"-o", "BatchMode=yes",
+			"-o", "ConnectTimeout=15",
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
 			"-o", "ExitOnForwardFailure=yes",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "UserKnownHostsFile=/dev/null",
 			"-o", "ServerAliveInterval=30",
 			"-o", "ServerAliveCountMax=3",
 			"-o", "ProxyCommand=" + proxyCmd,
-			"colab",
+			"root@colab",
 		}
 		escapedSSH := make([]string, len(sshParts))
 		for i, a := range sshParts {
@@ -72,10 +79,11 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 		exe, wslArgs := runner.BuildWSLCommand(distro, strings.Join(escapedSSH, " "), extra)
 		cmd := exec.Command(exe, wslArgs...)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		cmd.Stderr = errBuf
 		if err := cmd.Start(); err != nil {
-			return nil, err
+			return nil, errBuf, err
 		}
-		return cmd, nil
+		return cmd, errBuf, nil
 	}
 
 	// Native Windows OpenSSH + native colab.exe proxy-mode
@@ -91,13 +99,17 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 	sshArgs := []string{
 		"-N",
 		"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", localPort, remotePort),
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=15",
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=NUL",
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ProxyCommand=" + proxyCmd,
-		"colab",
+		"root@colab",
 	}
 	cmd := exec.Command("ssh.exe", sshArgs...)
 	extra := map[string]string{}
@@ -106,8 +118,9 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 	}
 	cmd.Env = runner.BaseEnvironment(extra)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.Stderr = errBuf
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, errBuf, err
 	}
-	return cmd, nil
+	return cmd, errBuf, nil
 }
