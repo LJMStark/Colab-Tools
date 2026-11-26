@@ -85,7 +85,7 @@ Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大
 - **Official Google Colab CLI** (`uv tool install google-colab-cli`, **checked & installable right inside the first-launch wizard**)
 
 ### Option 1: Download Prebuilt App (Recommended)
-1. Download `Colab-Tools-v0.3.16-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest), unzip it, and drag **`Colab Tools.app`** to `/Applications`.
+1. Download `Colab-Tools-v0.3.17-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest), unzip it, and drag **`Colab Tools.app`** to `/Applications`.
 2. Finish the 3-step setup wizard, then on the **Home** tab simply click the top-center **Power button** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
 
 > **Signature note:** Community builds are self-signed. On first launch, right-click → **Open** (or run `xattr -cr "/Applications/Colab Tools.app"`).

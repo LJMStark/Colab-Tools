@@ -979,7 +979,8 @@ if not cf_bin:
 if pid_path.exists():
     try:
         old_pid = int(pid_path.read_text().strip())
-        if pathlib.Path(f"/proc/{old_pid}/cmdline").exists():
+        old_cmd_p = pathlib.Path(f"/proc/{old_pid}/cmdline")
+        if old_cmd_p.exists() and "cloudflared" in old_cmd_p.read_bytes().decode("utf-8", errors="ignore"):
             os.killpg(old_pid, signal.SIGTERM)
     except Exception:
         pass
@@ -992,6 +993,7 @@ proc = subprocess.Popen(
     stdin=subprocess.DEVNULL,
     start_new_session=True,
 )
+logf.close()
 pid_path.write_text(str(proc.pid))
 
 deadline = time.time() + 20.0
@@ -1404,13 +1406,16 @@ func (e *Engine) StartBuiltinDeployScript(ctx context.Context, profile core.Acco
 	py := fmt.Sprintf(`import base64, json, os, pathlib, signal, subprocess
 script_path = pathlib.Path("/tmp/colab-tools-deploy.sh")
 pid_path = pathlib.Path("/tmp/colab-tools-deploy.pid")
+status_path = pathlib.Path("/tmp/colab-tools-status.json")
 if pid_path.exists():
     try:
         old_pid = int(pid_path.read_text().strip())
-        if pathlib.Path(f"/proc/{old_pid}/cmdline").exists():
+        old_cmd_p = pathlib.Path(f"/proc/{old_pid}/cmdline")
+        if old_cmd_p.exists() and "colab-tools-deploy.sh" in old_cmd_p.read_bytes().decode("utf-8", errors="ignore"):
             os.killpg(old_pid, signal.SIGTERM)
     except Exception:
         pass
+status_path.unlink(missing_ok=True)
 script_path.write_bytes(base64.b64decode("%s"))
 os.chmod(script_path, 0o700)
 extra = json.loads(base64.b64decode("%s").decode("utf-8"))
@@ -1419,6 +1424,7 @@ for k, v in extra.items():
     env[str(k)] = str(v)
 logf = open("/tmp/colab-tools-deploy.log", "wb")
 proc = subprocess.Popen(["bash", "/tmp/colab-tools-deploy.sh"], stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+logf.close()
 pid_path.write_text(str(proc.pid))
 print("DEPLOY_LAUNCHED=1")
 `, scriptB64, envB64)

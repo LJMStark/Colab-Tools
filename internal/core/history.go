@@ -387,6 +387,24 @@ func (s *HistoryStore) Query(filter HistoryFilter, now time.Time) ([]HistoryReco
 	return out, summary
 }
 
+func sanitizeCSVText(s string) string {
+	if s == "" {
+		return ""
+	}
+	if s[0] == '\t' || s[0] == '\r' || s[0] == '\n' {
+		return "'" + s
+	}
+	trimmed := strings.TrimLeft(s, " \t\r\n\u3000")
+	if trimmed == "" {
+		return s
+	}
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + s
+	}
+	return s
+}
+
 func (s *HistoryStore) ExportCSV(filter HistoryFilter, now time.Time) string {
 	records, _ := s.Query(filter, now)
 
@@ -441,27 +459,27 @@ func (s *HistoryStore) ExportCSV(filter HistoryFilter, now time.Time) string {
 			endedStr = rec.EndedAt.Local().Format("2006-01-02 15:04:05")
 		}
 		_ = w.Write([]string{
-			rec.ID,
-			kindCN(rec.Kind),
-			rec.AccountID,
-			rec.AccountName,
-			rec.SessionName,
+			sanitizeCSVText(rec.ID),
+			sanitizeCSVText(kindCN(rec.Kind)),
+			sanitizeCSVText(rec.AccountID),
+			sanitizeCSVText(rec.AccountName),
+			sanitizeCSVText(rec.SessionName),
 			rec.StartedAt.Local().Format("2006-01-02 15:04:05"),
 			endedStr,
 			fmt.Sprintf("%d", rec.DurationSec),
 			FormatDuration(rec.DurationSec),
-			rec.Hardware,
+			sanitizeCSVText(rec.Hardware),
 			boolCN(rec.HighMem),
-			rec.RecipeLabel,
+			sanitizeCSVText(rec.RecipeLabel),
 			fmt.Sprintf("%.2f", rec.ConsumedCU),
-			rec.BillingBasis.DisplayName(),
-			rec.ShutdownReason.DisplayName(),
+			sanitizeCSVText(rec.BillingBasis.DisplayName()),
+			sanitizeCSVText(rec.ShutdownReason.DisplayName()),
 			boolCN(rec.FallbackUsed),
 			boolCN(rec.ModelDowngraded),
-			rec.TargetsSummary,
+			sanitizeCSVText(rec.TargetsSummary),
 			fmt.Sprintf("%d", rec.Rounds),
-			rec.AllocOutcome.DisplayName(),
-			rec.Detail,
+			sanitizeCSVText(rec.AllocOutcome.DisplayName()),
+			sanitizeCSVText(rec.Detail),
 		})
 	}
 	w.Flush()

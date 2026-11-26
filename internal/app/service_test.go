@@ -25,6 +25,7 @@ type fakeRunner struct {
 	onShell     func(cmd string) runner.Result
 	onShellOpts func(cmd string, opts runner.RunOptions) runner.Result
 	onRun       func(name string, args []string) runner.Result
+	colabPath   string
 	commands    []string
 }
 
@@ -58,7 +59,12 @@ func (f *fakeRunner) RunStreamingShell(_ context.Context, _ string, _ time.Durat
 	return runner.Result{ExitCode: 0}
 }
 
-func (f *fakeRunner) LookPath(_ string) string { return "/usr/local/bin/colab" }
+func (f *fakeRunner) LookPath(_ string) string {
+	if f.colabPath != "" {
+		return f.colabPath
+	}
+	return "/usr/local/bin/colab"
+}
 
 func TestPhaseSettlementPostAllocAndStopVerification(t *testing.T) {
 	svc := NewService(true)
@@ -327,13 +333,27 @@ func TestFailureNotificationsTestNotificationAndTrayLiveStatus(t *testing.T) {
 	svc.Settings.SelectedAccountID = acc.ID
 	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
 
+	var sessionOnline bool
+	var mockMu sync.Mutex
 	fr := &fakeRunner{}
 	fr.onShell = func(cmd string) runner.Result {
 		if strings.Contains(cmd, "usage") {
-			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.00 compute units\nUsage rate: 2.33/hr\nActive assignments: 1\n"}
+			mockMu.Lock()
+			online := sessionOnline
+			mockMu.Unlock()
+			if online {
+				return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.00 compute units\nUsage rate: 2.33/hr\nActive assignments: 1\n"}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
 		}
 		if strings.Contains(cmd, "sessions") {
-			return runner.Result{ExitCode: 0, Stdout: "[" + acc.SessionName + "] m-s-pure1 | Hardware: L4 | Shape: Standard | Variant: GPU\n"}
+			mockMu.Lock()
+			online := sessionOnline
+			mockMu.Unlock()
+			if online {
+				return runner.Result{ExitCode: 0, Stdout: "[" + acc.SessionName + "] m-s-pure1 | Hardware: L4 | Shape: Standard | Variant: GPU\n"}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
 		}
 		return runner.Result{ExitCode: 0}
 	}
@@ -426,6 +446,9 @@ func TestFailureNotificationsTestNotificationAndTrayLiveStatus(t *testing.T) {
 	}
 
 	// 4. handlePostAllocation sends critical notifications with accurate wording for pure-boot vs auto-deploy
+	mockMu.Lock()
+	sessionOnline = true
+	mockMu.Unlock()
 	pureAcc := acc
 	pureAcc.DeployRecipe = core.RecipeNone
 	pureAcc.EnableLLMModule = false
@@ -1393,5 +1416,177 @@ func TestOpenWorkloadWebUIAutoSSHTunnel(t *testing.T) {
 	}
 	if !svc.StateFor(acc.ID).SSHTunnelActive {
 		t.Fatal("expected SSHTunnelActive=true after auto-tunnel")
+	}
+}
+
+func TestReviewFixesDeployPreLaunchStopCancelAndQueueRace(t *testing.T) {
+	// 1. DeployPreLaunch protects active Drive-auth preparation from healthy old ComfyUI telemetry,
+	// and StopAccountSession immediately cancels the pending Drive-auth deploy flow without pushing script.
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	var scriptPushed int
+	var mu sync.Mutex
+	shimDir := t.TempDir()
+	shimColab := filepath.Join(shimDir, "colab")
+	shimBody := "#!/bin/sh\necho 'REQUIRED: Google Drive Authorization needed'\necho 'https://accounts.google.com/o/oauth2/auth?test=1'\necho 'Press Enter after authorizing'\nread line\nexit 0\n"
+	if err := os.WriteFile(shimColab, []byte(shimBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{colabPath: shimColab}
+	fr.onShellOpts = func(cmd string, opts runner.RunOptions) runner.Result {
+		if strings.Contains(opts.Stdin, "colab-tools-deploy.sh") && strings.Contains(opts.Stdin, "DEPLOY_LAUNCHED=1") {
+			mu.Lock()
+			scriptPushed++
+			mu.Unlock()
+			return runner.Result{ExitCode: 0, Stdout: "DEPLOY_LAUNCHED=1\n"}
+		}
+		if strings.Contains(opts.Stdin, "DRIVE_MOUNTED=1") {
+			return runner.Result{ExitCode: 0, Stdout: "DRIVE_MOUNTED=0\n"}
+		}
+		if strings.Contains(cmd, "exec") {
+			return runner.Result{ExitCode: 0, Stdout: "COMFY_QUEUE={\"queue_running\":[],\"queue_pending\":[]}\nHEALTH=ok\nDEPLOY_ALIVE=0\n"}
+		}
+		if strings.Contains(cmd, "stop") {
+			return runner.Result{ExitCode: 0, Stdout: "Stopped.\n"}
+		}
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 95.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		}
+		if strings.Contains(cmd, "sessions") {
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	acc := core.NewDefaultAccountProfile("ReDeployUser", "redeploy@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.UseGoogleDrive = true
+	acc.DeployRecipe = core.RecipeH3Video
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	savedAcc := acc
+
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-live-1"
+	rt.ServerHealthy = true
+	svc.Runtime[acc.ID] = rt
+
+	deployDone := make(chan struct{})
+	go func() {
+		defer close(deployDone)
+		svc.launchVideoDeployFlow(savedAcc)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && svc.CurrentActionPrompt() == nil {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if p := svc.CurrentActionPrompt(); p == nil || p.Kind != core.PromptDriveAuth {
+		t.Fatalf("expected PromptDriveAuth during redeploy, got %+v", p)
+	}
+
+	// Telemetry arrives while old ComfyUI is still healthy -> must NOT clear DeployRunning during DeployPreLaunch!
+	svc.fetchAndApplyTelemetry(savedAcc, "ep-live-1")
+	midState := svc.StateFor(acc.ID)
+	if !midState.DeployRunning || !midState.DeployPreLaunch {
+		t.Fatalf("expected DeployRunning & DeployPreLaunch to stay true against old healthy service, got %+v", midState)
+	}
+
+	// Stopping the session while PromptDriveAuth is open must dismiss modal and abort launchVideoDeployFlow without pushing script
+	svc.StopAccountSession(acc.ID, "", "")
+	select {
+	case <-deployDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected launchVideoDeployFlow to abort promptly when StopAccountSession runs")
+	}
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatalf("expected PromptDriveAuth to be cleared on StopAccountSession, got %+v", svc.CurrentActionPrompt())
+	}
+	mu.Lock()
+	pushed := scriptPushed
+	mu.Unlock()
+	if pushed != 0 {
+		t.Fatalf("expected 0 deploy scripts pushed after StopAccountSession, got %d", pushed)
+	}
+
+	// 2. CancelQueue racing with an in-flight `colab new` success must NOT trigger auto-deploy, while surfacing live instance
+	svcQ := NewService(true)
+	defer svcQ.Shutdown()
+	svcQ.NotifySender = func(_, _ string) {}
+	var opened int
+	svcQ.URLOpener = func(_ string) {
+		mu.Lock()
+		opened++
+		mu.Unlock()
+	}
+
+	newStarted := make(chan struct{})
+	allowNewFinish := make(chan struct{})
+	var allocated bool
+	qr := &fakeRunner{}
+	qr.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "new") && strings.Contains(cmd, "--gpu") {
+			select {
+			case <-newStarted:
+			default:
+				close(newStarted)
+			}
+			<-allowNewFinish
+			mu.Lock()
+			allocated = true
+			mu.Unlock()
+			return runner.Result{ExitCode: 0, Stdout: "Created session.\n"}
+		}
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 200.0 compute units\nUsage rate: 7.00/hr\nActive assignments: 1\n"}
+		}
+		if strings.Contains(cmd, "sessions") {
+			mu.Lock()
+			isUp := allocated
+			mu.Unlock()
+			if isUp {
+				return runner.Result{ExitCode: 0, Stdout: "[" + acc.SessionName + "] m-s-raced | Hardware: G4 | Shape: High-RAM | Variant: GPU\n"}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		}
+		if strings.Contains(cmd, "DEPLOY_LAUNCHED") {
+			mu.Lock()
+			scriptPushed++
+			mu.Unlock()
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	svcQ.Engine = colab.NewEngine(qr, svcQ.Vault)
+	qAcc := acc
+	qAcc.UseGoogleDrive = false
+	svcQ.Settings.Accounts = []core.AccountProfile{qAcc}
+	svcQ.Settings.SelectedAccountID = qAcc.ID
+	svcQ.Runtime[qAcc.ID] = core.NewAccountRuntimeState()
+
+	svcQ.StartAccountSession(qAcc.ID)
+	<-newStarted
+	svcQ.CancelQueue(qAcc.ID)
+	close(allowNewFinish)
+
+	// Wait briefly for runPoliteQueue goroutine to settle
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !svcQ.StateFor(qAcc.ID).Phase.IsRunning() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	qState := svcQ.StateFor(qAcc.ID)
+	if !qState.Phase.IsRunning() || qState.ActiveEndpoint != "m-s-raced" {
+		t.Fatalf("expected cancelled-but-allocated instance to remain visible as running for billing safety, got %+v", qState)
+	}
+	if qState.DeployRunning {
+		t.Fatalf("cancelled queue must NOT start automatic video deployment, got %+v", qState)
+	}
+	mu.Lock()
+	gotOpened := opened
+	mu.Unlock()
+	if gotOpened != 0 {
+		t.Fatalf("cancelled queue must NOT auto-open ComfyUI browser, got %d opens", gotOpened)
 	}
 }

@@ -174,7 +174,22 @@ sync_or_download() {
 
   if [ -n "$drive_src" ]; then
     echo "[rsync] Drive -> NVMe: $filename"
-    rsync -ahW "$drive_src" "$local_dst"
+    local part_dst="${local_dst}.part.$$"
+    rm -f "$part_dst"
+    if ! rsync -ahW "$drive_src" "$part_dst"; then
+      rm -f "$part_dst"
+      fail_deploy "从 Google Drive 拷贝模型失败：${filename}"
+    fi
+    python3 - "$drive_src" "$part_dst" "$local_dst" <<'PY'
+import pathlib, sys
+src_p, part_p, dst_p = (pathlib.Path(p) for p in sys.argv[1:])
+src_sz = src_p.stat().st_size
+part_sz = part_p.stat().st_size if part_p.exists() else 0
+if src_sz <= 0 or part_sz != src_sz:
+    part_p.unlink(missing_ok=True)
+    raise SystemExit(f"size mismatch copying {dst_p.name}: expected {src_sz}, got {part_sz}")
+part_p.replace(dst_p)
+PY
     return 0
   fi
 
@@ -187,21 +202,45 @@ sync_or_download() {
 
   echo "[hf] Fast downloading $hf_repo / $hf_path -> NVMe"
   python3 - "$hf_repo" "$hf_path" "$local_dst" <<'PY'
-import pathlib, shutil, sys
+import os, pathlib, shutil, sys
 from huggingface_hub import hf_hub_download
 repo, rpath, dst = sys.argv[1:]
-cached = hf_hub_download(repo_id=repo, filename=rpath)
+cached = pathlib.Path(hf_hub_download(repo_id=repo, filename=rpath))
+src_sz = cached.stat().st_size
+if src_sz <= 0:
+    raise SystemExit(f"downloaded empty file for {rpath}")
 dst_p = pathlib.Path(dst)
 dst_p.parent.mkdir(parents=True, exist_ok=True)
-shutil.copy2(cached, dst_p)
+part_p = dst_p.with_name(f"{dst_p.name}.part.{os.getpid()}")
+try:
+    shutil.copy2(cached, part_p)
+    if part_p.stat().st_size != src_sz:
+        raise RuntimeError(f"incomplete copy for {dst_p.name}")
+    part_p.replace(dst_p)
+except BaseException:
+    part_p.unlink(missing_ok=True)
+    raise
 PY
 
-  # Optionally back up shared 21.5GB base weights back to Drive for future fast cold-starts
+  # Optionally back up shared 21.5GB base weights back to Drive atomically for future fast cold-starts
   if [ "$cache_back" = "1" ] && [ "$DRIVE_AVAILABLE" = "1" ] && [ "$CACHE_BASE_TO_DRIVE" = "1" ]; then
     local drive_dst="$DRIVE_MODELS_DIR/${sub_dir}/${filename}"
-    if [ ! -f "$drive_dst" ]; then
+    if [ ! -s "$drive_dst" ]; then
       echo "[backup] Caching base file to Drive: $filename"
-      rsync -ahW "$local_dst" "$drive_dst" || true
+      local drive_part="${drive_dst}.part.$$"
+      rm -f "$drive_part"
+      if rsync -ahW "$local_dst" "$drive_part"; then
+        python3 - "$local_dst" "$drive_part" "$drive_dst" <<'PY' || rm -f "$drive_part"
+import pathlib, sys
+src_p, part_p, dst_p = (pathlib.Path(p) for p in sys.argv[1:])
+if part_p.exists() and part_p.stat().st_size == src_p.stat().st_size and src_p.stat().st_size > 0:
+    part_p.replace(dst_p)
+else:
+    part_p.unlink(missing_ok=True)
+PY
+      else
+        rm -f "$drive_part"
+      fi
     fi
   fi
 }
@@ -236,10 +275,16 @@ case "$H3_VARIANT" in
     elif [ -n "$H3_CUSTOM_HF_REPO" ] && [ -n "$H3_CUSTOM_HF_FILES" ]; then
       IFS=',' read -ra FILES <<< "$H3_CUSTOM_HF_FILES"
       for raw_f in "${FILES[@]}"; do
-        f="$(echo "$raw_f" | xargs)"
+        f="${raw_f#"${raw_f%%[![:space:]]*}"}"
+        f="${f%"${f##*[![:space:]]}"}"
         if [ -n "$f" ]; then
           base_name="$(basename "$f")"
-          sync_or_download "diffusion_models" "$base_name" "$H3_CUSTOM_HF_REPO" "$f" "0"
+          target_sub="diffusion_models"
+          case "$f" in
+            text_encoders/*) target_sub="text_encoders" ;;
+            vae/*)           target_sub="vae" ;;
+          esac
+          sync_or_download "$target_sub" "$base_name" "$H3_CUSTOM_HF_REPO" "$f" "0"
         fi
       done
     else

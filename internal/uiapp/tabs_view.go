@@ -376,7 +376,7 @@ func (m *MainUI) adjustScheduleMinutes(acc core.AccountProfile, delta int) {
 // MARK: - Contextual LLM Integrations Panel (Shown ONLY when user picks "大模型代理")
 
 func (m *MainUI) renderIntegrationsPanel(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
-	det := m.Svc.ClientDetection
+	det := m.Svc.ViewState().ClientDetection
 	ids := integrations.IdentifiersForAccount(acc.ID)
 
 	SectionCard(c, pal, "编程工具接入（开机后自动安全同步，不改你原本的官方订阅）", "", func() {
@@ -558,12 +558,13 @@ func (m *MainUI) renderIntegrationsPanel(c *ui.Context, pal Palette, acc core.Ac
 // MARK: - Tab 2: Clean Multi-Account Manager & Official OAuth2 Binding
 
 func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
+	vs := m.Svc.ViewState()
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).Gap(4).Children(func() {
 			ui.Text(c, "账号").FontSize(22).Bold().TextColor(pal.TextPrimary)
 			ui.Text(c, "账号凭证加密存在本机系统凭据库（macOS 钥匙串 / Windows 凭据管理器），多账号点数完全隔离。").FontSize(13).TextColor(pal.TextMuted)
 		})
-		PillButton(c, pal, "+ 绑定新账号", true, !m.Svc.CLIInstalled, func() {
+		PillButton(c, pal, "+ 绑定新账号", true, !vs.CLIInstalled, func() {
 			m.ShowAddAccPanel = !m.ShowAddAccPanel
 		})
 	})
@@ -572,7 +573,7 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 		SectionCard(c, pal, "通过 Google 官方 OAuth2 绑定新账号", "", func() {
 			ui.Row(c).FillWidth().Padding(8, 12).Radius(9).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).AlignItems(ui.Center).Gap(10).Children(func() {
 				ui.Text(c, "本机终端若已登录过 google-colab-cli，可直接一键导入：").FontSize(12).TextColor(pal.TextMuted).Grow(1)
-				SmallActionButton(c, pal, "导入终端已登账号", nil, !m.Svc.CLIInstalled || m.Svc.IsImportingDefault, func() {
+				SmallActionButton(c, pal, "导入终端已登账号", nil, !vs.CLIInstalled || vs.IsImportingDefault, func() {
 					go func() {
 						if !m.Svc.TryImportSystemDefaultAccount() {
 							m.Svc.ShowToast("未检测到终端默认 colab 登录，请按下方步骤完成 Google 官方授权")
@@ -581,7 +582,9 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 				})
 			})
 			m.renderEmbeddedOAuthBinder(c, pal, func() {
+				m.formMu.Lock()
 				m.ShowAddAccPanel = false
+				m.formMu.Unlock()
 			})
 		})
 	}
@@ -670,6 +673,13 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 }
 
 func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess func()) {
+	cliReady := m.Svc.ViewState().CLIInstalled
+	m.formMu.Lock()
+	working := m.NewAccWorking
+	authURL := m.NewAccAuthURL
+	errText := m.NewAccError
+	m.formMu.Unlock()
+
 	ui.Column(c).FillWidth().Gap(12).Children(func() {
 		ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "账号备注名").FontSize(13).TextColor(pal.TextMuted).Width(90)
@@ -692,40 +702,48 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 		})
 
 		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-			PillButton(c, pal, "1. 打开浏览器完成 Google 官方授权", true, m.NewAccWorking || !m.Svc.CLIInstalled, func() {
+			PillButton(c, pal, "1. 打开浏览器完成 Google 官方授权", true, working || !cliReady, func() {
+				m.formMu.Lock()
 				m.NewAccWorking = true
 				m.NewAccError = ""
+				m.formMu.Unlock()
 				go func() {
 					u, err := m.Svc.BeginOAuthFlow()
+					m.formMu.Lock()
 					m.NewAccWorking = false
 					if err != nil {
 						m.NewAccError = err.Error()
 					} else {
 						m.NewAccAuthURL = u
-						m.Svc.ShowToast("已打开浏览器，授权后请复制授权码粘贴到下方")
 					}
-					if m.Svc.OnUIInvalidate != nil {
+					m.formMu.Unlock()
+					if err == nil {
+						m.Svc.ShowToast("已打开浏览器，授权后请复制授权码粘贴到下方")
+					} else if m.Svc.OnUIInvalidate != nil {
 						m.Svc.OnUIInvalidate()
 					}
 				}()
 			})
-			if m.NewAccAuthURL != "" {
+			if authURL != "" {
 				SmallActionButton(c, pal, "复制授权链接", nil, false, func() {
-					m.Svc.CopyToClipboard(m.NewAccAuthURL, "Google OAuth2 链接")
+					m.Svc.CopyToClipboard(authURL, "Google OAuth2 链接")
 				})
 			}
 		})
 
 		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
 			ui.TextInput(c, &m.NewAccAuthCode).Placeholder("2. 粘贴浏览器返回的 Google 授权码").Grow(1)
-			PillButton(c, pal, "完成绑定", true, m.NewAccWorking || strings.TrimSpace(m.NewAccAuthCode) == "", func() {
+			PillButton(c, pal, "完成绑定", true, working || strings.TrimSpace(m.NewAccAuthCode) == "", func() {
+				m.formMu.Lock()
 				m.NewAccWorking = true
 				m.NewAccError = ""
+				m.formMu.Unlock()
 				tier := core.AllSubscriptionTiers[m.NewAccTierIdx%len(core.AllSubscriptionTiers)]
 				name := m.NewAccName
 				code := m.NewAccAuthCode
 				go func() {
 					err := m.Svc.CompleteOAuthFlow(name, tier, code)
+					m.formMu.Lock()
 					m.NewAccWorking = false
 					if err != nil {
 						m.NewAccError = err.Error()
@@ -733,9 +751,10 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 						m.NewAccName = ""
 						m.NewAccAuthCode = ""
 						m.NewAccAuthURL = ""
-						if onSuccess != nil {
-							onSuccess()
-						}
+					}
+					m.formMu.Unlock()
+					if err == nil && onSuccess != nil {
+						onSuccess()
 					}
 					if m.Svc.OnUIInvalidate != nil {
 						m.Svc.OnUIInvalidate()
@@ -744,8 +763,8 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 			})
 		})
 
-		if m.NewAccError != "" {
-			ui.Text(c, "⚠ "+m.NewAccError).FontSize(12).TextColor(pal.Coral)
+		if errText != "" {
+			ui.Text(c, "⚠ "+errText).FontSize(12).TextColor(pal.Coral)
 		}
 	})
 }
@@ -753,6 +772,7 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 // MARK: - Tab 3: Single-Page Clean Settings (Zero Nested Sub-Tabs)
 
 func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
+	vs := m.Svc.ViewState()
 	ui.Column(c).FillWidth().Gap(4).Children(func() {
 		ui.Text(c, "设置").FontSize(22).Bold().TextColor(pal.TextPrimary)
 		ui.Text(c, "只保留常用系统偏好，模型与显卡在「主页」一步就能选好，修改即时生效。").FontSize(13).TextColor(pal.TextMuted)
@@ -790,7 +810,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 			ui.Row(c).Padding(3).Radius(9).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Gap(2).Shrink(0).Children(func() {
 				for _, o := range [][2]string{{"system", "跟随系统"}, {"dark", "深色"}, {"light", "浅色"}} {
 					k, lbl := o[0], o[1]
-					segmentedOptionPill(c, pal, lbl, m.Svc.Settings.ThemePreference == k, func() {
+					segmentedOptionPill(c, pal, lbl, vs.ThemePreference == k, func() {
 						m.Svc.UpdateSettings(func(s *core.AppSettings) { s.ThemePreference = k })
 					})
 				}
@@ -805,7 +825,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				ui.Text(c, "控制顶部菜单栏图标旁是否显示运行卡数与点数（macOS）").FontSize(12).TextColor(pal.TextMuted)
 			})
 			ui.Row(c).Padding(3).Radius(9).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Gap(2).Shrink(0).Children(func() {
-				cur := m.Svc.Settings.StatusBarMode
+				cur := vs.StatusBarMode
 				if cur == "" {
 					cur = core.StatusBarCompact
 				}
@@ -827,7 +847,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 
 		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
-		notif := m.Svc.Settings.EnableNotifications
+		notif := vs.EnableNotifications
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "桌面通知提醒").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
@@ -836,19 +856,19 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 			SmallActionButton(c, pal, "测试通知", nil, false, func() {
 				go m.Svc.SendTestNotification()
 			})
-			if ui.Switch(c, &notif).Clicked() || notif != m.Svc.Settings.EnableNotifications {
+			if ui.Switch(c, &notif).Clicked() || notif != vs.EnableNotifications {
 				m.Svc.UpdateSettings(func(s *core.AppSettings) { s.EnableNotifications = notif })
 			}
 		})
 	})
 
 	// 2. Official CLI Environment (single compact card, no separate sub-tab)
-	env := m.Svc.EnvReport
+	env := vs.EnvReport
 	SectionCard(c, pal, "运行环境（官方 google-colab-cli）", strings.ToUpper(runtime.GOOS), func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				detail := "未检测到可执行文件，可点右侧重新打开开箱向导一键安装"
-				if m.Svc.CLIInstalled {
+				if vs.CLIInstalled {
 					ver := ""
 					if env.ColabVersion != "" {
 						ver = " v" + env.ColabVersion
@@ -864,14 +884,14 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				ui.Text(c, detail).FontSize(12.5).TextColor(pal.TextPrimary)
 				ui.Text(c, "包管理环境："+env.PackageManagerSummary()).FontSize(11.5).TextColor(pal.TextMuted)
 			})
-			if m.Svc.CLIInstalled {
+			if vs.CLIInstalled {
 				e := pal.Emerald
 				recessedStatusPill(c, pal, &e, "正常")
 			} else {
 				a := pal.Amber
 				recessedStatusPill(c, pal, &a, "需安装")
 			}
-			neutralPrecisionButton(c, pal, nil, "refresh", "重新体检", m.Svc.IsCheckingEnv, func() {
+			neutralPrecisionButton(c, pal, nil, "refresh", "重新体检", vs.IsCheckingEnv, func() {
 				go m.Svc.RefreshEnvironmentCheck()
 			})
 			SmallActionButton(c, pal, "开箱向导", nil, false, func() {
@@ -887,6 +907,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				e := pal.Emerald
 				neutralPrecisionButton(c, pal, &e, "", "恢复小白推荐默认", false, func() {
 					m.Svc.ResetAccountToRecommendedDefaults(acc.ID)
+					m.DraftAccountID = ""
 				})
 				ui.Spacer(c)
 				advLbl := "展开高级参数 ▾"

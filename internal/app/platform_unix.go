@@ -28,7 +28,11 @@ func openTerminalCommand(shellCmd string) error {
 		return err
 	}
 	cmd := exec.Command("open", "-a", "Terminal", scriptPath)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 // ensureLocalSSHKey 检查本地 ~/.ssh 下是否有可用的密钥对；若均不存在则静默生成 ed25519 密钥。

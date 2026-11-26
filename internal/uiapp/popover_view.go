@@ -30,7 +30,7 @@ func (p *PopoverUI) isDark() bool {
 	if p.ForceTheme == "light" {
 		return false
 	}
-	switch p.Svc.Settings.ThemePreference {
+	switch p.Svc.ViewState().ThemePreference {
 	case "dark":
 		return true
 	case "light":
@@ -164,6 +164,7 @@ func (p *PopoverUI) renderAccountStrip(c *ui.Context, pal Palette, accounts []co
 }
 
 func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []core.AccountProfile) {
+	cliReady := p.Svc.ViewState().CLIInstalled
 	totalBal, totalRate := p.Svc.TotalBalanceAndRate()
 	running := p.Svc.RunningAccountCount()
 
@@ -212,7 +213,7 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 						go p.Svc.StopAccountSession(acc.ID, "", "")
 					})
 				} else {
-					SmallActionButton(c, pal, "启", nil, !p.Svc.CLIInstalled, func() {
+					SmallActionButton(c, pal, "启", nil, !cliReady, func() {
 						p.Svc.StartAccountSession(acc.ID)
 					})
 				}
@@ -312,7 +313,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 				p.Svc.CancelQueue(acc.ID)
 			})
 		} else {
-			popoverLaunchButton(c, pal, "一键开机", !p.Svc.CLIInstalled, func() {
+			popoverLaunchButton(c, pal, "一键开机", !p.Svc.ViewState().CLIInstalled, func() {
 				p.Svc.DeployNow(acc.ID)
 			})
 		}

@@ -27,7 +27,11 @@ func openTerminalCommand(shellCmd string) error {
 		return err
 	}
 	cmd := exec.Command("cmd.exe", "/c", "start", "Colab Tools Terminal", "wsl.exe", "--", "bash", wslScript)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func cleanupStaleColabSSH(_ string) {}

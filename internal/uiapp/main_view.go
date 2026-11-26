@@ -5,6 +5,7 @@ import (
 	"math"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LJMStark/Colab-Tools/internal/app"
@@ -32,6 +33,7 @@ type MainUI struct {
 	EditingTierAccountID string
 
 	// OAuth2 Add-Account form state
+	formMu          sync.Mutex
 	NewAccName      string
 	NewAccTierIdx   int
 	NewAccAuthURL   string
@@ -78,7 +80,7 @@ func (m *MainUI) isDark() bool {
 	if m.ForceTheme == "light" {
 		return false
 	}
-	switch m.Svc.Settings.ThemePreference {
+	switch m.Svc.ViewState().ThemePreference {
 	case "dark":
 		return true
 	case "light":
@@ -120,6 +122,8 @@ func (m *MainUI) View(c *ui.Context) {
 		m.syncDraftsIfNeeded(acc)
 	}
 
+	vs := m.Svc.ViewState()
+
 	ui.Column(c).Fill().LinearGradient(ui.LinearGradient{
 		From:  pal.BgTop,
 		To:    pal.BgBottom,
@@ -127,7 +131,7 @@ func (m *MainUI) View(c *ui.Context) {
 	}).Draw(func(p *ui.Painter, r ui.Rect) {
 		DrawPrecisionBackdrop(p, r, pal)
 	}).Children(func() {
-		if m.Svc.ShowingOnboarding {
+		if vs.ShowingOnboarding {
 			m.renderOnboarding(c, pal)
 		} else {
 			m.renderTopCapsuleBar(c, pal)
@@ -135,7 +139,7 @@ func (m *MainUI) View(c *ui.Context) {
 
 			body := func() {
 				ui.Column(c).FillWidth().Padding(16, 24, 22, 24).Gap(14).Children(func() {
-					switch m.Svc.SelectedSection {
+					switch vs.SelectedSection {
 					case app.SectionHome:
 						m.renderStatusPage(c, pal)
 					case app.SectionHistory:
@@ -168,7 +172,7 @@ func (m *MainUI) View(c *ui.Context) {
 	}
 
 	// Floating bottom-right toast banner (non-blocking PassThrough so clicks underneath always work)
-	if toast := m.Svc.ToastMessage; toast != "" {
+	if toast := vs.ToastMessage; toast != "" {
 		ui.Overlay(c, func() {
 			ui.Row(c).Absolute().Right(20).Bottom(20).PassThrough().
 				Gap(8).Padding(10, 16).Radius(999).
@@ -434,6 +438,7 @@ func (m *MainUI) centeredWorkbench(c *ui.Context, fn func()) {
 // MARK: - Top Mole-Style Floating Capsule Bar
 
 func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
+	vs := m.Svc.ViewState()
 	accounts := m.Svc.AccountsSnapshot()
 	selAcc, hasSel := m.Svc.SelectedAccount()
 	leftPad := float32(24)
@@ -488,7 +493,7 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 
 			for idx, title := range app.MainSectionTitles {
 				sec := app.MainSection(idx)
-				selected := m.Svc.SelectedSection == sec
+				selected := vs.SelectedSection == sec
 				el := ui.Row(c).Padding(6, 15).Radius(999).AlignItems(ui.Center).Cursor(ui.CursorPointer)
 				if selected {
 					el.Background(pal.NavPillBg).
@@ -512,7 +517,7 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 		ui.Spacer(c)
 
 		// Right live status pill with aligned refresh vector icon
-		pillColor, pillLabel := m.topRightPill(pal)
+		pillColor, pillLabel := m.topRightPill(pal, vs.CLIInstalled)
 		ui.Row(c).Gap(7).Padding(6, 13).Radius(999).
 			Background(pal.SubtleBg).
 			Border(1, ui.Color{}).
@@ -521,7 +526,7 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 			AlignItems(ui.Center).
 			Cursor(ui.CursorPointer).
 			OnClick(func() {
-				if !m.Svc.CLIInstalled {
+				if !vs.CLIInstalled {
 					m.Svc.ReopenOnboarding()
 				} else {
 					go m.Svc.RefreshAllAccounts(true, false)
@@ -529,15 +534,15 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 			}).Children(func() {
 			DrawPrecisionLED(c, pillColor, 10)
 			ui.Text(c, pillLabel).FontSize(12.5).FontWeight(500).FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
-			if m.Svc.CLIInstalled {
+			if vs.CLIInstalled {
 				ToolbarIcon(c, "refresh", 13, pal.TextMuted)
 			}
 		})
 	})
 }
 
-func (m *MainUI) topRightPill(pal Palette) (ui.Color, string) {
-	if !m.Svc.CLIInstalled {
+func (m *MainUI) topRightPill(pal Palette, cliInstalled bool) (ui.Color, string) {
+	if !cliInstalled {
 		return pal.Coral, "需安装 Colab CLI"
 	}
 	running := m.Svc.RunningAccountCount()
@@ -575,7 +580,8 @@ func drawBannerSemanticBar(p *ui.Painter, r ui.Rect, col ui.Color) {
 // MARK: - Tab 1: Mole-Style 3x2 Zero-Duplication Bento Status Dashboard + Conditional Live Session Table
 
 func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
-	if !m.Svc.CLIInstalled {
+	vs := m.Svc.ViewState()
+	if !vs.CLIInstalled {
 		ui.Row(c).FillWidth().Padding(14, 16, 14, 18).Radius(14).
 			Background(WithAlpha(pal.Amber, 0.10)).
 			Border(1, WithAlpha(pal.Amber, 0.30)).
@@ -588,8 +594,8 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "未检测到可用的官方 google-colab-cli").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 				detail := "打开开箱体检向导即可一键安装并绑定你的 Google Colab 账号。"
-				if m.Svc.EnvReport.ColabBrokenReason != "" {
-					detail = m.Svc.EnvReport.ColabBrokenReason
+				if vs.EnvReport.ColabBrokenReason != "" {
+					detail = vs.EnvReport.ColabBrokenReason
 				}
 				ui.Text(c, detail).FontSize(12).TextColor(pal.TextMuted)
 			})
@@ -758,7 +764,7 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 					isH3Orig := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal
 					isShortage := rt.LastAllocHadShortage || strings.Contains(rt.LastError, "无货") || strings.Contains(rt.LastError, "没货") || strings.Contains(rt.LastError, "503")
 					if isH3Orig {
-						SmallActionButton(c, pal, "改用 L4 轻量版", &pal.Emerald, !m.Svc.CLIInstalled, func() {
+						SmallActionButton(c, pal, "改用 L4 轻量版", &pal.Emerald, !vs.CLIInstalled, func() {
 							m.Svc.SwitchToLightGGUFAndStart(acc.ID)
 						})
 					}
@@ -767,7 +773,7 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 							m.Svc.QuickScheduleMorningStart(acc.ID, 7, 0)
 						})
 					}
-					SmallActionButton(c, pal, "直接重试", &pal.Amber, !m.Svc.CLIInstalled, func() {
+					SmallActionButton(c, pal, "直接重试", &pal.Amber, !vs.CLIInstalled, func() {
 						m.Svc.DeployNow(acc.ID)
 					})
 				}
@@ -975,7 +981,7 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 			subBadgeCol := pal.Amber
 			watchText := "00:00:00"
 			watchCol := pal.TextFaint
-			clickable := !isCooling && m.Svc.CLIInstalled
+			clickable := !isCooling && m.Svc.ViewState().CLIInstalled
 			var onCenterClick func()
 
 			if isRunning {
@@ -1343,6 +1349,7 @@ func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountPr
 				m.selectH3Preset(acc, core.H3VariantFlashGGUF)
 			})
 			m.bentoTaskChip(c, pal, "大模型代理", llmSel, func() {
+				m.DraftAccountID = ""
 				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
 			})
 		})
@@ -1803,6 +1810,7 @@ func (m *MainUI) quickCardButtonStyled(c *ui.Context, pal Palette, label string,
 // MARK: - Bottom Mole-Style Live Sessions & Accounts Table
 
 func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected core.AccountProfile) {
+	cliReady := m.Svc.ViewState().CLIInstalled
 	accounts := m.Svc.AccountsSnapshot()
 	const (
 		colHW   float32 = 116
@@ -1888,7 +1896,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 				hwCol := pal.TextFaint
 				if rt.Phase.IsRunning() {
 					shape := "Std"
-					if accCopy.HighMem {
+					if core.EffectiveUseHighMem(accCopy) && !rt.SessionUsedStandardRAM {
 						shape = "High-RAM"
 					}
 					hwStr = fmt.Sprintf("%s · %s", rt.ShortGPUName(), shape)
@@ -1941,7 +1949,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 							m.Svc.CancelQueue(accCopy.ID)
 						})
 					} else {
-						SmallActionButton(c, pal, "启动", nil, !m.Svc.CLIInstalled, func() {
+						SmallActionButton(c, pal, "启动", nil, !cliReady, func() {
 							m.Svc.DeployNow(accCopy.ID)
 						})
 					}

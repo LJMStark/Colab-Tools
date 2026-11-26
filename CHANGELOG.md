@@ -3,6 +3,24 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.17] - 2026-11-27
+
+### Fixed
+- **部署准备态隔离与停机即时回收交互弹窗**:
+  - 新增 `DeployPreLaunch` 部署准备态标记，在推送脚本前的云端清理与 Google Drive 挂载阶段屏蔽上一轮旧 `ServerHealthy` 遥测冲刷，避免旧健康状态误导就绪判定；
+  - 主动停机或会话切换时即时取消等待中的 Google Drive 挂载引导弹窗与部署观察协程，避免停卡后残留过期弹窗。
+- **H3 模型权重 `.part` 原子落盘与字节大小校验**:
+  - `scripts/templates/h3-video.sh` 在 Drive → NVMe 拷贝、HuggingFace 下载及底座回存 Drive 三个环节均改为先写入临时 `.part.<pid>` 文件、核对正数文件大小一致后再原子替换目标文件，防止断流留下残缺权重文件；
+  - 自定义 HuggingFace 文件列表改用纯参数展开去除首尾空白，并按 `text_encoders/`、`vae/` 前缀自动分流至对应模型子目录。
+- **排队取消与分配成功并发保护**:
+  - 收紧排队取消路径与 `colab new` 分配返回之间的并发锁保护与会话核验顺序，防止取消操作与刚分配成功的云端实例产生状态覆盖。
+- **UI 渲染 `ViewStateSnapshot` 线程安全快照消除竞态**:
+  - 为 `Service` 新增 `ViewState()` 只读快照（`ViewStateSnapshot`），统一主窗口、部署面板、引导向导、菜单栏 Popover 及多标签视图的并发状态读取，消除 UI 协程与后台轮询协程之间的数据竞态。
+- **远端进程组核对 `cmdline` 与本地子进程 `Wait` 回收**:
+  - 远端停止旧进程组前先核对 `/proc/<pid>/cmdline` 确认归属目标服务，避免 PID 复用误杀无关进程；本地拉起外部终端命令（macOS / Windows）后异步调用 `cmd.Wait()` 回收子进程描述符，防止产生僵尸进程。
+- **历史账单 CSV 导出公式注入防护**:
+  - `HistoryStore.ExportCSV` 新增 `sanitizeCSVText` 转义处理，对以 `=`、`+`、`-`、`@` 或控制字符开头的文本字段自动前置单引号，防止电子表格软件打开账单时触发公式执行。
+
 ## [0.3.16] - 2026-11-26
 
 ### Changed

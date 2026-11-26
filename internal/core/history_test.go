@@ -349,3 +349,45 @@ func TestHistoryStoreConcurrentAccess(t *testing.T) {
 		t.Fatalf("expected 160 concurrent records, got %d (sum=%d)", len(recs), sum.SessionCount)
 	}
 }
+
+func TestHistoryExportCSVFormulaInjectionGuard(t *testing.T) {
+	mem := core.NewMemoryHistoryStore()
+	now := time.Now()
+	mem.AddRecord(core.HistoryRecord{
+		Kind:           core.HistoryKindAllocation,
+		AccountID:      "acc-inj",
+		AccountName:    "=cmd|' /C calc'!A0",
+		SessionName:    "  @SUM(A1:A2)",
+		StartedAt:      now,
+		DurationSec:    15,
+		Hardware:       "+L4",
+		RecipeLabel:    "-HYPERLINK(\"http://evil\")",
+		TargetsSummary: "\t=1+1",
+		Rounds:         2,
+		AllocOutcome:   core.AllocTagError,
+		Detail:         "  =IMPORTXML()",
+	})
+
+	// Raw JSON/in-memory query keeps exact original strings
+	recs, _ := mem.Query(core.HistoryFilter{AccountID: "acc-inj"}, now)
+	if len(recs) != 1 || recs[0].AccountName != "=cmd|' /C calc'!A0" {
+		t.Fatalf("expected raw record to preserve original string, got %+v", recs)
+	}
+
+	csvOut := mem.ExportCSV(core.HistoryFilter{AccountID: "acc-inj"}, now)
+	rows, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(csvOut, "\uFEFF"))).ReadAll()
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("unexpected CSV parse result: err=%v rows=%d", err, len(rows))
+	}
+	row := rows[1]
+	// Checked indices: 3=AccountName, 4=SessionName, 9=Hardware, 11=RecipeLabel, 17=TargetsSummary, 20=Detail
+	for _, idx := range []int{3, 4, 9, 11, 17, 20} {
+		if !strings.HasPrefix(row[idx], "'") {
+			t.Fatalf("expected column %d (%q) to be neutralized with leading quote", idx, row[idx])
+		}
+	}
+	// Numeric columns remain clean numbers
+	if row[7] != "15" || row[18] != "2" {
+		t.Fatalf("numeric columns should remain plain numbers, got dur=%q rounds=%q", row[7], row[18])
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.16"
+const AppVersion = "0.3.17"
 
 // tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
 type tunnelStderrBuffer struct {
@@ -73,8 +74,29 @@ const (
 var MainSectionTitles = []string{"主页", "记录", "账号", "设置"}
 
 type deployWatchHandle struct {
-	token  string
-	cancel context.CancelFunc
+	token    string
+	endpoint string
+	cancel   context.CancelFunc
+}
+
+// ViewStateSnapshot provides a lock-safe snapshot of Service UI state for concurrent rendering.
+type ViewStateSnapshot struct {
+	SelectedSection        MainSection
+	ShowingOnboarding      bool
+	OnboardingStep         int
+	ThemePreference        string
+	StatusBarMode          core.StatusBarDisplayMode
+	EnableNotifications    bool
+	CLIInstalled           bool
+	IsCheckingEnv          bool
+	IsInstallingCLI        bool
+	IsCancellingCLIInstall bool
+	IsImportingDefault     bool
+	CLIInstallLogs         []string
+	CLIInstallError        string
+	ToastMessage           string
+	EnvReport              doctor.Report
+	ClientDetection        integrations.DetectionSnapshot
 }
 
 type queueHandle struct {
@@ -123,6 +145,7 @@ type Service struct {
 	sshTunnels             map[string]*exec.Cmd
 	sshADCPaths            map[string]string
 	sshStderrs             map[string]*tunnelStderrBuffer
+	deployFlowCancels      map[string]deployWatchHandle
 	deployWatchCancels     map[string]deployWatchHandle
 	pendingOAuth           *colab.OAuthSessionTicket
 	actionPrompt           *core.UserActionPrompt
@@ -172,6 +195,7 @@ func NewService(skipBootstrap bool) *Service {
 		sshTunnels:         map[string]*exec.Cmd{},
 		sshADCPaths:        map[string]string{},
 		sshStderrs:         map[string]*tunnelStderrBuffer{},
+		deployFlowCancels:  map[string]deployWatchHandle{},
 		deployWatchCancels: map[string]deployWatchHandle{},
 		sshStarter:         startSSHTunnelProcess,
 		OSRunner:           r,
@@ -356,6 +380,12 @@ func (s *Service) Shutdown() {
 			h.cancel()
 		}
 	}
+	for id, fh := range s.deployFlowCancels {
+		if fh.cancel != nil {
+			fh.cancel()
+		}
+		delete(s.deployFlowCancels, id)
+	}
 	for id, wh := range s.deployWatchCancels {
 		if wh.cancel != nil {
 			wh.cancel()
@@ -519,6 +549,43 @@ func (s *Service) TrayLiveStatus() TrayStatusSnapshot {
 
 // Snapshot helpers for thread-safe UI reads
 
+func (s *Service) ViewState() ViewStateSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ViewStateSnapshot{
+		SelectedSection:        s.SelectedSection,
+		ShowingOnboarding:      s.ShowingOnboarding,
+		OnboardingStep:         s.OnboardingStep,
+		ThemePreference:        s.Settings.ThemePreference,
+		StatusBarMode:          s.Settings.StatusBarMode,
+		EnableNotifications:    s.Settings.EnableNotifications,
+		CLIInstalled:           s.CLIInstalled,
+		IsCheckingEnv:          s.IsCheckingEnv,
+		IsInstallingCLI:        s.IsInstallingCLI,
+		IsCancellingCLIInstall: s.IsCancellingCLIInstall,
+		IsImportingDefault:     s.IsImportingDefault,
+		CLIInstallLogs:         slices.Clone(s.CLIInstallLogs),
+		CLIInstallError:        s.CLIInstallError,
+		ToastMessage:           s.ToastMessage,
+		EnvReport:              s.EnvReport,
+		ClientDetection:        s.ClientDetection,
+	}
+}
+
+func (s *Service) SetShowingOnboarding(show bool) {
+	s.mu.Lock()
+	s.ShowingOnboarding = show
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
+func (s *Service) SetOnboardingStep(step int) {
+	s.mu.Lock()
+	s.OnboardingStep = step
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
 func (s *Service) AccountsSnapshot() []core.AccountProfile {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -676,6 +743,7 @@ func (s *Service) UpdateSettings(fn func(*core.AppSettings)) {
 
 func (s *Service) RemoveAccount(accountID string) {
 	s.CancelQueue(accountID)
+	s.cancelDeployFlow(accountID)
 	s.cancelDeployWatcher(accountID)
 	s.StopSSHTunnel(accountID)
 	_ = s.Vault.DeleteADCCredentials(accountID)
@@ -1396,11 +1464,13 @@ func (s *Service) applyServerSnapshotLocked(
 			}
 
 			// Endpoint changed -> invalidate bound LLM URL & video deploy/auto-open state
+			s.cancelDeployFlowLocked(accountID)
 			rt.PublicURL = ""
 			rt.LLMURLBoundEndpoint = ""
 			rt.DisplayUIURL = ""
 			rt.ServerHealthy = false
 			rt.DeployRunning = false
+			rt.DeployPreLaunch = false
 			rt.DeployFailed = false
 			rt.DeployError = ""
 			rt.DeployStartingUntil = time.Time{}
@@ -1452,11 +1522,13 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.RAMTotalMB = 0
 	rt.GPUUtilPercent = 0
 	rt.SessionUptimeSec = 0
+	s.cancelDeployFlowLocked(accountID)
 	rt.PublicURL = ""
 	rt.LLMURLBoundEndpoint = ""
 	rt.DisplayUIURL = ""
 	rt.ServerHealthy = false
 	rt.DeployRunning = false
+	rt.DeployPreLaunch = false
 	rt.DeployFailed = false
 	rt.DeployError = ""
 	rt.DeployStartingUntil = time.Time{}
@@ -1532,7 +1604,10 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	inStartingGrace := !rt.DeployStartingUntil.IsZero() && now.Before(rt.DeployStartingUntil)
 	deployFailed := core.IsDeployFailedStatus(tel.StatusPayload) && !tel.DeployAlive && !tel.Healthy
 
-	if tel.DeployAlive {
+	if rt.DeployPreLaunch {
+		// Keep local pre-launch (Drive mount / script upload) alive even if a previous ComfyUI is still healthy on the VM.
+		rt.DeployRunning = true
+	} else if tel.DeployAlive {
 		rt.DeployRunning = true
 		rt.DeployFailed = false
 		rt.DeployError = ""
@@ -1557,7 +1632,7 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	statusFresh := tel.StatusPayload != nil && tel.StatusAgeSeconds != nil && *tel.StatusAgeSeconds <= core.StatusFileMaxAgeSec
 	shouldNotifyDeployFail := false
 	deployFailDetail := ""
-	if deployFailed {
+	if !rt.DeployPreLaunch && deployFailed {
 		detail := strings.TrimSpace(tel.StatusPayload.Detail)
 		if detail == "" {
 			detail = "云端部署中断，请点「查看日志」排查原因"
@@ -1575,7 +1650,7 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 			shouldNotifyDeployFail = true
 			deployFailDetail = detail
 		}
-	} else if statusFresh {
+	} else if !rt.DeployPreLaunch && statusFresh {
 		if k, ok := tel.StatusPayload.ParsedKind(); ok {
 			rt.DetectedWorkloadKind = &k
 		}
@@ -1648,6 +1723,7 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		acc.AutoOpenComfyUI &&
 		tel.ComfyQueue != nil &&
 		!rt.DeployRunning &&
+		!rt.DeployPreLaunch &&
 		rt.AutoOpenedEndpoint != expectedEndpoint
 	if shouldAutoOpenComfy {
 		rt.AutoOpenedEndpoint = expectedEndpoint
@@ -2009,6 +2085,13 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		if preUsage, sessions, err := s.Engine.FetchUsageAndSessions(ctx, acc); err == nil {
 			for _, sess := range sessions {
 				if !sess.IsOrphan && sess.Name == acc.SessionName {
+					s.mu.RLock()
+					stillOwned := s.isQueueTokenOwnerLocked(acc.ID, token)
+					s.mu.RUnlock()
+					if !stillOwned || ctx.Err() != nil {
+						go s.refreshAccount(acc.ID, true, true, true)
+						return
+					}
 					logQueueOnce(sess.Hardware, false, false, core.AllocTagSuccess, "检测到目标会话已在线")
 					s.handlePostAllocation(acc, sess.Hardware, false, false)
 					return
@@ -2112,6 +2195,18 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		}
 
 		if res.Outcome.Kind == core.OutcomeAllocated {
+			if !owned || ctx.Err() != nil {
+				// Queue was cancelled while `colab new` was in flight: sync live instance so billing is visible, but skip auto-deploy.
+				_ = s.refreshAccount(acc.ID, true, true, true)
+				hwLbl := strings.TrimSpace(res.Outcome.Hardware)
+				if hwLbl == "" {
+					hwLbl = "云端显卡"
+				}
+				warn := fmt.Sprintf("取消排队时云端恰好已完成 %s 分配，如无需使用请点击关机止损", hwLbl)
+				s.ShowToast(warn)
+				s.SendNotification("排队已取消，但实例已分配", warn, true)
+				return
+			}
 			usedFallback := isFallbackAllocation(res.Outcome.Hardware, attempt, primaryTargets, fbEnabled, fbAfter, fbTarget)
 			detail := fmt.Sprintf("第 %d 轮抢到 %s", attempt, res.Outcome.Hardware)
 			if usedFallback {
@@ -2658,7 +2753,63 @@ func (s *Service) DeployNow(accountID string) {
 	}
 }
 
+func (s *Service) cancelDeployFlowLocked(accountID string) {
+	if fh, ok := s.deployFlowCancels[accountID]; ok {
+		if fh.cancel != nil {
+			fh.cancel()
+		}
+		delete(s.deployFlowCancels, accountID)
+	}
+	if s.actionPrompt != nil && s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == accountID {
+		s.actionPrompt = nil
+		if ch := s.driveAuthResultCh; ch != nil {
+			s.driveAuthResultCh = nil
+			select {
+			case ch <- false:
+			default:
+			}
+		}
+	}
+}
+
+func (s *Service) cancelDeployFlow(accountID string) {
+	s.mu.Lock()
+	s.cancelDeployFlowLocked(accountID)
+	if cur, ok := s.Runtime[accountID]; ok && cur.DeployPreLaunch {
+		cur.DeployPreLaunch = false
+		cur.DeployRunning = false
+		cur.DeployStartingUntil = time.Time{}
+		s.Runtime[accountID] = cur
+	}
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
+func (s *Service) clearDeployFlowIfToken(accountID, token string) {
+	s.mu.Lock()
+	if fh, ok := s.deployFlowCancels[accountID]; ok && fh.token == token {
+		if fh.cancel != nil {
+			fh.cancel()
+		}
+		delete(s.deployFlowCancels, accountID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) isDeployFlowOwnerLocked(accountID, token, expectedEndpoint string) bool {
+	fh, ok := s.deployFlowCancels[accountID]
+	if !ok || fh.token != token {
+		return false
+	}
+	rt, exists := s.Runtime[accountID]
+	if !exists || !rt.Phase.IsRunning() {
+		return false
+	}
+	return rt.ActiveEndpoint == expectedEndpoint
+}
+
 func (s *Service) cancelDeployWatcher(accountID string) {
+	s.cancelDeployFlow(accountID)
 	s.mu.Lock()
 	if wh, ok := s.deployWatchCancels[accountID]; ok {
 		if wh.cancel != nil {
@@ -2687,19 +2838,33 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 		return
 	}
 
-	// Atomically guard against duplicate concurrent launches & immediately show live deploy progress before Drive mount
+	// Atomically guard against duplicate concurrent launches & bind full lifecycle to current running endpoint
 	s.mu.Lock()
 	cur := s.Runtime[acc.ID]
+	if !cur.Phase.IsRunning() {
+		s.mu.Unlock()
+		return
+	}
 	if cur.DeployRunning {
 		s.mu.Unlock()
 		s.ShowToast("云端正在自动部署中，可点「查看日志」跟踪实时进度")
 		return
 	}
+	expectedEndpoint := cur.ActiveEndpoint
+	flowToken := uuid.New().String()
+	flowCtx, cancelFlow := s.serviceContext()
+	s.cancelDeployFlowLocked(acc.ID)
+	s.deployFlowCancels[acc.ID] = deployWatchHandle{
+		token:    flowToken,
+		endpoint: expectedEndpoint,
+		cancel:   cancelFlow,
+	}
 	cur.DeployRunning = true
+	cur.DeployPreLaunch = true
 	cur.DeployFailed = false
 	cur.DeployError = ""
 	cur.DeployNotifiedFailEndpoint = ""
-	cur.DeployStartingUntil = time.Now().Add(95 * time.Second)
+	cur.DeployStartingUntil = time.Now().Add(120 * time.Second)
 	cur.WorkloadMetricLabel = "正在部署"
 	cur.WorkloadMetricValue = "5%"
 	cur.WorkloadMetricUnit = "准备环境"
@@ -2713,14 +2878,18 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 	cur.AutoOpenedEndpoint = ""
 	s.Runtime[acc.ID] = cur
 	s.mu.Unlock()
+	defer s.clearDeployFlowIfToken(acc.ID, flowToken)
 	s.notifyUI()
 
 	if acc.UseGoogleDrive {
 		s.ShowToast("正在挂载 Google Drive（复用模型并自动存成片）…")
-		driveCtx, cancelDrive := s.serviceContext()
-		mounted, reason := s.Engine.EnsureDriveMountedInteractive(driveCtx, acc, func(authURL string) bool {
+		mounted, reason := s.Engine.EnsureDriveMountedInteractive(flowCtx, acc, func(authURL string) bool {
 			ch := make(chan bool, 1)
 			s.mu.Lock()
+			if !s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) || flowCtx.Err() != nil {
+				s.mu.Unlock()
+				return false
+			}
 			if oldCh := s.driveAuthResultCh; oldCh != nil {
 				select {
 				case oldCh <- false:
@@ -2750,16 +2919,29 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 			select {
 			case proceed := <-ch:
 				return proceed
+			case <-flowCtx.Done():
+				return false
 			case <-s.stopLoops:
 				return false
 			}
 		})
-		cancelDrive()
+		s.mu.Lock()
+		stillValid := s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) && flowCtx.Err() == nil
+		if !stillValid {
+			if st, ok := s.Runtime[acc.ID]; ok && st.ActiveEndpoint == expectedEndpoint {
+				st.DeployPreLaunch = false
+				st.DeployRunning = false
+				st.DeployStartingUntil = time.Time{}
+				s.Runtime[acc.ID] = st
+			}
+			s.mu.Unlock()
+			s.notifyUI()
+			return
+		}
 		if !mounted {
 			if reason == "" {
 				reason = "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
 			}
-			s.mu.Lock()
 			if st, ok := s.Runtime[acc.ID]; ok {
 				st.WorkloadDetail = reason
 				s.Runtime[acc.ID] = st
@@ -2767,10 +2949,23 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 			s.mu.Unlock()
 			s.notifyUI()
 			s.ShowToast(reason)
+		} else {
+			s.mu.Unlock()
 		}
 	}
 
 	s.mu.Lock()
+	if !s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) || flowCtx.Err() != nil {
+		if st, ok := s.Runtime[acc.ID]; ok && st.ActiveEndpoint == expectedEndpoint {
+			st.DeployPreLaunch = false
+			st.DeployRunning = false
+			st.DeployStartingUntil = time.Time{}
+			s.Runtime[acc.ID] = st
+		}
+		s.mu.Unlock()
+		s.notifyUI()
+		return
+	}
 	if st, ok := s.Runtime[acc.ID]; ok {
 		st.WorkloadMetricValue = "8%"
 		st.WorkloadMetricUnit = "推送脚本"
@@ -2786,13 +2981,26 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 	if acc.DeployRecipe == core.RecipeComfyUIGeneral {
 		scriptBody = templates.ComfyUIVideoScript
 	}
-	if err := s.Engine.StartBuiltinDeployScript(context.Background(), acc, scriptBody, envVars); err != nil {
+	if err := s.Engine.StartBuiltinDeployScript(flowCtx, acc, scriptBody, envVars); err != nil {
+		s.mu.Lock()
+		stillValid := s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) && flowCtx.Err() == nil
+		if !stillValid {
+			if st, ok := s.Runtime[acc.ID]; ok && st.ActiveEndpoint == expectedEndpoint {
+				st.DeployPreLaunch = false
+				st.DeployRunning = false
+				st.DeployStartingUntil = time.Time{}
+				s.Runtime[acc.ID] = st
+			}
+			s.mu.Unlock()
+			s.notifyUI()
+			return
+		}
 		errMsg := strings.TrimSpace(err.Error())
 		if errMsg == "" {
 			errMsg = "未能把部署脚本送到云端机器"
 		}
-		s.mu.Lock()
 		st := s.Runtime[acc.ID]
+		st.DeployPreLaunch = false
 		st.DeployRunning = false
 		st.DeployFailed = true
 		st.DeployError = errMsg
@@ -2812,7 +3020,12 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 	}
 
 	s.mu.Lock()
+	if !s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) {
+		s.mu.Unlock()
+		return
+	}
 	cur = s.Runtime[acc.ID]
+	cur.DeployPreLaunch = false
 	cur.DeployRunning = true
 	cur.DeployFailed = false
 	cur.DeployError = ""
@@ -2826,6 +3039,7 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 	cur.AutoOpenedEndpoint = ""
 	s.Runtime[acc.ID] = cur
 	s.mu.Unlock()
+	s.clearDeployFlowIfToken(acc.ID, flowToken)
 	s.notifyUI()
 	s.ShowToast("已把部署脚本送到云端，可直接在主屏看到实时进度或点「查看日志」")
 
@@ -2908,6 +3122,7 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 	s.notifyUI()
 
 	if targetSession == acc.SessionName {
+		s.cancelDeployFlow(accountID)
 		s.cancelDeployWatcher(accountID)
 		s.StopSSHTunnel(accountID)
 	}

@@ -986,3 +986,48 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		renderPNG(t, v0316IdlePop.View, 420, 520, filepath.Join(qaDir, "qa-v0316-popover-idle.png"))
 	}
 }
+
+func TestConcurrentBackgroundMutationsAndUIRenderNoRace(t *testing.T) {
+	svc := makeDemoService(app.SectionHome, false, false)
+	defer svc.Shutdown()
+	m := uiapp.NewMainUI(svc)
+	m.PreviewMode = true
+	p := uiapp.NewPopoverUI(svc)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		step := 1
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				svc.ShowToast("并发状态更新测试")
+				svc.SetShowingOnboarding(step%2 == 0)
+				svc.SetOnboardingStep((step % 3) + 1)
+				svc.SetSection(app.MainSection(step % 4))
+				svc.UpdateSettings(func(s *core.AppSettings) {
+					if step%2 == 0 {
+						s.ThemePreference = "dark"
+					} else {
+						s.ThemePreference = "light"
+					}
+				})
+				step++
+			}
+		}
+	}()
+
+	for i := 0; i < 8; i++ {
+		if img := ui.Render(m.View, 1160, 760, 1); img == nil {
+			t.Fatal("expected non-nil MainUI render under concurrent mutations")
+		}
+		if img := ui.Render(p.View, 420, 560, 1); img == nil {
+			t.Fatal("expected non-nil PopoverUI render under concurrent mutations")
+		}
+	}
+	close(stop)
+	<-done
+}

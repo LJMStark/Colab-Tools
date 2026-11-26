@@ -21,6 +21,7 @@ func (m *MainUI) selectH3Preset(acc core.AccountProfile, variant core.H3Variant)
 	if cp.IdleTimeoutMinutes == 40 {
 		cp.IdleTimeoutMinutes = cp.QueueDrainMinutes
 	}
+	m.DraftAccountID = ""
 	m.Svc.UpdateAccount(cp)
 	m.Svc.ClearAccountError(acc.ID)
 }
@@ -77,6 +78,7 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 				m.selectH3Preset(acc, core.H3VariantFlashGGUF)
 			})
 			m.compactOverlayChip(c, pal, "大模型代理", acc.DeployRecipe == core.RecipeLLMProxy, func() {
+				m.DraftAccountID = ""
 				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
 			})
 		})
@@ -87,9 +89,11 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 				m.selectH3Preset(acc, core.H3VariantCustom)
 			})
 			m.compactOverlayChip(c, pal, "通用 ComfyUI", acc.DeployRecipe == core.RecipeComfyUIGeneral, func() {
+				m.DraftAccountID = ""
 				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeComfyUIGeneral)
 			})
 			m.compactOverlayChip(c, pal, "纯开机", acc.DeployRecipe == core.RecipeNone, func() {
+				m.DraftAccountID = ""
 				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeNone)
 			})
 		})
@@ -230,8 +234,9 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 
 	// Allow switching/redeploying quickly when opened from a running dashboard
 	if rt.Phase.IsRunning() && acc.DeployRecipe.IsVideoComfy() {
+		cliReady := m.Svc.ViewState().CLIInstalled
 		ui.Row(c).FillWidth().Justify(ui.End).Gap(8).Children(func() {
-			SmallActionButton(c, pal, "按新选择立即重新部署", &pal.Amber, !m.Svc.CLIInstalled, func() {
+			SmallActionButton(c, pal, "按新选择立即重新部署", &pal.Amber, !cliReady, func() {
 				m.Svc.DeployNow(acc.ID)
 			})
 		})

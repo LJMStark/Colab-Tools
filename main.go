@@ -26,7 +26,7 @@ func main() {
 
 	openMainWindow := func(sec app.MainSection, onboarding bool) {
 		if onboarding {
-			svc.ShowingOnboarding = true
+			svc.SetShowingOnboarding(true)
 		} else {
 			svc.SetSection(sec)
 		}
@@ -171,7 +171,7 @@ func main() {
 		})
 		mygo.App.OnActivate(func(hasVisibleWindows bool) {
 			if !hasVisibleWindows {
-				openMainWindow(svc.SelectedSection, false)
+				openMainWindow(svc.ViewState().SelectedSection, false)
 			}
 		})
 		mygo.App.OnBeforeQuit(func(_ *mygo.QuitEvent) {
@@ -259,7 +259,7 @@ func main() {
 		updateTray()
 		svc.StartBackgroundServices()
 		// Open main console on initial launch for immediate visibility
-		openMainWindow(app.SectionStatus, svc.ShowingOnboarding)
+		openMainWindow(app.SectionStatus, svc.ViewState().ShowingOnboarding)
 	})
 
 	if err := mygo.App.Run(); err != nil {

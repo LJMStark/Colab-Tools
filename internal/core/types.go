@@ -1418,6 +1418,7 @@ type AccountRuntimeState struct {
 	DetectedServicePort        *int
 	QueueInFlight              bool
 	DeployRunning              bool
+	DeployPreLaunch            bool
 	DeployFailed               bool
 	DeployError                string
 	DeployStartingUntil        time.Time

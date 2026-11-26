@@ -9,6 +9,7 @@ import (
 )
 
 func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
+	vs := m.Svc.ViewState()
 	topPad := float32(28)
 	if !m.PreviewMode && runtime.GOOS == "darwin" {
 		topPad = 36
@@ -35,7 +36,7 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 				ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
 					for i, title := range steps {
 						stepNum := i + 1
-						active := m.Svc.OnboardingStep == stepNum
+						active := vs.OnboardingStep == stepNum
 						bg := pal.RecessedBg
 						border := pal.RecessedBorder
 						fg := pal.TextMuted
@@ -45,7 +46,7 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 							fg = pal.TextPrimary
 						}
 						el := ui.Row(c).FillWidth().Padding(10, 14).Radius(11).Background(bg).Border(1, border).Justify(ui.Center).AlignItems(ui.Center).Gap(8).OnClick(func() {
-							m.Svc.OnboardingStep = stepNum
+							m.Svc.SetOnboardingStep(stepNum)
 						})
 						if active {
 							el.InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight)
@@ -63,7 +64,7 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 					}
 				})
 
-				switch m.Svc.OnboardingStep {
+				switch vs.OnboardingStep {
 				case 1:
 					m.onboardingStep1Doctor(c, pal)
 				case 2:
@@ -83,7 +84,8 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 }
 
 func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
-	env := m.Svc.EnvReport
+	vs := m.Svc.ViewState()
+	env := vs.EnvReport
 	accounts := m.Svc.AccountsSnapshot()
 
 	SectionCard(c, pal, "", "", func() {
@@ -93,10 +95,10 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 				ui.Text(c, "Colab Tools 完全基于 Google 官方 google-colab-cli 驱动，不私自绕过任何官方接口。").FontSize(12.5).TextColor(pal.TextMuted)
 			})
 			lbl := "重新体检"
-			if m.Svc.IsCheckingEnv {
+			if vs.IsCheckingEnv {
 				lbl = "检测中…"
 			}
-			onboardingRefreshButton(c, pal, lbl, m.Svc.IsCheckingEnv || m.Svc.IsInstallingCLI, func() {
+			onboardingRefreshButton(c, pal, lbl, vs.IsCheckingEnv || vs.IsInstallingCLI, func() {
 				go m.Svc.RefreshEnvironmentCheck()
 			})
 		})
@@ -104,7 +106,7 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
 		cliDetail := "未检测到 colab 命令，可点击下方按钮自动为你安装"
-		if m.Svc.CLIInstalled {
+		if vs.CLIInstalled {
 			ver := ""
 			if env.ColabVersion != "" {
 				ver = " v" + env.ColabVersion
@@ -113,7 +115,7 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 		} else if env.ColabBrokenReason != "" {
 			cliDetail = env.ColabBrokenReason
 		}
-		m.doctorRow(c, pal, "官方 google-colab-cli", m.Svc.CLIInstalled, cliDetail)
+		m.doctorRow(c, pal, "官方 google-colab-cli", vs.CLIInstalled, cliDetail)
 
 		pkgOK := env.UVPath != "" || env.PipxPath != "" || env.BrewPath != "" || env.UsingWSLBridge
 		pkgTitle := "包管理环境（uv / pipx / Homebrew）"
@@ -128,7 +130,7 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 		}
 		m.doctorRow(c, pal, "Google Colab 账号授权", len(accounts) > 0, accDetail)
 
-		if !m.Svc.CLIInstalled {
+		if !vs.CLIInstalled {
 			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 			ui.Column(c).FillWidth().Gap(12).Children(func() {
 				ui.Text(c, "✦ 自动安装方案："+env.RecommendedMethod.DisplayTitle()).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
@@ -142,15 +144,15 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 				}
 
 				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-					if m.Svc.IsInstallingCLI {
+					if vs.IsInstallingCLI {
 						status := "正在安装 google-colab-cli，请稍候…"
 						cancelLabel := "取消安装"
-						if m.Svc.IsCancellingCLIInstall {
+						if vs.IsCancellingCLIInstall {
 							status = "正在终止安装进程组…"
 							cancelLabel = "正在取消…"
 						}
 						ui.Text(c, status).FontSize(13).FontWeight(500).TextColor(pal.Amber)
-						SmallActionButton(c, pal, cancelLabel, &pal.Coral, m.Svc.IsCancellingCLIInstall, func() {
+						SmallActionButton(c, pal, cancelLabel, &pal.Coral, vs.IsCancellingCLIInstall, func() {
 							m.Svc.CancelCLIInstall()
 						})
 					} else {
@@ -166,13 +168,13 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 					ui.Spacer(c)
 				})
 
-				if m.Svc.CLIInstallError != "" {
-					ui.Text(c, "⚠ "+m.Svc.CLIInstallError).FontSize(12.5).TextColor(pal.Coral)
+				if vs.CLIInstallError != "" {
+					ui.Text(c, "⚠ "+vs.CLIInstallError).FontSize(12.5).TextColor(pal.Coral)
 				}
 
-				if len(m.Svc.CLIInstallLogs) > 0 {
+				if len(vs.CLIInstallLogs) > 0 {
 					ui.Column(c).FillWidth().Padding(10).Radius(8).Background(ui.RGBA(0, 0, 0, 0.25)).Children(func() {
-						tail := m.Svc.CLIInstallLogs
+						tail := vs.CLIInstallLogs
 						if len(tail) > 8 {
 							tail = tail[len(tail)-8:]
 						}
@@ -185,7 +187,7 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 				ui.Text(c, "✓ 环境已就绪，google-colab-cli 可正常工作").FontSize(13.5).FontWeight(600).TextColor(pal.Emerald)
 				ui.Spacer(c)
 				PillButton(c, pal, "下一步：绑定 Google 账号 →", true, false, func() {
-					m.Svc.OnboardingStep = 2
+					m.Svc.SetOnboardingStep(2)
 				})
 			})
 		}
@@ -217,6 +219,7 @@ func (m *MainUI) doctorRow(c *ui.Context, pal Palette, title string, ok bool, de
 }
 
 func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
+	vs := m.Svc.ViewState()
 	accounts := m.Svc.AccountsSnapshot()
 	SectionCard(c, pal, "", "", func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
@@ -224,7 +227,7 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 				ui.Text(c, "绑定你的第一个 Google Colab 账号").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
 				ui.Text(c, "凭证仅加密存于本机系统凭据库；支持同时绑定多个 AI Ultra / Pro+ / Pro / Free 账号。").FontSize(12.5).TextColor(pal.TextMuted)
 			})
-			SmallActionButton(c, pal, "自动导入终端已登账号", nil, !m.Svc.CLIInstalled || m.Svc.IsImportingDefault, func() {
+			SmallActionButton(c, pal, "自动导入终端已登账号", nil, !vs.CLIInstalled || vs.IsImportingDefault, func() {
 				go func() {
 					if !m.Svc.TryImportSystemDefaultAccount() {
 						m.Svc.ShowToast("未检测到终端默认 colab 登录，请用下方按钮走官方授权")
@@ -258,12 +261,12 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 			ui.Row(c).FillWidth().Padding(6, 0, 0, 0).Children(func() {
 				ui.Spacer(c)
 				PillButton(c, pal, "下一步：30 秒快速上手 →", true, false, func() {
-					m.Svc.OnboardingStep = 3
+					m.Svc.SetOnboardingStep(3)
 				})
 			})
 		} else {
 			m.renderEmbeddedOAuthBinder(c, pal, func() {
-				m.Svc.OnboardingStep = 3
+				m.Svc.SetOnboardingStep(3)
 			})
 		}
 	})
@@ -284,7 +287,7 @@ func (m *MainUI) onboardingStep3Tour(c *ui.Context, pal Palette) {
 
 		ui.Row(c).FillWidth().Padding(8, 0, 0, 0).Children(func() {
 			PillButton(c, pal, "← 返回上一步", false, false, func() {
-				m.Svc.OnboardingStep = 2
+				m.Svc.SetOnboardingStep(2)
 			})
 			ui.Spacer(c)
 			PillButton(c, pal, "✦ 进入 Colab Tools 主控制台", true, false, func() {
