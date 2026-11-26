@@ -3,6 +3,20 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.10] - 2026-11-26
+
+### Changed
+- **First-Principles Beginner UX Simplification (6+4 Pages → 3 Clean Tabs)**:
+  - Streamlined top navigation from 6 tabs (`状态 / 部署 / 抢卡 / 接入 / 账号 / 设置` + 4 nested settings sub-tabs) down to **3 clear tabs (`主页` · `账号` · `设置`)** with zero nested settings sub-tabs.
+  - Replaced the empty dashed offline dashboard with a **zero-config Home Launchpad**: defaults to **H3 Flash 极速版 + Smart GPU picking (`A100 → G4 → L4`) + Google Drive sync + 10m post-queue auto-shutdown**, letting beginners start in **1 click** without hunting through settings.
+  - Consolidated GPU picking into **3 unified modes (`智能挑卡` / `省点模式` / `高级自定义`)** inside a collapsible drawer, moved LLM coding-tool integrations contextually under the **大模型代理** preset, unified auto-shutdown into a single source of truth, and removed the conflicting legacy 6-workload selector from Advanced Settings.
+  - Added one-click **「恢复小白推荐默认」** and direct subscription tier selection in Accounts.
+
+### Fixed
+- **Eliminated False 15-Minute Rate-Limit Locks & Hidden Provision Errors**:
+  - Updated `ClassifyProvisionFailure` to match real `google-colab-cli 0.8.x` outputs (`Backend rejected accelerator '...'` → single-card 400 prune & auto-skip; `Allocation refused (precondition failed)` → active-session check that auto-skips to the next card when 0 sessions are active or surfaces a one-click **「停掉旧机器」** button when sessions exist; `502/503/504/ReadTimeout` → retryable shortage; `401/403` and command timeouts → clear actionable retry without 15-minute lockout).
+  - Restricted 15-minute cooldown strictly to genuine `429` rate limits / abuse warnings, displayed the actual plain-Chinese reason (with expandable raw CLI snippet), and added a manual **「解除等待」** escape hatch.
+
 ## [0.3.9] - 2026-11-26
 
 ### Changed

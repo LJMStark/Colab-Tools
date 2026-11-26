@@ -41,22 +41,41 @@ func TestSubscriptionTierAndOfflineHoursEstimation(t *testing.T) {
 	}
 
 	acc := core.NewDefaultAccountProfile("Ultra", "u@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.GPUStrategy = core.GPUStrategyCustom
+	acc.EnablePoliteQueue = false
 	acc.PreferredAccelerator = core.AccAutoBest
 	rt := core.NewAccountRuntimeState()
 	rt.CUBalance = 2362.2
 
-	// Offline auto preset uses L4 baseline (2.33 CU/h -> ~1014h), never CPU 0.1 CU/h (23622h)
+	// Offline custom single-launch auto preset uses L4 baseline (2.33 CU/h -> ~1014h), never CPU 0.1 CU/h (23622h)
 	hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
 	if !ok || basis != "L4" || int(hrs+0.5) != 1014 {
 		t.Fatalf("unexpected offline estimate: hrs=%.1f basis=%s ok=%v", hrs, basis, ok)
 	}
 
-	// Queue targeting G4 first uses G4 (7.0 CU/h -> ~337h)
+	// Custom queue targeting G4 first uses G4 (7.0 CU/h -> ~337h)
 	acc.EnablePoliteQueue = true
 	acc.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccH100}
 	hrs, basis, ok = rt.EstimatedHoursRemaining(acc)
 	if !ok || basis != "G4" || int(hrs+0.5) != 337 {
 		t.Fatalf("unexpected queue estimate: hrs=%.1f basis=%s ok=%v", hrs, basis, ok)
+	}
+
+	// Smart strategy auto-adapts GPU priority per scenario:
+	// H3 Flash -> A100 -> G4 -> L4; H3 Original -> G4 -> A100 -> H100; GGUF -> L4 -> A100
+	acc.GPUStrategy = core.GPUStrategyAutoSmart
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.H3Variant = core.H3VariantFlash
+	if got := core.EffectiveQueueTargets(acc); len(got) < 3 || got[0] != core.AccA100 || got[1] != core.AccG4 || got[2] != core.AccL4 {
+		t.Fatalf("expected H3 Flash smart order A100->G4->L4, got %v", got)
+	}
+	acc.H3Variant = core.H3VariantOriginal
+	if got := core.EffectiveQueueTargets(acc); len(got) < 3 || got[0] != core.AccG4 || got[1] != core.AccA100 {
+		t.Fatalf("expected H3 Original smart order G4->A100->H100, got %v", got)
+	}
+	acc.H3Variant = core.H3VariantFlashGGUF
+	if got := core.EffectiveQueueTargets(acc); len(got) < 2 || got[0] != core.AccL4 {
+		t.Fatalf("expected H3 GGUF smart order L4->A100, got %v", got)
 	}
 
 	// Free tier without paid balance is restricted from SSH/WebUI
@@ -96,18 +115,30 @@ func TestPoliteQueueEqualJitterFallbackAndScheduleGrace(t *testing.T) {
 		t.Fatalf("round 3 must append L4 fallback: %v", r3)
 	}
 
-	// Circuit breaker classification
+	// Real google-colab-cli 0.8.x error classification (never misclassify single-card rejection or timeout as 15m rate-limit)
 	if core.ClassifyProvisionFailure(1, false, "", "HTTP 503 Service Unavailable", "G4").Kind != core.OutcomeCapacity503 {
-		t.Fatal("503 should allow queue")
+		t.Fatal("503 should allow queue/fallback")
 	}
-	if core.ClassifyProvisionFailure(1, false, "", "HTTP 429 Too Many Requests", "G4").Kind != core.OutcomeCircuitBroken {
-		t.Fatal("429 must circuit break")
+	if core.ClassifyProvisionFailure(1, false, "", "requests.exceptions.ReadTimeout: Read timed out", "G4").Kind != core.OutcomeCapacity503 {
+		t.Fatal("ReadTimeout should be treated as retryable capacity/network issue")
 	}
-	if core.ClassifyProvisionFailure(1, false, "", "HTTP 412 Too many assignments", "G4").Kind != core.OutcomeCircuitBroken {
-		t.Fatal("412 must circuit break")
+	if core.ClassifyProvisionFailure(1, false, "", "[colab] Backend rejected accelerator 'G4'. You may not have quota or entitlement for this accelerator on your account.", "G4").Kind != core.OutcomeUnsupportedTier400 {
+		t.Fatal("google-colab-cli 0.8.0 Backend rejected accelerator must classify as single-card unsupported 400")
 	}
-	if core.ClassifyProvisionFailure(1, true, "", "", "G4").Kind != core.OutcomeCircuitBroken {
-		t.Fatal("timeout must circuit break")
+	if core.ClassifyProvisionFailure(1, false, "", "[colab] Allocation refused (precondition failed). This can mean too many active sessions, or a temporary usage or capacity limit.", "G4").Kind != core.OutcomePrecondition412 {
+		t.Fatal("412 Allocation refused must classify as OutcomePrecondition412 for active-session inspection")
+	}
+	if core.ClassifyProvisionFailure(1, false, "", "HTTP 401 Unauthorized", "G4").Kind != core.OutcomeAuthError {
+		t.Fatal("401 must classify as OutcomeAuthError without 15m lock")
+	}
+	if core.ClassifyProvisionFailure(1, true, "", "", "G4").Kind != core.OutcomeTransientError {
+		t.Fatal("command timeout must classify as transient error without 15m lock")
+	}
+	if core.ClassifyProvisionFailure(1, false, "", "HTTP 429 Too Many Requests", "G4").Kind != core.OutcomeRateLimited {
+		t.Fatal("429 must trigger rate-limit cooldown")
+	}
+	if core.ClassifyProvisionFailure(1, false, "", "Your account is blocked from accessing Colab due to abusive usage", "G4").Kind != core.OutcomeRateLimited {
+		t.Fatal("abuse warning must trigger rate-limit cooldown")
 	}
 
 	// Schedule grace window & missed one-shot expiry

@@ -577,24 +577,27 @@ func (e *Engine) ProvisionSession(
 ) ProvisionRoundResult {
 	res := ProvisionRoundResult{UnsupportedValues: map[string]bool{}}
 	if !core.IsValidSessionName(profile.SessionName) {
-		res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeCircuitBroken, Code: "INVALID_SESSION", Message: "会话名不合法（仅允许字母、数字、._-）"}
+		res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "INVALID_SESSION", Message: "会话名不合法（仅允许字母、数字、._-）"}
 		return res
 	}
 	targets := overrideTargets
 	if len(targets) == 0 {
-		targets = profile.PreferredAccelerator.ProbeTargets()
+		for _, opt := range core.EffectiveQueueTargets(profile) {
+			targets = append(targets, opt.ProbeTargets()...)
+		}
 	}
 	if len(targets) == 0 {
-		res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeCircuitBroken, Code: "NO_TARGET", Message: "未选择任何目标算力卡"}
+		res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "NO_TARGET", Message: "未选择任何目标算力卡"}
 		return res
 	}
 
-	lastOutcome := core.ProvisionOutcome{Kind: core.OutcomeCapacity503, Message: "当前目标算力无库存 (503)"}
-	saw503 := false
+	lastOutcome := core.ProvisionOutcome{Kind: core.OutcomeCapacity503, Message: "当前目标算力暂时没货"}
+	sawCapacity := false
+	useHighMem := core.EffectiveUseHighMem(profile)
 
 	for idx, target := range targets {
 		if ctx.Err() != nil {
-			res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeCircuitBroken, Code: "CANCELLED", Message: "已取消申请"}
+			res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "CANCELLED", Message: "已取消申请"}
 			return res
 		}
 		if deadline != nil && time.Until(*deadline) < core.QueueMinProvisionBudget {
@@ -609,12 +612,12 @@ func (e *Engine) ProvisionSession(
 			}
 			if pause > 0 {
 				if onProgress != nil {
-					onProgress(fmt.Sprintf("准备尝试 %s（间隔 %ds）…", target.Display, int(pause.Seconds())))
+					onProgress(fmt.Sprintf("自动改试 %s（间隔 %ds）…", target.Display, int(pause.Seconds())))
 				}
 				select {
 				case <-time.After(pause):
 				case <-ctx.Done():
-					res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeCircuitBroken, Code: "CANCELLED", Message: "已取消申请"}
+					res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "CANCELLED", Message: "已取消申请"}
 					return res
 				}
 			}
@@ -633,13 +636,13 @@ func (e *Engine) ProvisionSession(
 		}
 
 		if onProgress != nil {
-			onProgress(fmt.Sprintf("申请 %s…", target.Display))
+			onProgress(fmt.Sprintf("正在申请 %s…", target.Display))
 		}
 		args := []string{"new", "-s", profile.SessionName}
 		if target.Flag != "" && target.Value != "" {
 			args = append(args, target.Flag, target.Value)
 		}
-		if profile.HighMem && profile.Tier.SupportsHighMem() {
+		if useHighMem {
 			args = append(args, "--high-mem")
 		}
 		r := e.RunColab(ctx, profile, args, "", stepTimeout)
@@ -654,18 +657,58 @@ func (e *Engine) ProvisionSession(
 			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
 			res.Outcome = outcome
 			return res
-		case core.OutcomeCircuitBroken, core.OutcomeBudgetExhausted:
+		case core.OutcomeRateLimited, core.OutcomeAuthError, core.OutcomeBudgetExhausted:
+			res.Outcome = outcome
+			return res
+		case core.OutcomePrecondition412:
+			// Official google-colab-cli 0.8.x uses HTTP 412 for BOTH "too many active sessions"
+			// AND "temporary usage/capacity limit for the requested accelerator".
+			// Check active sessions on server: if 0 active sessions, treat this card as unavailable and try the next card!
+			_, activeSessions, checkErr := e.FetchUsageAndSessions(ctx, profile)
+			if checkErr == nil && len(activeSessions) == 0 {
+				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
+				sawCapacity = true
+				lastOutcome = core.ProvisionOutcome{
+					Kind:      core.OutcomeCapacity503,
+					Hardware:  target.Display,
+					Code:      "412_CAPACITY",
+					Message:   fmt.Sprintf("%s 暂时受限或满载，将自动改试下一张卡", target.Display),
+					RawDetail: outcome.RawDetail,
+				}
+				if onProgress != nil {
+					onProgress(fmt.Sprintf("%s 暂时受限，自动切换下一张卡…", target.Display))
+				}
+				continue
+			}
+			if checkErr == nil && len(activeSessions) > 0 {
+				outcome.Message = fmt.Sprintf("账号里已有 %d 个运行中的机器，达到同时开机上限，请先关掉旧机器", len(activeSessions))
+			}
 			res.Outcome = outcome
 			return res
 		case core.OutcomeCapacity503:
 			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
-			saw503 = true
+			sawCapacity = true
 			lastOutcome = outcome
+			if onProgress != nil {
+				onProgress(fmt.Sprintf("%s 暂时没货，自动切换下一张卡…", target.Display))
+			}
 		case core.OutcomeUnsupportedTier400:
 			if target.Value != "" {
 				res.UnsupportedValues[strings.ToUpper(target.Value)] = true
 			}
-			if !saw503 {
+			if !sawCapacity {
+				lastOutcome = outcome
+			}
+			if onProgress != nil {
+				onProgress(fmt.Sprintf("当前账号无 %s 配额，自动跳过…", target.Display))
+			}
+		case core.OutcomeTransientError:
+			if outcome.Code == "TIMEOUT" {
+				// Do not blindly retry after an ambiguous timeout to avoid duplicate billing.
+				res.Outcome = outcome
+				return res
+			}
+			if !sawCapacity {
 				lastOutcome = outcome
 			}
 		}

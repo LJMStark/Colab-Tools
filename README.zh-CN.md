@@ -28,12 +28,12 @@
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/images/preview-deploy-h3.png" alt="一键部署 H3 原版与 Flash 极速版" width="420" /><br />
-      <sub><b>一键部署 H3 视频模型</b> · 默认选「H3 原版」或「H3 Flash 极速版」，也能换轻量 GGUF 或自己贴链接，21.5GB 底座共用不重复下</sub>
+      <img src="docs/images/preview-deploy-h3.png" alt="极简主页一屏免配置开机台" width="420" /><br />
+      <sub><b>打开主页点 1 下就能跑</b> · 默认已配齐 H3 Flash 极速版 + 智能挑卡（没货自动换下张）+ Drive 存片 + 跑完 10 分钟关机</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-settings-queue.png" alt="算力抢卡与清晨错峰预约" width="420" /><br />
-      <sub><b>自动排队抢卡 & 清晨预约</b> · 挑好想抢的显卡顺位与保底卡，设好清晨自动开机，不用守在电脑前狂点</sub>
+      <img src="docs/images/preview-settings-queue.png" alt="按需展开的自定义显卡顺位与清晨预约" width="420" /><br />
+      <sub><b>老手也能按需展开微调</b> · 平时折叠不打扰，需要时一键切省点模式或自定义多卡顺位、保底与清晨定时预约</sub>
     </td>
   </tr>
   <tr>
@@ -86,9 +86,9 @@
 
 ### 方式一：直接下载安装包（推荐）
 1. 去 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 按你的电脑下载：
-   - **macOS (Apple Silicon)**：下载 `Colab-Tools-v0.3.9-macOS-arm64.zip`，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
-   - **Windows (64 位)**：下载 `Colab-Tools-v0.3.9-Windows-amd64.zip`，解压后直接双击 **`Colab Tools.exe`**。
-2. 跟着 3 步开箱引导绑好 Google 账号，切到「**部署**」页选 **H3 原版** 或 **H3 Flash 极速版**，点一下 **「立即开机并部署」**，剩下的交给它。
+   - **macOS (Apple Silicon)**：下载 `Colab-Tools-v0.3.10-macOS-arm64.zip`，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
+   - **Windows (64 位)**：下载 `Colab-Tools-v0.3.10-Windows-amd64.zip`，解压后直接双击 **`Colab Tools.exe`**。
+2. 跟着 3 步开箱引导绑好 Google 账号，回到「**主页**」默认已经选好 **H3 Flash 极速版 + 智能挑卡 + Drive 存片 + 跑完自动关机**，直接点 **「▶ 一键开机并运行」** 就行。
 
 > **系统弹窗提示**：开源工具使用自签发布。macOS 第一次打开如遇提示，请右键应用点「打开」（或终端执行 `xattr -cr "/Applications/Colab Tools.app"`）；Windows 若弹出 SmartScreen，点「更多信息 → 仍要运行」即可。
 

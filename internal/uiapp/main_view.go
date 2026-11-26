@@ -14,27 +14,23 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-type SettingsSubTab int
-
-const (
-	SubTabGeneral SettingsSubTab = iota
-	SubTabDoctor
-	SubTabAdvanced
-	SubTabAbout
-)
-
 // MainUI holds transient form/editor state for the desktop console window.
 type MainUI struct {
 	Svc         *app.Service
 	PreviewMode bool
 	ForceTheme  string // "", "dark", "light" (used for deterministic screenshot exports)
 
-	SettingsSubTab      SettingsSubTab
-	SelectedCopyProto   integrations.CopyProtocolKind
-	SelectedInsightHW   string
-	ShowAccountDropdown bool
-	AgreedRemoteScript  bool
-	ShowInstallLogs     bool
+	SelectedCopyProto    integrations.CopyProtocolKind
+	SelectedInsightHW    string
+	ShowAccountDropdown  bool
+	AgreedRemoteScript   bool
+	ShowInstallLogs      bool
+	ShowHomeOptions      bool // Idle launchpad collapsible options drawer (collapsed by default)
+	ShowMoreRecipes      bool // Extended recipes row under "更多玩法"
+	ShowRunningDrawer    bool // On-demand scheme/integration drawer when running
+	ShowErrorRaw         bool // Toggle raw CLI snippet in error banner
+	ShowAdvancedSettings bool // Collapsible advanced parameters in Settings (collapsed by default)
+	EditingTierAccountID string
 
 	// OAuth2 Add-Account form state
 	NewAccName      string
@@ -57,6 +53,8 @@ type MainUI struct {
 	DraftAccountID     string
 	PortValidationErr  string
 }
+
+func timeNow() time.Time { return time.Now() }
 
 func NewMainUI(svc *app.Service) *MainUI {
 	return &MainUI{
@@ -129,14 +127,8 @@ func (m *MainUI) View(c *ui.Context) {
 			body := func() {
 				ui.Column(c).FillWidth().Padding(18, 24, 24, 24).Gap(14).Children(func() {
 					switch m.Svc.SelectedSection {
-					case app.SectionStatus:
+					case app.SectionHome:
 						m.renderStatusPage(c, pal)
-					case app.SectionDeploy:
-						m.centeredWorkbench(c, func() { m.renderDeployPage(c, pal) })
-					case app.SectionCompute:
-						m.centeredWorkbench(c, func() { m.renderComputePage(c, pal) })
-					case app.SectionIntegrations:
-						m.centeredWorkbench(c, func() { m.renderIntegrationsPage(c, pal) })
 					case app.SectionAccounts:
 						m.centeredWorkbench(c, func() { m.renderAccountsPage(c, pal) })
 					case app.SectionSettings:
@@ -153,17 +145,16 @@ func (m *MainUI) View(c *ui.Context) {
 		}
 	})
 
-	// Floating bottom-right toast banner
+	// Floating bottom-right toast banner (non-blocking PassThrough so clicks underneath always work)
 	if toast := m.Svc.ToastMessage; toast != "" {
 		ui.Overlay(c, func() {
-			ui.Column(c).Fill().Justify(ui.End).AlignItems(ui.End).Padding(20).Children(func() {
-				ui.Row(c).Gap(8).Padding(10, 16).Radius(999).
-					Background(pal.CardBg).Border(1, pal.SubtleBorder).
-					Shadow(0, 4, 14, 0, ui.RGBA(0, 0, 0, 0.25)).
-					AlignItems(ui.Center).Children(func() {
-					ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Emerald)
-					ui.Text(c, toast).FontSize(13).FontWeight(500).TextColor(pal.TextPrimary).MaxLines(1)
-				})
+			ui.Row(c).Absolute().Right(20).Bottom(20).PassThrough().
+				Gap(8).Padding(10, 16).Radius(999).
+				Background(pal.CardBg).Border(1, pal.SubtleBorder).
+				Shadow(0, 4, 14, 0, ui.RGBA(0, 0, 0, 0.25)).
+				AlignItems(ui.Center).Children(func() {
+				ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Emerald)
+				ui.Text(c, toast).FontSize(13).FontWeight(500).TextColor(pal.TextPrimary).MaxLines(1)
 			})
 		})
 	}
@@ -326,18 +317,21 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 
 	rt := m.Svc.StateFor(acc.ID)
 
-	// Active queue or circuit-breaker banner
+	// Active queue, rate-limit cooldown, or actionable error banner (always plain Chinese with clear recovery)
 	if rt.Phase.IsQueuing() {
-		countdown := "正在探测库存…"
+		countdown := "正在按顺位尝试拿卡…"
+		if rt.Phase.Detail != "" {
+			countdown = rt.Phase.Detail
+		}
 		if rt.Phase.NextRetryAt != nil {
 			rem := max(0, int(math.Ceil(time.Until(*rt.Phase.NextRetryAt).Seconds())))
-			countdown = fmt.Sprintf("距下次探测 %02d:%02d", rem/60, rem%60)
+			countdown = fmt.Sprintf("暂未有货，%02d:%02d 后自动再试下一轮", rem/60, rem%60)
 		}
 		ui.Row(c).FillWidth().Padding(10, 14).Radius(12).
 			Background(WithAlpha(pal.Amber, 0.13)).Border(1, WithAlpha(pal.Amber, 0.34)).
 			AlignItems(ui.Center).Gap(10).Children(func() {
 			ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Amber)
-			ui.Textf(c, "合规排队中 · 第 %d/%d 轮（%s）· %s", rt.Phase.QueueAttempt, rt.Phase.QueueMax, rt.Phase.TargetsSummary, countdown).
+			ui.Textf(c, "自动排队拿卡中 · 第 %d/%d 轮（%s）· %s", rt.Phase.QueueAttempt, rt.Phase.QueueMax, rt.Phase.TargetsSummary, countdown).
 				FontSize(13).FontWeight(500).FontFeatures("tnum").TextColor(pal.TextPrimary).Grow(1)
 			SmallActionButton(c, pal, "取消排队", &pal.Coral, false, func() {
 				m.Svc.CancelQueue(acc.ID)
@@ -345,16 +339,103 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		})
 	} else if rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(time.Now()) {
 		remMin := max(1, int(math.Ceil(time.Until(*rt.QueueCircuitBreakTill).Minutes())))
-		ui.Row(c).FillWidth().Padding(10, 14).Radius(12).
-			Background(WithAlpha(pal.Coral, 0.13)).Border(1, WithAlpha(pal.Coral, 0.34)).
-			AlignItems(ui.Center).Gap(10).Children(func() {
-			ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Coral)
-			ui.Textf(c, "已触发防风控硬熔断保护，冷却剩余约 %d 分钟后可重新申请。", remMin).
-				FontSize(13).FontWeight(500).TextColor(pal.TextPrimary)
+		title := rt.LastErrorTitle
+		if title == "" {
+			title = "Google 提示请求偏频繁，先歇一会儿保护账号"
+		}
+		detail := rt.LastError
+		if detail == "" {
+			detail = fmt.Sprintf("建议等待约 %d 分钟后再申请；如果刚换了显卡或确认无误，也可以点右侧直接解除等待。", remMin)
+		} else {
+			detail = fmt.Sprintf("%s（还剩约 %d 分钟）", detail, remMin)
+		}
+		ui.Column(c).FillWidth().Padding(12, 14).Gap(8).Radius(12).
+			Background(WithAlpha(pal.Coral, 0.12)).Border(1, WithAlpha(pal.Coral, 0.34)).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+				ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Coral).Shrink(0)
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+					ui.Text(c, detail).FontSize(12).TextColor(pal.TextMuted)
+				})
+				if rt.LastErrorRaw != "" {
+					lbl := "查看详情"
+					if m.ShowErrorRaw {
+						lbl = "收起详情"
+					}
+					SmallActionButton(c, pal, lbl, nil, false, func() {
+						m.ShowErrorRaw = !m.ShowErrorRaw
+					})
+				}
+				SmallActionButton(c, pal, "解除等待", &pal.Amber, false, func() {
+					m.Svc.ClearCooldown(acc.ID)
+				})
+			})
+			if m.ShowErrorRaw && rt.LastErrorRaw != "" {
+				ui.Text(c, "原始反馈："+rt.LastErrorRaw).FontSize(11.5).Font("monospace").TextColor(pal.TextMuted)
+			}
+		})
+	} else if rt.LastError != "" && !rt.Phase.IsRunning() {
+		title := rt.LastErrorTitle
+		if title == "" {
+			title = "刚才这次申请没成功"
+		}
+		ui.Column(c).FillWidth().Padding(12, 14).Gap(8).Radius(12).
+			Background(WithAlpha(pal.Amber, 0.12)).Border(1, WithAlpha(pal.Amber, 0.35)).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+				ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Amber).Shrink(0)
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+					ui.Text(c, rt.LastError).FontSize(12).TextColor(pal.TextMuted)
+				})
+				if rt.LastErrorRaw != "" {
+					lbl := "详情"
+					if m.ShowErrorRaw {
+						lbl = "收起"
+					}
+					SmallActionButton(c, pal, lbl, nil, false, func() {
+						m.ShowErrorRaw = !m.ShowErrorRaw
+					})
+				}
+				switch rt.LastErrorAction {
+				case "stop_existing":
+					SmallActionButton(c, pal, "停掉旧机器", &pal.Coral, false, func() {
+						go m.Svc.StopAllManagedSessions()
+					})
+				case "reauth":
+					SmallActionButton(c, pal, "去重新授权", &pal.Amber, false, func() {
+						m.Svc.SetSection(app.SectionAccounts)
+					})
+				default:
+					SmallActionButton(c, pal, "直接重试", &pal.Amber, !m.Svc.CLIInstalled, func() {
+						m.Svc.DeployNow(acc.ID)
+					})
+				}
+				SmallActionButton(c, pal, "✕", nil, false, func() {
+					m.Svc.ClearAccountError(acc.ID)
+				})
+			})
+			if m.ShowErrorRaw && rt.LastErrorRaw != "" {
+				ui.Text(c, "原始反馈："+rt.LastErrorRaw).FontSize(11.5).Font("monospace").TextColor(pal.TextMuted)
+			}
 		})
 	}
 
-	// 4x2 Mole Bento Grid
+	// Smart dual-mode Home:
+	// - Offline idle -> clean zero-config Launchpad (one click to run, no empty dashed cards)
+	// - Running / Starting / Queuing / Stopping -> live 4x2 Bento telemetry console
+	if !rt.Phase.IsRunning() && !rt.Phase.IsQueuing() && !rt.Phase.IsBusy() {
+		m.centeredWorkbench(c, func() {
+			m.renderHomeIdleLaunchpad(c, pal, acc, rt)
+			accounts := m.Svc.AccountsSnapshot()
+			hasExtra := len(rt.Sessions) > 0 || rt.CURatePerHour > 0
+			if len(accounts) >= 2 || hasExtra {
+				m.renderLiveAccountsTable(c, pal, acc)
+			}
+		})
+		return
+	}
+
+	// 4x2 Mole Bento Grid (Live Console when Active/Queuing/Starting)
 	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(14).Children(func() {
 		m.bentoHealthCU(c, pal, acc, rt)
 		m.bentoVRAM(c, pal, rt)
@@ -365,6 +446,23 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		m.bentoStrategy(c, pal, acc)
 		m.bentoQuickIntegrations(c, pal, acc, rt)
 	})
+
+	// Optional inline drawer when user clicks "换 H3 版本 / 调整方案 / 配置接入" while running
+	if m.ShowRunningDrawer {
+		m.centeredWorkbench(c, func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "当前任务方案与工具配置").FontSize(15).FontWeight(600).TextColor(pal.TextPrimary)
+				ui.Spacer(c)
+				SmallActionButton(c, pal, "收起 ▴", nil, false, func() {
+					m.ShowRunningDrawer = false
+				})
+			})
+			if acc.DeployRecipe == core.RecipeLLMProxy {
+				m.renderIntegrationsPanel(c, pal, acc, rt)
+			}
+			m.renderHomeOptionsDrawer(c, pal, acc, rt)
+		})
+	}
 
 	// Bottom Live Sessions & Multi-Account Table
 	m.renderLiveAccountsTable(c, pal, acc)
@@ -451,10 +549,10 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 				ui.Text(c, "⏻  关机止损").FontSize(12.5).FontWeight(600).TextColor(pal.Coral)
 			})
 		} else {
-			blocked := (acc.EnablePoliteQueue && isCooling) || !m.Svc.CLIInstalled
+			blocked := isCooling || !m.Svc.CLIInstalled
 			label := "▶  一键启动"
-			if acc.EnablePoliteQueue {
-				label = "↻  排队启动"
+			if core.EffectiveAutoQueue(acc) {
+				label = "▶  一键开机"
 			}
 			bg := pal.NavPillBg
 			fg := pal.NavPillText
@@ -464,7 +562,7 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 			}
 			el := ui.Row(c).FillWidth().Padding(7, 10).Radius(8).Background(bg).Justify(ui.Center)
 			if !blocked {
-				el.OnClick(func() { m.Svc.StartAccountSession(acc.ID) })
+				el.OnClick(func() { m.Svc.DeployNow(acc.ID) })
 			}
 			el.Children(func() {
 				ui.Text(c, label).FontSize(12.5).FontWeight(600).TextColor(fg)
@@ -830,24 +928,20 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 }
 
 func (m *MainUI) bentoStrategy(c *ui.Context, pal Palette, acc core.AccountProfile) {
-	targets := core.SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
-	headline := acc.PreferredAccelerator.ShortChipLabel()
-	badge := "单次启动"
-	var bTint *ui.Color
-	if acc.EnablePoliteQueue {
-		headline = core.QueueTargetsSummary(targets)
-		badge = "排队已开"
-		t := pal.Amber
-		bTint = &t
-	}
+	targets := core.EffectiveQueueTargets(acc)
+	headline := core.QueueTargetsSummary(targets)
+	badge := acc.GPUStrategy.DisplayName()
+	t := pal.Amber
+	bTint := &t
+	fbOn, fbRounds, fbTarget := core.EffectiveFallback(acc)
 	BentoCard(c, pal, 176, func() {
-		TileHeader(c, pal, pal.Amber, "抢卡与预约", badge, bTint)
+		TileHeader(c, pal, pal.Amber, "挑卡策略", badge, bTint)
 		ui.Text(c, headline).FontSize(21).Bold().TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			hasTag := false
-			if acc.EnablePoliteQueue && acc.QueueFallbackEnabled {
+			if fbOn {
 				hasTag = true
-				Badge(c, pal, fmt.Sprintf("%d轮保底 %s", acc.QueueFallbackAfterRounds, acc.QueueFallbackTarget.ShortChipLabel()), nil)
+				Badge(c, pal, fmt.Sprintf("%d轮保底 %s", fbRounds, fbTarget.ShortChipLabel()), nil)
 			}
 			if acc.ScheduledStartEnabled {
 				hasTag = true
@@ -855,14 +949,18 @@ func (m *MainUI) bentoStrategy(c *ui.Context, pal Palette, acc core.AccountProfi
 				Badge(c, pal, fmt.Sprintf("预约 %02d:%02d", acc.ScheduledStartHour, acc.ScheduledStartMinute), &e)
 			}
 			if !hasTag {
-				ui.Text(c, "未设保底或定时预约").FontSize(12).TextColor(pal.TextFaint)
+				ui.Text(c, "没货自动顺延下一张卡").FontSize(12).TextColor(pal.TextMuted)
 			}
 		})
 		ui.Spacer(c)
+		btnTxt := "调整方案与显卡"
+		if m.ShowRunningDrawer {
+			btnTxt = "收起方案抽屉"
+		}
 		ui.Row(c).FillWidth().Padding(6, 10).Radius(8).Background(pal.SubtleBg).AlignItems(ui.Center).OnClick(func() {
-			m.Svc.SetSection(app.SectionCompute)
+			m.ShowRunningDrawer = !m.ShowRunningDrawer
 		}).Children(func() {
-			ui.Text(c, "配置顺位、降级与预约").FontSize(12).FontWeight(500).TextColor(pal.TextPrimary)
+			ui.Text(c, btnTxt).FontSize(12).FontWeight(500).TextColor(pal.TextPrimary)
 			ui.Spacer(c)
 			ui.Text(c, "›").FontSize(14).TextColor(pal.TextMuted)
 		})
@@ -890,8 +988,8 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 					m.quickCardBtn(c, pal, "开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
 						go m.Svc.OpenComfyUI(acc.ID)
 					})
-					m.quickCardBtn(c, pal, "换 H3 版本", false, false, func() {
-						m.Svc.SetSection(app.SectionDeploy)
+					m.quickCardBtn(c, pal, "调整方案", m.ShowRunningDrawer, false, func() {
+						m.ShowRunningDrawer = !m.ShowRunningDrawer
 					})
 				})
 				ui.Row(c).FillWidth().Gap(7).Children(func() {
@@ -941,7 +1039,7 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 					if hasTargets && rt.PublicURL != "" {
 						go m.Svc.SyncAllEnabledClients(acc.ID, false)
 					} else {
-						m.Svc.SetSection(app.SectionIntegrations)
+						m.ShowRunningDrawer = true
 					}
 				})
 

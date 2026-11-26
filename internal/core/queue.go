@@ -31,14 +31,20 @@ const (
 	OutcomeCapacity503        ProvisionOutcomeKind = "capacity_503"
 	OutcomeBudgetExhausted    ProvisionOutcomeKind = "budget_exhausted"
 	OutcomeUnsupportedTier400 ProvisionOutcomeKind = "unsupported_400"
-	OutcomeCircuitBroken      ProvisionOutcomeKind = "circuit_broken"
+	OutcomePrecondition412    ProvisionOutcomeKind = "precondition_412"
+	OutcomeAuthError          ProvisionOutcomeKind = "auth_error"
+	OutcomeTransientError     ProvisionOutcomeKind = "transient_error"
+	OutcomeRateLimited        ProvisionOutcomeKind = "rate_limited"
+	// OutcomeCircuitBroken is kept as an alias for OutcomeRateLimited (true rate-limit / abuse block only).
+	OutcomeCircuitBroken ProvisionOutcomeKind = OutcomeRateLimited
 )
 
 type ProvisionOutcome struct {
-	Kind     ProvisionOutcomeKind
-	Hardware string
-	Code     string
-	Message  string
+	Kind      ProvisionOutcomeKind
+	Hardware  string
+	Code      string
+	Message   string
+	RawDetail string
 }
 
 type ScheduleDecisionKind string
@@ -178,61 +184,103 @@ func InterTargetDelay(unitRandom float64) time.Duration {
 	return time.Duration(math.Round(12.0+r*8.0)) * time.Second
 }
 
-// ClassifyProvisionFailure classifies a failed `colab new` run.
-// ONLY explicit HTTP 503 capacity shortage allows polite queueing; 412/429/401/403/timeout/unknown circuit-break immediately.
+// SanitizeRawErrorSnippet extracts one compact, readable diagnostic line from CLI output.
+func SanitizeRawErrorSnippet(stdout, stderr string) string {
+	pick := func(raw string) string {
+		lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			ln := strings.TrimSpace(lines[i])
+			if ln == "" || strings.HasPrefix(ln, "Traceback ") || strings.HasPrefix(ln, "File \"") || strings.HasPrefix(ln, "[colab] Creating session") {
+				continue
+			}
+			if len(ln) > 180 {
+				ln = ln[:177] + "..."
+			}
+			return ln
+		}
+		return ""
+	}
+	if s := pick(stderr); s != "" {
+		return s
+	}
+	return pick(stdout)
+}
+
+// ClassifyProvisionFailure classifies a failed `colab new` run against real google-colab-cli 0.8.x outputs.
+// Only true 429 / abuse warnings trigger the 15-minute cooldown; single-card rejections (400 / Backend rejected),
+// capacity limits (503/502/504/ReadTimeout), and single-card 412s allow trying the next card or actionable recovery.
 func ClassifyProvisionFailure(exitCode int, timedOut bool, stdout, stderr, targetDisplay string) ProvisionOutcome {
+	raw := SanitizeRawErrorSnippet(stdout, stderr)
 	if timedOut {
 		return ProvisionOutcome{
-			Kind:    OutcomeCircuitBroken,
-			Code:    "TIMEOUT",
-			Message: fmt.Sprintf("申请 %s 超时，结果不确定，已熔断停止以防重复计费", targetDisplay),
+			Kind:      OutcomeTransientError,
+			Hardware:  targetDisplay,
+			Code:      "TIMEOUT",
+			Message:   fmt.Sprintf("申请 %s 响应超时，请稍等几秒直接重试（若已开机可先点右上角刷新）", targetDisplay),
+			RawDetail: raw,
 		}
 	}
 	combined := strings.ToLower(stderr + "\n" + stdout)
 	if strings.Contains(combined, "abusive") || strings.Contains(combined, "blocked from accessing") {
 		return ProvisionOutcome{
-			Kind:    OutcomeCircuitBroken,
-			Code:    "ABUSE_BLOCK",
-			Message: "检测到官方风控/访问限制提示，已立即熔断停止排队",
+			Kind:      OutcomeRateLimited,
+			Hardware:  targetDisplay,
+			Code:      "ABUSE_BLOCK",
+			Message:   "Google 提示当前账号访问受限，为保护账号先暂停自动申请 15 分钟",
+			RawDetail: raw,
 		}
 	}
 	if strings.Contains(combined, "429") || strings.Contains(combined, "too many requests") || strings.Contains(combined, "rate limit") {
 		return ProvisionOutcome{
-			Kind:    OutcomeCircuitBroken,
-			Code:    "429",
-			Message: "触发官方限流 (429)，已熔断停止并进入 15 分钟冷却",
+			Kind:      OutcomeRateLimited,
+			Hardware:  targetDisplay,
+			Code:      "429",
+			Message:   "Google 提示请求偏频繁 (429)，先冷静等待 15 分钟再试以保护账号",
+			RawDetail: raw,
 		}
 	}
-	if strings.Contains(combined, "412") || strings.Contains(combined, "precondition failed") || strings.Contains(combined, "too many assignments") {
+	if strings.Contains(combined, "401") || strings.Contains(combined, "403") || strings.Contains(combined, "unauthorized") || strings.Contains(combined, "forbidden") || strings.Contains(combined, "invalid_grant") || strings.Contains(combined, "reauthenticate") {
 		return ProvisionOutcome{
-			Kind:    OutcomeCircuitBroken,
-			Code:    "412",
-			Message: "活跃会话或配额已达上限 (412)，已熔断停止，请先关闭已有会话",
+			Kind:      OutcomeAuthError,
+			Hardware:  targetDisplay,
+			Code:      "AUTH",
+			Message:   "Google 账号登录已过期或无权限，请去「账号」页重新授权后再开机",
+			RawDetail: raw,
 		}
 	}
-	if strings.Contains(combined, "401") || strings.Contains(combined, "403") || strings.Contains(combined, "unauthorized") || strings.Contains(combined, "forbidden") {
+	if strings.Contains(combined, "412") || strings.Contains(combined, "precondition failed") || strings.Contains(combined, "too many assignments") || strings.Contains(combined, "allocation refused") {
 		return ProvisionOutcome{
-			Kind:    OutcomeCircuitBroken,
-			Code:    "401/403",
-			Message: "认证失效或无权限 (401/403)，已熔断停止，请检查账号授权",
+			Kind:      OutcomePrecondition412,
+			Hardware:  targetDisplay,
+			Code:      "412",
+			Message:   fmt.Sprintf("Google 暂时拒绝了 %s 申请（可能已有运行中机器，或该卡暂时满载）", targetDisplay),
+			RawDetail: raw,
 		}
 	}
-	if strings.Contains(combined, "503") || strings.Contains(combined, "service unavailable") {
+	if strings.Contains(combined, "backend rejected accelerator") || strings.Contains(combined, "not have quota or entitlement") || strings.Contains(combined, "400") || strings.Contains(combined, "bad request") {
 		return ProvisionOutcome{
-			Kind:    OutcomeCapacity503,
-			Message: fmt.Sprintf("%s 当前无可用库存 (503)", targetDisplay),
+			Kind:      OutcomeUnsupportedTier400,
+			Hardware:  targetDisplay,
+			Code:      "400",
+			Message:   fmt.Sprintf("当前账号暂不支持或暂无 %s 配额，将自动改试下一张卡", targetDisplay),
+			RawDetail: raw,
 		}
 	}
-	if strings.Contains(combined, "400") || strings.Contains(combined, "bad request") {
+	if strings.Contains(combined, "503") || strings.Contains(combined, "502") || strings.Contains(combined, "504") || strings.Contains(combined, "service unavailable") || strings.Contains(combined, "bad gateway") || strings.Contains(combined, "gateway timeout") || strings.Contains(combined, "readtimeout") || strings.Contains(combined, "read timed out") || strings.Contains(combined, "insufficient capacity") || strings.Contains(combined, "cannot connect to gpu backend") {
 		return ProvisionOutcome{
-			Kind:    OutcomeUnsupportedTier400,
-			Message: fmt.Sprintf("当前订阅不支持 %s (400)", targetDisplay),
+			Kind:      OutcomeCapacity503,
+			Hardware:  targetDisplay,
+			Code:      "503",
+			Message:   fmt.Sprintf("%s 当前暂时没货，将自动改试下一张卡", targetDisplay),
+			RawDetail: raw,
 		}
 	}
 	return ProvisionOutcome{
-		Kind:    OutcomeCircuitBroken,
-		Code:    fmt.Sprintf("ERR_%d", exitCode),
-		Message: fmt.Sprintf("%s 申请异常（退出码 %d），已熔断停止", targetDisplay, exitCode),
+		Kind:      OutcomeTransientError,
+		Hardware:  targetDisplay,
+		Code:      fmt.Sprintf("ERR_%d", exitCode),
+		Message:   fmt.Sprintf("申请 %s 暂时失败（退出码 %d），检查网络或换张卡后可直接重试", targetDisplay, exitCode),
+		RawDetail: raw,
 	}
 }
 

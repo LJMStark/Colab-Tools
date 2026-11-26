@@ -619,6 +619,109 @@ func BuildDeployEnv(acc AccountProfile) (map[string]string, error) {
 	return env, nil
 }
 
+// GPUStrategyMode unifies card picking into 3 beginner-friendly modes so users never juggle dual settings.
+type GPUStrategyMode string
+
+const (
+	GPUStrategyAutoSmart GPUStrategyMode = "auto_smart" // 智能挑卡（按所选任务自动配最稳顺位，没货自动顺延）
+	GPUStrategyEcoSaver  GPUStrategyMode = "eco_saver"  // 省点模式（优先 L4 / T4）
+	GPUStrategyCustom    GPUStrategyMode = "custom"     // 高级自定义（自选顺位 + 保底 + 定时预约）
+)
+
+func (g GPUStrategyMode) DisplayName() string {
+	switch g {
+	case GPUStrategyEcoSaver:
+		return "省点模式"
+	case GPUStrategyCustom:
+		return "高级自定义"
+	default:
+		return "智能挑卡"
+	}
+}
+
+// SmartQueueTargets derives the most reliable GPU priority order for a given subscription tier and task.
+func SmartQueueTargets(acc AccountProfile) []AcceleratorOption {
+	switch acc.Tier {
+	case TierFree:
+		return []AcceleratorOption{AccT4}
+	case TierAIPro, TierColabPro, TierPayAsYouGo:
+		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantFlashGGUF {
+			return []AcceleratorOption{AccL4, AccA100}
+		}
+		return []AcceleratorOption{AccA100, AccL4, AccT4}
+	default: // TierAIUltra, TierColabProPlus
+		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantOriginal {
+			return []AcceleratorOption{AccG4, AccA100, AccH100}
+		}
+		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantFlashGGUF {
+			return []AcceleratorOption{AccL4, AccA100}
+		}
+		// Default for H3 Flash, General ComfyUI, LLM Proxy, Pure Compute:
+		// try A100 first (reliably available & fast), then G4, then L4 fallback.
+		return []AcceleratorOption{AccA100, AccG4, AccL4}
+	}
+}
+
+// EffectiveQueueTargets is the single source of truth for which cards will be attempted and in what order.
+func EffectiveQueueTargets(acc AccountProfile) []AcceleratorOption {
+	switch acc.GPUStrategy {
+	case GPUStrategyEcoSaver:
+		if acc.Tier == TierFree {
+			return []AcceleratorOption{AccT4}
+		}
+		return []AcceleratorOption{AccL4, AccT4}
+	case GPUStrategyCustom:
+		return SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
+	default:
+		return SanitizedQueueTargets(SmartQueueTargets(acc), acc.Tier)
+	}
+}
+
+// EffectiveFallback returns two-stage fallback settings aligned with GPUStrategy.
+func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, target AcceleratorOption) {
+	switch acc.GPUStrategy {
+	case GPUStrategyEcoSaver:
+		return false, 2, AccT4
+	case GPUStrategyCustom:
+		return acc.QueueFallbackEnabled, acc.QueueFallbackAfterRounds, acc.QueueFallbackTarget
+	default:
+		// H3 Original prioritizes G4/A100/H100 first, then adds L4 after 2 rounds if scarce.
+		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantOriginal && slices.Contains(acc.Tier.QueueableAccelerators(), AccL4) {
+			return true, 2, AccL4
+		}
+		return false, 2, DefaultFallbackTarget(EffectiveQueueTargets(acc), acc.Tier)
+	}
+}
+
+// EffectiveAutoQueue determines whether 503 shortages automatically continue in polite queue.
+func EffectiveAutoQueue(acc AccountProfile) bool {
+	if acc.GPUStrategy == GPUStrategyCustom {
+		return acc.EnablePoliteQueue
+	}
+	return true
+}
+
+// EffectiveUseHighMem determines whether --high-mem should be requested.
+func EffectiveUseHighMem(acc AccountProfile) bool {
+	if !acc.Tier.SupportsHighMem() {
+		return false
+	}
+	switch acc.GPUStrategy {
+	case GPUStrategyEcoSaver:
+		return false
+	case GPUStrategyCustom:
+		return acc.HighMem
+	default:
+		return true
+	}
+}
+
+// EffectiveGPUPlanSummary returns a concise plain-Chinese description of the active GPU strategy.
+func EffectiveGPUPlanSummary(acc AccountProfile) string {
+	targets := EffectiveQueueTargets(acc)
+	return fmt.Sprintf("%s（%s）", acc.GPUStrategy.DisplayName(), QueueTargetsSummary(targets))
+}
+
 // EffectiveIdleTimeoutMinutes returns the unified idle shutdown timeout shared by both the watchdog loop and UI countdowns.
 func EffectiveIdleTimeoutMinutes(acc AccountProfile, rt AccountRuntimeState) int {
 	timeout := acc.IdleTimeoutMinutes
@@ -641,6 +744,7 @@ type AccountProfile struct {
 	Tier                 SubscriptionTier    `json:"tier"`
 	AuthMode             AccountAuthMode     `json:"authMode"`
 	SessionName          string              `json:"sessionName"`
+	GPUStrategy          GPUStrategyMode     `json:"gpuStrategy,omitempty"`
 	PreferredAccelerator AcceleratorOption   `json:"preferredAccelerator"`
 	HighMem              bool                `json:"highMem"`
 	WorkloadKind         WorkloadKind        `json:"workloadKind"`
@@ -717,8 +821,9 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		Tier:                      tier,
 		AuthMode:                  authMode,
 		SessionName:               fmt.Sprintf("colab-%s", shortID),
+		GPUStrategy:               GPUStrategyAutoSmart,
 		PreferredAccelerator:      tier.DefaultAccelerator(),
-		HighMem:                   false,
+		HighMem:                   tier.SupportsHighMem(),
 		WorkloadKind:              WorkloadVideo,
 		EnableLLMModule:           false,
 		EnableHardwareIdle:        true,
@@ -734,7 +839,7 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		EnableCloudflared:         false,
 		StopAfterQueueDrained:     true,
 		QueueDrainMinutes:         10,
-		EnablePoliteQueue:         false,
+		EnablePoliteQueue:         true,
 		QueueTargets:              defaultTargets,
 		QueueFallbackEnabled:      false,
 		QueueFallbackAfterRounds:  2,
@@ -744,7 +849,7 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		ScheduledStartMinute:      0,
 		ScheduledStartRepeatDaily: true,
 		AutoShutdownEnabled:       true,
-		IdleTimeoutMinutes:        40,
+		IdleTimeoutMinutes:        10,
 		WarnBeforeMinutes:         2,
 		DriveScriptPath:           "/content/drive/MyDrive/colab-llm/scripts/start_server.sh",
 		AutoSyncCCSwitch:          false,
@@ -774,6 +879,11 @@ func (a *AccountProfile) Sanitize() {
 		a.AuthMode = AuthSystemDefaultOAuth2
 	}
 	a.SessionName = SanitizeSessionName(a.SessionName)
+	switch a.GPUStrategy {
+	case GPUStrategyAutoSmart, GPUStrategyEcoSaver, GPUStrategyCustom:
+	default:
+		a.GPUStrategy = GPUStrategyAutoSmart
+	}
 	if !IsValidAccelerator(string(a.PreferredAccelerator)) {
 		a.PreferredAccelerator = a.Tier.DefaultAccelerator()
 	}
@@ -966,6 +1076,14 @@ func normalizeLegacySettingsJSON(raw []byte) ([]byte, bool, error) {
 					if _, exists := m[k]; !exists {
 						m[k] = v
 					}
+				}
+			}
+			// Populate v0.3.10 unified GPU strategy cleanly when upgrading from earlier configs
+			if _, hasStrat := m["gpuStrategy"]; !hasStrat {
+				if pq, ok := m["enablePoliteQueue"].(bool); ok && pq {
+					m["gpuStrategy"] = string(GPUStrategyCustom)
+				} else {
+					m["gpuStrategy"] = string(GPUStrategyAutoSmart)
 				}
 			}
 		}
@@ -1218,6 +1336,9 @@ type AccountRuntimeState struct {
 	QueueCircuitBreakTill *time.Time
 	NonLLMReminderPending bool
 	LastError             string
+	LastErrorTitle        string
+	LastErrorAction       string // "", "retry", "stop_existing", "reauth", "clear_cooldown"
+	LastErrorRaw          string
 }
 
 func NewAccountRuntimeState() AccountRuntimeState {
@@ -1329,10 +1450,11 @@ func (rt AccountRuntimeState) EstimatedHoursRemaining(acc AccountProfile) (hours
 	}
 
 	ref := acc.PreferredAccelerator
-	if acc.EnablePoliteQueue {
-		if targets := SanitizedQueueTargets(acc.QueueTargets, acc.Tier); len(targets) > 0 {
-			ref = targets[0]
-		}
+	if acc.GPUStrategy == GPUStrategyCustom && !acc.EnablePoliteQueue {
+		// Honor explicit single-launch preferred accelerator when custom queue is disabled
+		ref = acc.PreferredAccelerator
+	} else if targets := EffectiveQueueTargets(acc); len(targets) > 0 {
+		ref = targets[0]
 	}
 	switch ref {
 	case AccG4:

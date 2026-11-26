@@ -28,12 +28,12 @@ No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/images/preview-deploy-h3.png" alt="One-Click H3 Original & Flash Deployment" width="420" /><br />
-      <sub><b>Zero-Hands H3 Deployment</b> · Choose <b>H3 Original (31B)</b>, <b>H3 Flash (13.7B)</b>, GGUF, or custom HuggingFace / Drive weights — all sharing one 21.5 GB base</sub>
+      <img src="docs/images/preview-deploy-h3.png" alt="Zero-Config Beginner Home Launchpad" width="420" /><br />
+      <sub><b>One-Click Zero-Config Home</b> · Pre-configured with <b>H3 Flash</b>, smart GPU auto-fallback, Drive backup & 10m post-queue auto-shutdown</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-settings-queue.png" alt="Polite GPU Queue & Off-Peak Schedule" width="420" /><br />
-      <sub><b>Polite GPU Queue & Morning Schedule</b> · Pick your priority GPUs, set a fallback card, or wake up to an already-grabbed A100/G4</sub>
+      <img src="docs/images/preview-settings-queue.png" alt="Optional Custom GPU Priority & Morning Schedule" width="420" /><br />
+      <sub><b>Optional Power-User Controls</b> · Quietly collapsed by default; expand anytime for eco mode, custom GPU order, fallback & morning schedule</sub>
     </td>
   </tr>
   <tr>
@@ -86,9 +86,9 @@ Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大
 
 ### Option 1: Download Prebuilt App (Recommended)
 1. Grab the archive for your OS from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest):
-   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.9-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
-   - **Windows (x64)**: `Colab-Tools-v0.3.9-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
-2. Finish the 3-step setup wizard, open the **Deploy** tab, pick **H3 Original** or **H3 Flash**, and click **Start & Deploy**.
+   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.10-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
+   - **Windows (x64)**: `Colab-Tools-v0.3.10-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
+2. Finish the 3-step setup wizard, then on the **Home** tab simply click **Start & Run** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
 
 > **Signature notes:** Community builds are self-signed. On macOS, right-click → **Open** (or `xattr -cr "/Applications/Colab Tools.app"`). On Windows SmartScreen, click **More info → Run anyway**.
 

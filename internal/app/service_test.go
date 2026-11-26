@@ -237,3 +237,71 @@ func (a *atomicStopTracker) didStop() bool {
 	defer a.mu.Unlock()
 	return a.stopped
 }
+
+func TestProvisionAutoSkips400AndEmpty412AndManualCooldownClear(t *testing.T) {
+	svc := NewService(true)
+	acc := core.NewDefaultAccountProfile("SmartUser", "smart@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.GPUStrategy = core.GPUStrategyCustom
+	acc.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccA100, core.AccL4}
+	acc.DeployRecipe = core.RecipeNone
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
+
+	// Case 1: G4 hits google-colab-cli 0.8.0 "Allocation refused (precondition failed)" with 0 active sessions,
+	// A100 hits "Backend rejected accelerator 'A100'" -> engine must auto-skip both and allocate L4 without any cooldown!
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		switch {
+		case strings.Contains(cmd, "--gpu") && strings.Contains(cmd, "G4"):
+			return runner.Result{ExitCode: 1, Stderr: "[colab] Allocation refused (precondition failed). This can mean too many active sessions, or a temporary usage or capacity limit."}
+		case strings.Contains(cmd, "--gpu") && strings.Contains(cmd, "A100"):
+			return runner.Result{ExitCode: 1, Stderr: "[colab] Backend rejected accelerator 'A100'. You may not have quota or entitlement."}
+		case strings.Contains(cmd, "--gpu") && strings.Contains(cmd, "L4"):
+			return runner.Result{ExitCode: 0, Stdout: "Created session.\n"}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 1000.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		case strings.Contains(cmd, "sessions"):
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	res := svc.Engine.ProvisionSession(context.Background(), acc, nil, nil, nil, nil)
+	if res.Outcome.Kind != core.OutcomeAllocated || res.Outcome.Hardware != "L4" {
+		t.Fatalf("expected auto-fallback to L4 after empty-412 G4 and 400 A100, got %+v", res.Outcome)
+	}
+	if !res.UnsupportedValues["A100"] {
+		t.Fatalf("expected A100 to be pruned as unsupported, got %+v", res.UnsupportedValues)
+	}
+
+	// Case 2: Non-rate-limit errors (timeout / 412 with active session / 401) must NEVER impose a 15-minute cooldown lock
+	svc.NotifySender = func(_, _ string) {}
+	svc.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "TIMEOUT", Message: "超时"})
+	if rt := svc.StateFor(acc.ID); rt.QueueCircuitBreakTill != nil {
+		t.Fatalf("timeout must not set cooldown lock: %+v", rt.QueueCircuitBreakTill)
+	}
+	svc.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomePrecondition412, Code: "412", Message: "已有运行中机器"})
+	if rt := svc.StateFor(acc.ID); rt.QueueCircuitBreakTill != nil || rt.LastErrorAction != "stop_existing" {
+		t.Fatalf("412 must offer stop_existing without 15m lock, got till=%v action=%q", rt.QueueCircuitBreakTill, rt.LastErrorAction)
+	}
+
+	// Case 3: True 429 triggers cooldown, and ClearCooldown clears it immediately
+	svc.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomeRateLimited, Code: "429", Message: "请求偏频繁"})
+	if rt := svc.StateFor(acc.ID); rt.QueueCircuitBreakTill == nil || !rt.QueueCircuitBreakTill.After(time.Now()) {
+		t.Fatalf("429 must trigger cooldown, got %+v", rt.QueueCircuitBreakTill)
+	}
+	svc.ClearCooldown(acc.ID)
+	if rt := svc.StateFor(acc.ID); rt.QueueCircuitBreakTill != nil || rt.LastError != "" {
+		t.Fatalf("ClearCooldown must clear lock & error banner, got till=%v err=%q", rt.QueueCircuitBreakTill, rt.LastError)
+	}
+
+	// Case 4: ResetAccountToRecommendedDefaults restores H3 Flash + Smart GPU picking cleanly
+	svc.ResetAccountToRecommendedDefaults(acc.ID)
+	resetAcc, _ := svc.accountByID(acc.ID)
+	if resetAcc.GPUStrategy != core.GPUStrategyAutoSmart || resetAcc.DeployRecipe != core.RecipeH3Video || resetAcc.H3Variant != core.H3VariantFlash {
+		t.Fatalf("expected clean beginner defaults after reset, got %+v", resetAcc)
+	}
+}

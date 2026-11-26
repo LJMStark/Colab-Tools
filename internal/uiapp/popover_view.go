@@ -226,19 +226,19 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 	})
 
 	ui.Row(c).FillWidth().Gap(8).Children(func() {
-		p.popoverQuickBtn(c, pal, "打开大屏", false, false, func() {
+		p.popoverQuickBtn(c, pal, "打开主页", false, false, func() {
 			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionStatus)
+				p.OnOpenMain(app.SectionHome)
 			}
 		})
-		p.popoverQuickBtn(c, pal, "一键部署", false, false, func() {
+		p.popoverQuickBtn(c, pal, "管理账号", false, false, func() {
 			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionDeploy)
+				p.OnOpenMain(app.SectionAccounts)
 			}
 		})
-		p.popoverQuickBtn(c, pal, "抢卡策略", false, false, func() {
+		p.popoverQuickBtn(c, pal, "偏好设置", false, false, func() {
 			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionCompute)
+				p.OnOpenMain(app.SectionSettings)
 			}
 		})
 	})
@@ -294,12 +294,27 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 			SmallActionButton(c, pal, "⏻ 关机止损", &pal.Coral, false, func() {
 				go p.Svc.StopAccountSession(acc.ID, "", "")
 			})
+		} else if rt.Phase.IsQueuing() {
+			SmallActionButton(c, pal, "取消排队", &pal.Coral, false, func() {
+				p.Svc.CancelQueue(acc.ID)
+			})
 		} else {
 			PillButton(c, pal, "▶ 启动", true, !p.Svc.CLIInstalled, func() {
-				p.Svc.StartAccountSession(acc.ID)
+				p.Svc.DeployNow(acc.ID)
 			})
 		}
 	})
+
+	if rt.LastError != "" && !rt.Phase.IsRunning() {
+		ui.Row(c).FillWidth().Padding(8, 10).Radius(9).Background(WithAlpha(pal.Amber, 0.12)).Border(1, WithAlpha(pal.Amber, 0.35)).AlignItems(ui.Center).Gap(6).Children(func() {
+			ui.Text(c, rt.LastError).FontSize(11.5).TextColor(pal.TextPrimary).Grow(1).MaxLines(2).Ellipsis("…")
+			SmallActionButton(c, pal, "查看", nil, false, func() {
+				if p.OnOpenMain != nil {
+					p.OnOpenMain(app.SectionHome)
+				}
+			})
+		})
+	}
 
 	// 2x2 Compact HUD Cards
 	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
@@ -318,19 +333,21 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		})
 	})
 
-	// Quota + strategy summary
+	// Quota + active scheme summary
 	hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
-	SectionCard(c, pal, "算力续航", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), func() {
+	SectionCard(c, pal, "算力续航与方案", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-			if ok {
-				ui.Textf(c, "%.0f 小时（按 %s）", hrs, basis).FontSize(16).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-			} else {
-				ui.Text(c, acc.Tier.DisplayName()).FontSize(15).Bold().TextColor(pal.TextPrimary)
-			}
-			ui.Spacer(c)
-			SmallActionButton(c, pal, "策略配置 ›", nil, false, func() {
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				if ok {
+					ui.Textf(c, "%.0f 小时（按 %s）", hrs, basis).FontSize(15.5).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+				} else {
+					ui.Text(c, acc.Tier.DisplayName()).FontSize(15).Bold().TextColor(pal.TextPrimary)
+				}
+				ui.Text(c, core.EffectiveGPUPlanSummary(acc)).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+			})
+			SmallActionButton(c, pal, "换方案 ›", nil, false, func() {
 				if p.OnOpenMain != nil {
-					p.OnOpenMain(app.SectionCompute)
+					p.OnOpenMain(app.SectionHome)
 				}
 			})
 		})
@@ -347,7 +364,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 			guardStatus = fmt.Sprintf("%d 分钟自动关机", effMins)
 		}
 	}
-	SectionCard(c, pal, "空闲守护与快捷接入", guardStatus, func() {
+	SectionCard(c, pal, "空闲守护与快捷操作", guardStatus, func() {
 		hasTargets := acc.AutoSyncCCSwitch || acc.AutoSyncOpenCode || acc.AutoSyncCodex
 		allSynced := hasTargets && (!acc.AutoSyncCCSwitch || rt.CCSwitchSynced) && (!acc.AutoSyncOpenCode || rt.OpenCodeSynced) && (!acc.AutoSyncCodex || rt.CodexSynced)
 		isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
@@ -371,7 +388,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 						if hasTargets && rt.PublicURL != "" {
 							go p.Svc.SyncAllEnabledClients(acc.ID, false)
 						} else if p.OnOpenMain != nil {
-							p.OnOpenMain(app.SectionIntegrations)
+							p.OnOpenMain(app.SectionHome)
 						}
 					})
 					p.popoverQuickBtn(c, pal, ">_ Claude", false, !rt.Phase.IsRunning() || rt.PublicURL == "", func() {

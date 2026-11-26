@@ -21,20 +21,20 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.9"
+const AppVersion = "0.3.10"
 
 type MainSection int
 
 const (
-	SectionStatus MainSection = iota
-	SectionDeploy
-	SectionCompute
-	SectionIntegrations
+	SectionHome MainSection = iota
 	SectionAccounts
 	SectionSettings
+
+	// SectionStatus aliases SectionHome so existing call sites stay clean and unified.
+	SectionStatus = SectionHome
 )
 
-var MainSectionTitles = []string{"状态", "部署", "抢卡", "接入", "账号", "设置"}
+var MainSectionTitles = []string{"主页", "账号", "设置"}
 
 type deployWatchHandle struct {
 	token  string
@@ -1179,13 +1179,19 @@ func (s *Service) StartAccountSession(accountID string) {
 	if rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(time.Now()) {
 		remMin := max(1, int(time.Until(*rt.QueueCircuitBreakTill).Minutes())+1)
 		s.mu.Unlock()
-		s.ShowToast(fmt.Sprintf("防风控冷却中，请约 %d 分钟后再申请", remMin))
+		s.ShowToast(fmt.Sprintf("正在冷静等待中（约 %d 分钟），如已切换显卡可点横幅右侧「解除等待」", remMin))
 		return
 	}
-	if acc.EnablePoliteQueue {
+	// Clear stale error banner when starting a fresh attempt
+	rt.LastError = ""
+	rt.LastErrorTitle = ""
+	rt.LastErrorAction = ""
+	rt.LastErrorRaw = ""
+
+	if core.EffectiveAutoQueue(acc) {
 		if s.ActiveQueueAccountID != "" && s.ActiveQueueAccountID != accountID {
 			s.mu.Unlock()
-			s.ShowToast("已有其他账号在合规排队中（全局单通道防风控）")
+			s.ShowToast("已有其他账号在排队拿卡中（单通道防风控）")
 			return
 		}
 		token := uuid.New().String()
@@ -1193,7 +1199,7 @@ func (s *Service) StartAccountSession(accountID string) {
 		s.ActiveQueueAccountID = accountID
 		s.activeQueueToken = token
 		s.queueCancels[accountID] = queueHandle{token: token, cancel: cancel}
-		targets := core.SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
+		targets := core.EffectiveQueueTargets(acc)
 		rt.Phase = core.InstancePhase{
 			Kind:           core.PhaseQueuing,
 			QueueAttempt:   1,
@@ -1207,7 +1213,7 @@ func (s *Service) StartAccountSession(accountID string) {
 		return
 	}
 
-	rt.Phase = core.InstancePhase{Kind: core.PhaseStarting, Detail: "申请云端实例…"}
+	rt.Phase = core.InstancePhase{Kind: core.PhaseStarting, Detail: "申请云端显卡…"}
 	s.Runtime[accountID] = rt
 	s.mu.Unlock()
 	s.notifyUI()
@@ -1270,7 +1276,8 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 			}
 		}
 
-		roundAccs := core.QueueTargetsForRound(attempt, acc.QueueTargets, acc.QueueFallbackEnabled, acc.QueueFallbackAfterRounds, acc.QueueFallbackTarget, acc.Tier)
+		fbEnabled, fbAfter, fbTarget := core.EffectiveFallback(acc)
+		roundAccs := core.QueueTargetsForRound(attempt, core.EffectiveQueueTargets(acc), fbEnabled, fbAfter, fbTarget, acc.Tier)
 		var probeTargets []core.ProbeTarget
 		for _, a := range roundAccs {
 			for _, pt := range a.ProbeTargets() {
@@ -1284,7 +1291,11 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 			owned := s.isQueueTokenOwnerLocked(acc.ID, token)
 			s.mu.RUnlock()
 			if owned {
-				s.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomeCircuitBroken, Code: "NO_SUPPORTED_TARGET", Message: "所选显卡均不被当前订阅支持，排队已停止"})
+				s.handleProvisionFailure(acc, core.ProvisionOutcome{
+					Kind:    core.OutcomeUnsupportedTier400,
+					Code:    "NO_SUPPORTED_TARGET",
+					Message: "当前顺位里的显卡均暂无配额，可切换到「省点模式 (L4)」或「智能挑卡」再试",
+				})
 			}
 			return
 		}
@@ -1340,7 +1351,7 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		if !owned || ctx.Err() != nil {
 			return
 		}
-		if res.Outcome.Kind == core.OutcomeCircuitBroken || res.Outcome.Kind == core.OutcomeBudgetExhausted {
+		if res.Outcome.Kind != core.OutcomeCapacity503 {
 			s.handleProvisionFailure(acc, res.Outcome)
 			return
 		}
@@ -1417,11 +1428,38 @@ func (s *Service) recordProbeInsights(records []colab.ProbeAttemptRecord) {
 }
 
 func (s *Service) handleProvisionFailure(acc core.AccountProfile, outcome core.ProvisionOutcome) {
+	if outcome.Code == "CANCELLED" {
+		return
+	}
+	title := "本次申请未成功，可直接重试"
+	action := "retry"
+	switch outcome.Kind {
+	case core.OutcomeRateLimited:
+		title = "Google 提示请求偏频繁，先冷静等一会儿"
+		action = "clear_cooldown"
+	case core.OutcomePrecondition412:
+		title = "已有运行中机器，达到同时开机上限"
+		action = "stop_existing"
+	case core.OutcomeAuthError:
+		title = "Google 账号需要重新授权"
+		action = "reauth"
+	case core.OutcomeUnsupportedTier400:
+		title = "当前账号暂不支持所选显卡"
+		action = "retry"
+	case core.OutcomeCapacity503, core.OutcomeBudgetExhausted:
+		title = "热门显卡暂时没货"
+		action = "retry"
+	}
+
 	s.mu.Lock()
 	rt := s.Runtime[acc.ID]
 	rt.Phase = core.InstancePhase{Kind: core.PhaseOffline}
 	rt.LastError = outcome.Message
-	if outcome.Kind == core.OutcomeCircuitBroken && outcome.Code != "CANCELLED" {
+	rt.LastErrorTitle = title
+	rt.LastErrorAction = action
+	rt.LastErrorRaw = outcome.RawDetail
+	// ONLY genuine rate-limit / abuse warnings trigger the 15-minute cooldown lock.
+	if outcome.Kind == core.OutcomeRateLimited {
 		until := time.Now().Add(core.QueueCircuitBreakerCooldown)
 		rt.QueueCircuitBreakTill = &until
 		if s.Settings.QueueCooldownsByAccount == nil {
@@ -1432,11 +1470,66 @@ func (s *Service) handleProvisionFailure(acc core.AccountProfile, outcome core.P
 	}
 	s.Runtime[acc.ID] = rt
 	s.mu.Unlock()
+	s.notifyUI()
+
+	if outcome.Kind == core.OutcomePrecondition412 {
+		// Refresh live sessions so any running machine appears immediately for one-click stop
+		go s.refreshAccount(acc.ID, true, true, true)
+	}
 
 	s.ShowToast(outcome.Message)
-	if outcome.Kind == core.OutcomeCircuitBroken && outcome.Code != "CANCELLED" {
-		s.SendNotification("Colab Tools 防风控熔断", outcome.Message, true)
+	if outcome.Kind == core.OutcomeRateLimited {
+		s.SendNotification("Colab Tools 保护暂停", outcome.Message, true)
 	}
+}
+
+// ClearCooldown lets the user manually clear a cooldown lock or error banner once they have switched cards or fixed the cause.
+func (s *Service) ClearCooldown(accountID string) {
+	s.mu.Lock()
+	rt := s.Runtime[accountID]
+	rt.QueueCircuitBreakTill = nil
+	rt.LastError = ""
+	rt.LastErrorTitle = ""
+	rt.LastErrorAction = ""
+	rt.LastErrorRaw = ""
+	s.Runtime[accountID] = rt
+	if s.Settings.QueueCooldownsByAccount != nil {
+		delete(s.Settings.QueueCooldownsByAccount, accountID)
+	}
+	s.saveSettingsLocked()
+	s.mu.Unlock()
+	s.notifyUI()
+	s.ShowToast("已解除等待状态，现在可以直接重试")
+}
+
+// ClearAccountError dismisses the visible error notice on the home screen.
+func (s *Service) ClearAccountError(accountID string) {
+	s.mu.Lock()
+	rt := s.Runtime[accountID]
+	rt.LastError = ""
+	rt.LastErrorTitle = ""
+	rt.LastErrorAction = ""
+	rt.LastErrorRaw = ""
+	s.Runtime[accountID] = rt
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
+// ResetAccountToRecommendedDefaults restores one-click beginner-friendly defaults without removing the account or credentials.
+func (s *Service) ResetAccountToRecommendedDefaults(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	fresh := core.NewDefaultAccountProfile(acc.DisplayName, acc.Email, acc.Tier, acc.AuthMode)
+	fresh.ID = acc.ID
+	fresh.ColorTag = acc.ColorTag
+	fresh.SessionName = acc.SessionName
+	fresh.CCSwitchProviderID = acc.CCSwitchProviderID
+	fresh.CCSwitchName = acc.CCSwitchName
+	s.UpdateAccount(fresh)
+	s.ClearCooldown(accountID)
+	s.ShowToast("已恢复小白推荐默认配置（H3 Flash 极速版 · 智能挑卡 · 自动存片关机）")
 }
 
 func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string) {
@@ -1491,7 +1584,7 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string)
 	}
 }
 
-// ApplyDeployRecipe updates an account's one-click deploy preset and aligns ports/workload flags cleanly.
+// ApplyDeployRecipe updates an account's one-click deploy preset and aligns ports/workload/idle defaults cleanly.
 func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) {
 	acc, ok := s.accountByID(accountID)
 	if !ok {
@@ -1504,16 +1597,26 @@ func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) 
 		acc.EnableLLMModule = false
 		acc.RemoteServicePort = 8188
 		acc.LocalSSHTunnelPort = 8188
+		if acc.QueueDrainMinutes < 5 {
+			acc.QueueDrainMinutes = 10
+		}
+		if acc.IdleTimeoutMinutes == 40 {
+			acc.IdleTimeoutMinutes = acc.QueueDrainMinutes
+		}
 	case core.RecipeLLMProxy:
 		acc.WorkloadKind = core.WorkloadLLM
 		acc.EnableLLMModule = true
 		acc.RemoteServicePort = 18080
 		acc.LocalSSHTunnelPort = 18080
+		if acc.IdleTimeoutMinutes <= 15 {
+			acc.IdleTimeoutMinutes = 40
+		}
 	default:
 		acc.WorkloadKind = core.WorkloadGeneral
 		acc.EnableLLMModule = false
 	}
 	s.UpdateAccount(acc)
+	s.ClearAccountError(accountID)
 }
 
 // DeployNow starts a machine (and deploys after allocation) if offline, or immediately pushes the built-in deploy script if online.

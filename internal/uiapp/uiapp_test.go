@@ -15,7 +15,7 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.Service {
+func makeDemoService(section app.MainSection, onboarding, idleHome bool) *app.Service {
 	svc := app.NewService(true)
 	svc.SelectedSection = section
 	svc.ShowingOnboarding = onboarding
@@ -38,7 +38,7 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 	svc.EnvReport = doctor.Report{
 		ColabInstalled:    true,
 		ColabPath:         "~/.local/bin/colab",
-		ColabVersion:      "0.8.2",
+		ColabVersion:      "0.8.0",
 		UVPath:            "/opt/homebrew/bin/uv",
 		BrewPath:          "/opt/homebrew/bin/brew",
 		RecommendedMethod: doctor.MethodUVTool,
@@ -51,11 +51,11 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 		ClaudeCodeInstalled: true,
 	}
 
-	if narrowIdle {
-		acc := core.NewDefaultAccountProfile("demolongusername9876", "demolongusername9876@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
-		acc.DeployRecipe = core.RecipeLLMProxy
-		acc.WorkloadKind = core.WorkloadLLM
-		acc.EnableLLMModule = true
+	if idleHome {
+		acc := core.NewDefaultAccountProfile("Personal", "personal@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+		acc.GPUStrategy = core.GPUStrategyAutoSmart
+		acc.DeployRecipe = core.RecipeH3Video
+		acc.H3Variant = core.H3VariantFlash
 		svc.Settings.Accounts = []core.AccountProfile{acc}
 		svc.Settings.SelectedAccountID = acc.ID
 		rt := core.NewAccountRuntimeState()
@@ -67,7 +67,7 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 
 	acc1 := core.NewDefaultAccountProfile("Personal", "personal@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
 	acc1.SessionName = "h3-studio"
-	acc1.HighMem = true
+	acc1.GPUStrategy = core.GPUStrategyAutoSmart
 	acc1.DeployRecipe = core.RecipeH3Video
 	acc1.H3Variant = core.H3VariantFlash
 	acc1.WorkloadKind = core.WorkloadVideo
@@ -79,7 +79,7 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 	acc1.QueueDrainMinutes = 10
 	acc1.IdleTimeoutMinutes = 10
 	acc1.EnablePoliteQueue = true
-	acc1.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccH100}
+	acc1.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccA100}
 	acc1.QueueFallbackEnabled = true
 	acc1.QueueFallbackAfterRounds = 2
 	acc1.QueueFallbackTarget = core.AccL4
@@ -89,7 +89,7 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 	nf := core.NextScheduledFireDate(7, 0, now)
 	acc1.ScheduledNextFireAt = &nf
 	acc1.AutoSyncCCSwitch = true
-	acc1.CCSwitchName = "Colab Qwen3.8-27B (无审查)"
+	acc1.CCSwitchName = "Colab Qwen3.8-27B"
 	acc1.AutoSyncOpenCode = true
 
 	rt1 := core.NewAccountRuntimeState()
@@ -151,7 +151,6 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 	svc.Runtime[acc2.ID] = rt2
 	svc.Runtime[acc3.ID] = rt3
 
-	// Seed rich local allocation heatmap samples for preview
 	for i := 0; i < 8; i++ {
 		svc.Insights.Record("G4", i < 7, time.Date(2026, 11, 25, 6, 30, 0, 0, time.Local))
 	}
@@ -159,10 +158,6 @@ func makeDemoService(section app.MainSection, onboarding, narrowIdle bool) *app.
 		svc.Insights.Record("G4", i < 3, time.Date(2026, 11, 25, 2, 0, 0, 0, time.Local))
 		svc.Insights.Record("G4", i < 3, time.Date(2026, 11, 25, 10, 0, 0, 0, time.Local))
 		svc.Insights.Record("G4", i < 2, time.Date(2026, 11, 25, 21, 0, 0, 0, time.Local))
-	}
-	for i := 0; i < 5; i++ {
-		svc.Insights.Record("G4", i == 0, time.Date(2026, 11, 25, 14, 0, 0, 0, time.Local))
-		svc.Insights.Record("G4", i == 0, time.Date(2026, 11, 25, 18, 0, 0, 0, time.Local))
 	}
 	return svc
 }
@@ -187,44 +182,65 @@ func renderPNG(t *testing.T, view func(*ui.Context), width, height int, outPath 
 }
 
 func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
-	svc := makeDemoService(app.SectionStatus, false, false)
+	// 1. Offline Beginner Launchpad: zero-config defaults + collapsible options + cooldown clear
+	idleSvc := makeDemoService(app.SectionHome, false, true)
+	accID := idleSvc.Settings.SelectedAccountID
+	until := time.Now().Add(12 * time.Minute)
+	rt := idleSvc.Runtime[accID]
+	rt.QueueCircuitBreakTill = &until
+	rt.LastErrorTitle = "Google 提示请求偏频繁，先歇一会儿保护账号"
+	rt.LastError = "Google 提示请求偏频繁 (429)"
+	rt.LastErrorRaw = "HTTP 429 Too Many Requests"
+	idleSvc.Runtime[accID] = rt
+
+	idleUI := uiapp.NewMainUI(idleSvc)
+	idleUI.ForceTheme = "light"
+	idleTester := ui.NewTester(idleUI.View, 1160, 760)
+	if !idleTester.HasText("H3 Flash 极速版") || !idleTester.HasText("一键开机并运行") || !idleTester.HasText("解除等待") {
+		t.Fatalf("missing beginner launchpad or cooldown clear controls: %q", idleTester.Texts())
+	}
+	if err := idleTester.Click("解除等待"); err != nil {
+		t.Fatalf("click 解除等待 failed: %v", err)
+	}
+	if got := idleSvc.StateFor(accID); got.QueueCircuitBreakTill != nil {
+		t.Fatalf("expected cooldown cleared after click")
+	}
+	if err := idleTester.Click("H3 原版 (31B)"); err != nil {
+		t.Fatalf("click H3 原版 failed: %v", err)
+	}
+	if acc, _ := idleSvc.SelectedAccount(); acc.H3Variant != core.H3VariantOriginal {
+		t.Fatalf("expected H3 original variant, got %q", acc.H3Variant)
+	}
+	if err := idleTester.Click("调整显卡与选项 ▾"); err != nil {
+		t.Fatalf("click expand options failed: %v", err)
+	}
+	if !idleTester.HasText("智能挑卡") || !idleTester.HasText("省点模式") || !idleTester.HasText("高级自定义") {
+		t.Fatalf("missing simplified 3-mode GPU picker: %q", idleTester.Texts())
+	}
+
+	// 2. Running Live Bento Console + 3-tab navigation (主页 / 账号 / 设置)
+	svc := makeDemoService(app.SectionHome, false, false)
 	mui := uiapp.NewMainUI(svc)
 	mui.ForceTheme = "dark"
 	tt := ui.NewTester(mui.View, 1160, 760)
 
-	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → H100") || !tt.HasText("开 ComfyUI") {
-		t.Fatalf("missing primary dashboard text: %q", tt.Texts())
+	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("A100 → G4 → L4") || !tt.HasText("开 ComfyUI") {
+		t.Fatalf("missing primary live dashboard text: %q", tt.Texts())
 	}
-
-	// Switch video drain/watchdog pill to 40m
 	if err := tt.Click("40m"); err != nil {
 		t.Fatalf("click 40m failed: %v", err)
 	}
 	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 40 || acc.QueueDrainMinutes != 40 {
 		t.Fatalf("expected 40m after click, got idle=%d drain=%d", acc.IdleTimeoutMinutes, acc.QueueDrainMinutes)
 	}
-
-	// Navigate across all 6 capsule tabs and verify H3 Original / Flash toggle inside Deploy page
-	for _, tab := range []string{"部署", "抢卡", "接入", "账号", "设置", "部署"} {
+	for _, tab := range []string{"账号", "设置", "主页"} {
 		if err := tt.Click(tab); err != nil {
 			t.Fatalf("click tab %s failed: %v", tab, err)
 		}
 	}
-	if !tt.HasText("H3 原版（31B 官方满血）") || !tt.HasText("H3 Flash 极速版（13.7B）") {
-		t.Fatalf("missing H3 variant cards on deploy page: %q", tt.Texts())
-	}
-	if err := tt.Click("H3 原版（31B 官方满血）"); err != nil {
-		t.Fatalf("click H3 original failed: %v", err)
-	}
-	if acc, _ := svc.SelectedAccount(); acc.H3Variant != core.H3VariantOriginal {
-		t.Fatalf("expected H3 original variant, got %q", acc.H3Variant)
-	}
-	if err := tt.Click("状态"); err != nil {
-		t.Fatalf("return to status tab failed: %v", err)
-	}
 
-	// Onboarding wizard renders cleanly
-	obSvc := makeDemoService(app.SectionStatus, true, false)
+	// 3. Onboarding wizard renders cleanly
+	obSvc := makeDemoService(app.SectionHome, true, false)
 	obUI := uiapp.NewMainUI(obSvc)
 	obUI.ForceTheme = "dark"
 	obTester := ui.NewTester(obUI.View, 1160, 720)
@@ -232,7 +248,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("missing onboarding elements: %q", obTester.Texts())
 	}
 
-	// Popover companion HUD renders cleanly
+	// 4. Popover companion HUD renders cleanly
 	pop := uiapp.NewPopoverUI(svc)
 	pop.ForceTheme = "dark"
 	popTester := ui.NewTester(pop.View, 420, 620)
@@ -248,45 +264,77 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		t.Skip("set COLABTOOLS_EXPORT_DIR to export official @2x screenshots")
 	}
 
-	exportMain := func(sec app.MainSection, onboarding, narrow bool, theme string, w, h int, filename string) {
-		svc := makeDemoService(sec, onboarding, narrow)
-		mui := uiapp.NewMainUI(svc)
-		mui.PreviewMode = true
-		mui.ForceTheme = theme
-		renderPNG(t, mui.View, w, h, filepath.Join(outDir, filename))
-	}
+	// 1. Live running status console (dark)
+	runSvc := makeDemoService(app.SectionHome, false, false)
+	runUI := uiapp.NewMainUI(runSvc)
+	runUI.PreviewMode = true
+	runUI.ForceTheme = "dark"
+	renderPNG(t, runUI.View, 1160, 760, filepath.Join(outDir, "preview-main-status.png"))
 
-	exportMain(app.SectionStatus, false, false, "dark", 1160, 760, "preview-main-status.png")
-	exportMain(app.SectionDeploy, false, false, "dark", 1160, 950, "preview-deploy-h3.png")
-	exportMain(app.SectionCompute, false, false, "dark", 1160, 1230, "preview-settings-queue.png")
-	exportMain(app.SectionIntegrations, false, false, "dark", 1160, 860, "preview-settings-integrations.png")
-	exportMain(app.SectionStatus, true, false, "dark", 1160, 720, "preview-onboarding.png")
+	// 2. Clean zero-config Home Launchpad (idle beginner view — H3 Flash default)
+	idleSvc := makeDemoService(app.SectionHome, false, true)
+	idleUI := uiapp.NewMainUI(idleSvc)
+	idleUI.PreviewMode = true
+	idleUI.ForceTheme = "dark"
+	renderPNG(t, idleUI.View, 1160, 680, filepath.Join(outDir, "preview-deploy-h3.png"))
 
-	// Popover single + multi-account
-	singleSvc := makeDemoService(app.SectionStatus, false, false)
+	// 3. Expanded custom GPU strategy & morning schedule drawer
+	customSvc := makeDemoService(app.SectionHome, false, true)
+	cAcc := customSvc.Settings.Accounts[0]
+	cAcc.GPUStrategy = core.GPUStrategyCustom
+	cAcc.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccA100}
+	cAcc.QueueFallbackEnabled = true
+	cAcc.QueueFallbackAfterRounds = 2
+	cAcc.QueueFallbackTarget = core.AccL4
+	cAcc.ScheduledStartEnabled = true
+	cAcc.ScheduledStartHour = 7
+	cAcc.ScheduledStartMinute = 0
+	nf := core.NextScheduledFireDate(7, 0, time.Now())
+	cAcc.ScheduledNextFireAt = &nf
+	customSvc.Settings.Accounts[0] = cAcc
+	customUI := uiapp.NewMainUI(customSvc)
+	customUI.PreviewMode = true
+	customUI.ForceTheme = "dark"
+	customUI.ShowHomeOptions = true
+	renderPNG(t, customUI.View, 1160, 1205, filepath.Join(outDir, "preview-settings-queue.png"))
+
+	// 4. Contextual LLM Proxy mode showing native integrations right on Home
+	llmSvc := makeDemoService(app.SectionHome, false, true)
+	llmSvc.ApplyDeployRecipe(llmSvc.Settings.Accounts[0].ID, core.RecipeLLMProxy)
+	llmUI := uiapp.NewMainUI(llmSvc)
+	llmUI.PreviewMode = true
+	llmUI.ForceTheme = "dark"
+	renderPNG(t, llmUI.View, 1160, 1020, filepath.Join(outDir, "preview-settings-integrations.png"))
+
+	// 5. Onboarding wizard
+	obSvc := makeDemoService(app.SectionHome, true, false)
+	obUI := uiapp.NewMainUI(obSvc)
+	obUI.PreviewMode = true
+	obUI.ForceTheme = "dark"
+	renderPNG(t, obUI.View, 1160, 720, filepath.Join(outDir, "preview-onboarding.png"))
+
+	// 6. Popover single + multi-account
+	singleSvc := makeDemoService(app.SectionHome, false, false)
 	singleSvc.Settings.Accounts = singleSvc.Settings.Accounts[:1]
 	popSingle := uiapp.NewPopoverUI(singleSvc)
 	popSingle.ForceTheme = "dark"
 	renderPNG(t, popSingle.View, 420, 620, filepath.Join(outDir, "preview-dashboard.png"))
 
-	multiSvc := makeDemoService(app.SectionStatus, false, false)
+	multiSvc := makeDemoService(app.SectionHome, false, false)
 	popMulti := uiapp.NewPopoverUI(multiSvc)
 	popMulti.ForceTheme = "dark"
 	popMulti.OverviewMode = true
 	renderPNG(t, popMulti.View, 420, 540, filepath.Join(outDir, "preview-multi-account.png"))
 
 	if qaDir := os.Getenv("COLABTOOLS_EXPORT_QA"); qaDir != "" {
-		exportQA := func(sec app.MainSection, onboarding, narrow bool, theme string, w, h int, filename string) {
-			svc := makeDemoService(sec, onboarding, narrow)
-			mui := uiapp.NewMainUI(svc)
-			mui.PreviewMode = true
-			mui.ForceTheme = theme
-			renderPNG(t, mui.View, w, h, filepath.Join(qaDir, filename))
-		}
-		exportQA(app.SectionStatus, false, false, "light", 1160, 760, "qa-main-status-light.png")
-		exportQA(app.SectionDeploy, false, false, "light", 1160, 950, "qa-deploy-h3-light.png")
-		exportQA(app.SectionStatus, true, false, "light", 1160, 720, "qa-onboarding-light.png")
-		exportQA(app.SectionSettings, false, false, "dark", 1160, 740, "qa-main-settings-dark.png")
-		exportQA(app.SectionStatus, false, true, "dark", 980, 680, "qa-main-status-narrow-idle.png")
+		idleLight := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, true))
+		idleLight.PreviewMode = true
+		idleLight.ForceTheme = "light"
+		renderPNG(t, idleLight.View, 1160, 680, filepath.Join(qaDir, "qa-home-idle-light.png"))
+
+		setLight := uiapp.NewMainUI(makeDemoService(app.SectionSettings, false, true))
+		setLight.PreviewMode = true
+		setLight.ForceTheme = "light"
+		renderPNG(t, setLight.View, 1160, 760, filepath.Join(qaDir, "qa-settings-light.png"))
 	}
 }
