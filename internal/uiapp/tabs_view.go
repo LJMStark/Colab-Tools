@@ -16,8 +16,51 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// MARK: - Reusable Power-User Subpanel: Custom GPU Priority, Fallback, Schedule & Local Heatmap
-// Embedded cleanly inside the Home options drawer ONLY when the user picks "高级自定义".
+// MARK: - Reusable Power-User Subpanel: Smart Strategy Protection & Custom GPU Priority
+// Embedded inside the Home options drawer.
+
+func (m *MainUI) renderSmartStrategyDetails(c *ui.Context, pal Palette, acc core.AccountProfile) {
+	isH3Orig := !acc.EnableLLMModule && acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal
+	fbOn, fbRounds, fbTarget := core.EffectiveFallback(acc)
+
+	var note string
+	var noteCol ui.Color = pal.TextMuted
+	switch {
+	case isH3Orig && !acc.AllowCrossModelFallback:
+		note = "显存保护已开启：H3 原版 (31B) 仅抢高显存大卡，不会自动降级到 L4。"
+	case isH3Orig && acc.AllowCrossModelFallback:
+		note = fmt.Sprintf("已允许跨模型保底：前 %d 轮主攻大卡，第 %d 轮起自动加入 %s 保底并切轻量 GGUF。", fbRounds, fbRounds+1, fbTarget.ShortChipLabel())
+		noteCol = pal.Amber
+	case fbOn:
+		note = fmt.Sprintf("已启用安全保底：前 %d 轮主攻大卡，第 %d 轮起自动加入 %s 保底。", fbRounds, fbRounds+1, fbTarget.ShortChipLabel())
+	default:
+		note = "当前方案已按显存需求自动匹配稳妥顺位，不会误开不兼容显卡。"
+	}
+
+	ui.Row(c).FillWidth().Padding(8, 12).Radius(9).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).AlignItems(ui.Center).Gap(8).Children(func() {
+		DrawPrecisionLED(c, pal.Amber, 10)
+		ui.Text(c, note).FontSize(12).TextColor(noteCol).Grow(1)
+	})
+
+	if isH3Orig {
+		allowFB := acc.AllowCrossModelFallback
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+			ui.Column(c).Grow(1).Gap(2).Cursor(ui.CursorPointer).OnClick(func() {
+				cp := acc
+				cp.AllowCrossModelFallback = !acc.AllowCrossModelFallback
+				m.Svc.UpdateAccount(cp)
+			}).Children(func() {
+				ui.Text(c, "大卡 2 轮无货时，允许保底开 L4 并自动切轻量 GGUF").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
+				ui.Text(c, "默认关闭以保留 31B 原版满血画质；开启后若大卡抢不到，将改开 L4 并自动切为轻量 GGUF").FontSize(11.5).TextColor(pal.TextMuted)
+			})
+			if ui.Switch(c, &allowFB).Clicked() || allowFB != acc.AllowCrossModelFallback {
+				cp := acc
+				cp.AllowCrossModelFallback = allowFB
+				m.Svc.UpdateAccount(cp)
+			}
+		})
+	}
+}
 
 func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc core.AccountProfile) {
 	enableQueue := acc.EnablePoliteQueue

@@ -62,24 +62,28 @@ func TestSubscriptionTierAndOfflineHoursEstimation(t *testing.T) {
 	}
 
 	// Smart strategy auto-adapts GPU priority per scenario:
-	// H3 Flash / ComfyUI / LLM / None -> G4 -> A100 -> L4; H3 Original -> G4 -> A100 -> H100 (no fallback); GGUF -> L4 -> G4 -> A100
+	// H3 Flash / ComfyUI / LLM / None -> primary [G4, A100] with L4 fallback from round 3;
+	// H3 Original -> G4 -> A100 -> H100 (no fallback by default); GGUF -> L4 -> G4 -> A100 (no fallback)
 	acc.GPUStrategy = core.GPUStrategyAutoSmart
 	acc.DeployRecipe = core.RecipeH3Video
 	acc.H3Variant = core.H3VariantFlash
-	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
-		t.Fatalf("expected H3 Flash smart order G4->A100->L4, got %v", got)
+	if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccG4 || got[1] != core.AccA100 {
+		t.Fatalf("expected H3 Flash smart primary order G4->A100, got %v", got)
+	}
+	if fbOn, fbAfter, fbTarget := core.EffectiveFallback(acc); !fbOn || fbAfter != 2 || fbTarget != core.AccL4 {
+		t.Fatalf("expected H3 Flash Ultra fallback (true, 2, L4), got (%v, %d, %v)", fbOn, fbAfter, fbTarget)
 	}
 	acc.DeployRecipe = core.RecipeComfyUIGeneral
-	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
-		t.Fatalf("expected General ComfyUI smart order G4->A100->L4, got %v", got)
+	if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccG4 || got[1] != core.AccA100 {
+		t.Fatalf("expected General ComfyUI smart primary order G4->A100, got %v", got)
 	}
 	acc.DeployRecipe = core.RecipeLLMProxy
-	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
-		t.Fatalf("expected LLM Proxy smart order G4->A100->L4, got %v", got)
+	if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccG4 || got[1] != core.AccA100 {
+		t.Fatalf("expected LLM Proxy smart primary order G4->A100, got %v", got)
 	}
 	acc.DeployRecipe = core.RecipeNone
-	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
-		t.Fatalf("expected Pure Compute smart order G4->A100->L4, got %v", got)
+	if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccG4 || got[1] != core.AccA100 {
+		t.Fatalf("expected Pure Compute smart primary order G4->A100, got %v", got)
 	}
 	acc.DeployRecipe = core.RecipeH3Video
 	acc.H3Variant = core.H3VariantOriginal
@@ -87,11 +91,14 @@ func TestSubscriptionTierAndOfflineHoursEstimation(t *testing.T) {
 		t.Fatalf("expected H3 Original smart order G4->A100->H100, got %v", got)
 	}
 	if fbEnabled, _, _ := core.EffectiveFallback(acc); fbEnabled {
-		t.Fatal("expected EffectiveFallback to stay disabled for H3 Original under auto_smart")
+		t.Fatal("expected EffectiveFallback to stay disabled for H3 Original under auto_smart by default")
 	}
 	acc.H3Variant = core.H3VariantFlashGGUF
 	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccL4 || got[1] != core.AccG4 || got[2] != core.AccA100 {
 		t.Fatalf("expected H3 GGUF smart order L4->G4->A100, got %v", got)
+	}
+	if fbEnabled, _, _ := core.EffectiveFallback(acc); fbEnabled {
+		t.Fatal("expected EffectiveFallback to stay disabled for H3 GGUF under auto_smart")
 	}
 
 	// Free tier without paid balance is restricted from SSH/WebUI
@@ -381,5 +388,139 @@ func TestH3DeployEnvValidationAndSanitization(t *testing.T) {
 	// Drive subpath sanitizer blocks traversal & shell metacharacters
 	if got := core.SanitizeDriveSubpath("/content/drive/MyDrive/../../etc/passwd", "/content/drive/MyDrive/ColabTools/outputs"); got != "/content/drive/MyDrive/ColabTools/outputs" {
 		t.Fatalf("traversal must fall back cleanly, got %q", got)
+	}
+}
+
+func TestVRAMProtectionCrossModelFallbackAndEcoSaver(t *testing.T) {
+	// Pro / AI Pro / PAYG VRAM protection under GPUStrategyAutoSmart
+	for _, tier := range []core.SubscriptionTier{core.TierAIPro, core.TierColabPro, core.TierPayAsYouGo} {
+		acc := core.NewDefaultAccountProfile("Pro", "p@example.com", tier, core.AuthSystemDefaultOAuth2)
+		acc.GPUStrategy = core.GPUStrategyAutoSmart
+		acc.DeployRecipe = core.RecipeH3Video
+
+		// 31B Original: strictly [A100], no L4/T4; fallback disabled by default
+		acc.H3Variant = core.H3VariantOriginal
+		acc.AllowCrossModelFallback = false
+		if got := core.EffectiveQueueTargets(acc); len(got) != 1 || got[0] != core.AccA100 {
+			t.Fatalf("tier %s 31B must only queue [A100], got %v", tier, got)
+		}
+		if fbOn, after, target := core.EffectiveFallback(acc); fbOn || after != 2 || target != core.AccL4 {
+			t.Fatalf("tier %s 31B default fallback = (%v,%d,%v), want (false,2,L4)", tier, fbOn, after, target)
+		}
+
+		// 31B Original with AllowCrossModelFallback=true: primary [A100], round 3+ adds L4
+		acc.AllowCrossModelFallback = true
+		if fbOn, after, target := core.EffectiveFallback(acc); !fbOn || after != 2 || target != core.AccL4 {
+			t.Fatalf("tier %s 31B cross-model fallback = (%v,%d,%v), want (true,2,L4)", tier, fbOn, after, target)
+		}
+		r3 := core.QueueTargetsForRound(3, core.EffectiveQueueTargets(acc), true, 2, core.AccL4, tier)
+		if len(r3) != 2 || r3[0] != core.AccA100 || r3[1] != core.AccL4 {
+			t.Fatalf("tier %s 31B round 3 expected [A100, L4], got %v", tier, r3)
+		}
+
+		// H3 Flash: [A100, L4], never T4
+		acc.H3Variant = core.H3VariantFlash
+		if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccA100 || got[1] != core.AccL4 {
+			t.Fatalf("tier %s H3 Flash expected [A100, L4], got %v", tier, got)
+		}
+		if fbOn, _, _ := core.EffectiveFallback(acc); fbOn {
+			t.Fatalf("tier %s H3 Flash must not fall back to T4", tier)
+		}
+
+		// H3 GGUF: [L4, A100], no T4 fallback
+		acc.H3Variant = core.H3VariantFlashGGUF
+		if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccL4 || got[1] != core.AccA100 {
+			t.Fatalf("tier %s GGUF expected [L4, A100], got %v", tier, got)
+		}
+		if fbOn, _, _ := core.EffectiveFallback(acc); fbOn {
+			t.Fatalf("tier %s GGUF must disable fallback", tier)
+		}
+
+		// General ComfyUI / LLM Proxy / Pure Compute: [A100, L4] with T4 fallback
+		for _, recipe := range []core.DeployRecipe{core.RecipeComfyUIGeneral, core.RecipeLLMProxy, core.RecipeNone} {
+			acc.DeployRecipe = recipe
+			if got := core.EffectiveQueueTargets(acc); len(got) != 2 || got[0] != core.AccA100 || got[1] != core.AccL4 {
+				t.Fatalf("tier %s recipe %s expected [A100, L4], got %v", tier, recipe, got)
+			}
+			if fbOn, after, target := core.EffectiveFallback(acc); !fbOn || after != 2 || target != core.AccT4 {
+				t.Fatalf("tier %s recipe %s expected fallback (true,2,T4), got (%v,%d,%v)", tier, recipe, fbOn, after, target)
+			}
+		}
+	}
+
+	// Free tier under AutoSmart
+	freeAcc := core.NewDefaultAccountProfile("Free", "f@example.com", core.TierFree, core.AuthSystemDefaultOAuth2)
+	freeAcc.GPUStrategy = core.GPUStrategyAutoSmart
+	if got := core.EffectiveQueueTargets(freeAcc); len(got) != 1 || got[0] != core.AccT4 {
+		t.Fatalf("free tier expected [T4], got %v", got)
+	}
+	if fbOn, _, target := core.EffectiveFallback(freeAcc); fbOn || target != core.AccT4 {
+		t.Fatalf("free tier fallback expected (false, _, T4), got (%v, %v)", fbOn, target)
+	}
+
+	// EcoSaver VRAM protection
+	ultraEco := core.NewDefaultAccountProfile("UltraEco", "ue@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	ultraEco.GPUStrategy = core.GPUStrategyEcoSaver
+	ultraEco.DeployRecipe = core.RecipeH3Video
+	ultraEco.H3Variant = core.H3VariantOriginal
+	if got := core.EffectiveQueueTargets(ultraEco); len(got) != 2 || got[0] != core.AccA100 || got[1] != core.AccG4 {
+		t.Fatalf("Ultra eco 31B expected [A100, G4], got %v", got)
+	}
+	proEco := core.NewDefaultAccountProfile("ProEco", "pe@example.com", core.TierColabPro, core.AuthSystemDefaultOAuth2)
+	proEco.GPUStrategy = core.GPUStrategyEcoSaver
+	proEco.DeployRecipe = core.RecipeH3Video
+	proEco.H3Variant = core.H3VariantOriginal
+	if got := core.EffectiveQueueTargets(proEco); len(got) != 1 || got[0] != core.AccA100 {
+		t.Fatalf("Pro eco 31B expected [A100], got %v", got)
+	}
+	proEco.H3Variant = core.H3VariantFlash
+	if got := core.EffectiveQueueTargets(proEco); len(got) != 1 || got[0] != core.AccL4 {
+		t.Fatalf("Pro eco Flash expected [L4], got %v", got)
+	}
+	proEco.H3Variant = core.H3VariantFlashGGUF
+	if got := core.EffectiveQueueTargets(proEco); len(got) != 1 || got[0] != core.AccL4 {
+		t.Fatalf("Pro eco GGUF expected [L4], got %v", got)
+	}
+	proEco.DeployRecipe = core.RecipeComfyUIGeneral
+	if got := core.EffectiveQueueTargets(proEco); len(got) != 2 || got[0] != core.AccL4 || got[1] != core.AccT4 {
+		t.Fatalf("Pro eco ComfyUI expected [L4, T4], got %v", got)
+	}
+	freeAcc.GPUStrategy = core.GPUStrategyEcoSaver
+	if got := core.EffectiveQueueTargets(freeAcc); len(got) != 1 || got[0] != core.AccT4 {
+		t.Fatalf("Free eco expected [T4], got %v", got)
+	}
+
+	// DefaultFallbackTarget must never select H100/A100 when L4 is already in primary list
+	if got := core.DefaultFallbackTarget([]core.AcceleratorOption{core.AccL4, core.AccG4, core.AccA100}, core.TierAIUltra); got != core.AccT4 {
+		t.Fatalf("DefaultFallbackTarget with L4 present on Ultra must return T4, got %v", got)
+	}
+	if got := core.DefaultFallbackTarget([]core.AcceleratorOption{core.AccL4, core.AccT4}, core.TierColabPro); got != core.AccT4 {
+		t.Fatalf("DefaultFallbackTarget with L4+T4 present on Pro must return T4 (never A100), got %v", got)
+	}
+	if got := core.DefaultFallbackTarget([]core.AcceleratorOption{core.AccG4, core.AccA100}, core.TierAIUltra); got != core.AccL4 {
+		t.Fatalf("DefaultFallbackTarget with G4+A100 on Ultra must return L4, got %v", got)
+	}
+
+	// IsSmallVRAMHardware & ShouldCrossModelDowngrade
+	if !core.IsSmallVRAMHardware("NVIDIA L4") || !core.IsSmallVRAMHardware("Tesla T4") || core.IsSmallVRAMHardware("NVIDIA A100") {
+		t.Fatal("IsSmallVRAMHardware classification mismatch")
+	}
+	acc31B := core.NewDefaultAccountProfile("31B", "31b@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc31B.DeployRecipe = core.RecipeH3Video
+	acc31B.H3Variant = core.H3VariantOriginal
+	acc31B.AllowCrossModelFallback = false
+	if core.ShouldCrossModelDowngrade(acc31B, "L4") {
+		t.Fatal("ShouldCrossModelDowngrade must be false when AllowCrossModelFallback=false")
+	}
+	acc31B.AllowCrossModelFallback = true
+	if !core.ShouldCrossModelDowngrade(acc31B, "L4") || !core.ShouldCrossModelDowngrade(acc31B, "T4") {
+		t.Fatal("ShouldCrossModelDowngrade must be true on L4/T4 when AllowCrossModelFallback=true")
+	}
+	if core.ShouldCrossModelDowngrade(acc31B, "A100") || core.ShouldCrossModelDowngrade(acc31B, "G4") {
+		t.Fatal("ShouldCrossModelDowngrade must be false on A100/G4")
+	}
+	acc31B.EnableLLMModule = true
+	if core.ShouldCrossModelDowngrade(acc31B, "L4") {
+		t.Fatal("ShouldCrossModelDowngrade must be false when EnableLLMModule=true")
 	}
 }

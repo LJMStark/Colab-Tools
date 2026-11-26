@@ -51,6 +51,12 @@ type MainUI struct {
 	DriveOutputDraft   string
 	DraftAccountID     string
 	PortValidationErr  string
+
+	// History tab filter & pagination state
+	HistoryKindFilter core.HistoryEntryKind
+	HistoryDaysFilter int
+	HistoryAccountID  string
+	HistoryPageLimit  int
 }
 
 func timeNow() time.Time { return time.Now() }
@@ -60,6 +66,8 @@ func NewMainUI(svc *app.Service) *MainUI {
 		Svc:               svc,
 		SelectedCopyProto: integrations.ProtocolOpenAI,
 		NewAccTierIdx:     3, // Colab Pro default
+		HistoryDaysFilter: 7,
+		HistoryPageLimit:  60,
 	}
 }
 
@@ -130,6 +138,8 @@ func (m *MainUI) View(c *ui.Context) {
 					switch m.Svc.SelectedSection {
 					case app.SectionHome:
 						m.renderStatusPage(c, pal)
+					case app.SectionHistory:
+						m.renderHistoryPage(c, pal)
 					case app.SectionAccounts:
 						m.centeredWorkbench(c, func() { m.renderAccountsPage(c, pal) })
 					case app.SectionSettings:
@@ -345,7 +355,7 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 					}
 				}).Children(func() {
 				DrawPrecisionLED(c, AccountTagColor(pal, selAcc.ColorTag), 10)
-				ui.Text(c, selAcc.DisplayName).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
+				ui.Text(c, selAcc.DisplayName).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary).MaxWidth(140).MaxLines(1).Ellipsis("…")
 				ui.Text(c, "▾").FontSize(11).TextColor(pal.TextMuted)
 			})
 		}
@@ -606,6 +616,18 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 						m.Svc.SetSection(app.SectionAccounts)
 					})
 				default:
+					isH3Orig := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal
+					isShortage := rt.LastAllocHadShortage || strings.Contains(rt.LastError, "无货") || strings.Contains(rt.LastError, "没货") || strings.Contains(rt.LastError, "503")
+					if isH3Orig {
+						SmallActionButton(c, pal, "改用 L4 轻量版", &pal.Emerald, !m.Svc.CLIInstalled, func() {
+							m.Svc.SwitchToLightGGUFAndStart(acc.ID)
+						})
+					}
+					if isShortage || isH3Orig {
+						SmallActionButton(c, pal, "预约 07:00 抢卡", &pal.Sky, false, func() {
+							m.Svc.QuickScheduleMorningStart(acc.ID, 7, 0)
+						})
+					}
 					SmallActionButton(c, pal, "直接重试", &pal.Amber, !m.Svc.CLIInstalled, func() {
 						m.Svc.DeployNow(acc.ID)
 					})
@@ -1582,6 +1604,9 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 		ui.Row(c).FillWidth().Gap(10).Padding(0, 6).AlignItems(ui.Center).Children(func() {
 			ui.Row(c).Grow(1).MinWidth(220).Gap(10).AlignItems(ui.Center).Children(func() {
 				ui.Textf(c, "账号与活跃会话 (%d)", len(accounts)).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
+				SmallActionButton(c, pal, "查看历史 ›", nil, false, func() {
+					m.Svc.SetSection(app.SectionHistory)
+				})
 				if m.Svc.TotalManagedRunningSessionCount() >= 2 {
 					SmallActionButton(c, pal, "⏻ 全部关机止损", &pal.Coral, false, func() {
 						go m.Svc.StopAllManagedSessions()

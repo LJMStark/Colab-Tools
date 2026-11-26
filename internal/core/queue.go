@@ -112,16 +112,23 @@ func EligibleFallbackTargets(excluding []AcceleratorOption, tier SubscriptionTie
 }
 
 func DefaultFallbackTarget(excluding []AcceleratorOption, tier SubscriptionTier) AcceleratorOption {
+	if tier == TierFree {
+		return AccT4
+	}
 	candidates := EligibleFallbackTargets(excluding, tier)
 	if slices.Contains(candidates, AccL4) {
 		return AccL4
 	}
-	if len(candidates) > 0 {
-		return candidates[0]
+	if slices.Contains(candidates, AccT4) {
+		return AccT4
 	}
-	q := tier.QueueableAccelerators()
-	if len(q) > 0 {
-		return q[len(q)-1]
+	// Never pick high-cost cards (H100/G4/A100) as a fallback when L4/T4 are already present or excluded.
+	allowed := tier.QueueableAccelerators()
+	if slices.Contains(allowed, AccT4) {
+		return AccT4
+	}
+	if slices.Contains(allowed, AccL4) {
+		return AccL4
 	}
 	return AccT4
 }

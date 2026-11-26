@@ -66,6 +66,7 @@ type ProvisionRoundResult struct {
 	Outcome           core.ProvisionOutcome
 	UnsupportedValues map[string]bool
 	ProbeRecords      []ProbeAttemptRecord
+	UsedStandardRAM   bool
 }
 
 type OAuthSessionTicket struct {
@@ -651,6 +652,75 @@ func (e *Engine) ProvisionSession(
 			return res
 		}
 		outcome := core.ClassifyProvisionFailure(r.ExitCode, r.TimedOut, r.Stdout, r.Stderr, target.Display)
+		handleTimeout := func(toOutcome core.ProvisionOutcome, standardRAM bool) (done bool, shouldContinue bool) {
+			_, activeSessions, checkErr := e.FetchUsageAndSessions(ctx, profile)
+			if checkErr == nil {
+				for _, sess := range activeSessions {
+					if !sess.IsOrphan && sess.Name == profile.SessionName {
+						hw := strings.TrimSpace(sess.Hardware)
+						if hw == "" {
+							hw = target.Display
+						}
+						res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: hw, Succeeded: true})
+						if standardRAM {
+							res.UsedStandardRAM = true
+						}
+						res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeAllocated, Hardware: hw}
+						return true, false
+					}
+				}
+				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
+				if !sawCapacity {
+					lastOutcome = toOutcome
+				}
+				if onProgress != nil {
+					onProgress(fmt.Sprintf("%s 申请超时且确认未开机，自动切换下一张卡…", target.Display))
+				}
+				return false, true
+			}
+			// Do not blindly retry when verification failed to avoid duplicate billing.
+			res.Outcome = toOutcome
+			return true, false
+		}
+		handle412 := func(preOutcome core.ProvisionOutcome) (done bool, shouldContinue bool) {
+			// Official google-colab-cli 0.8.x uses HTTP 412 for BOTH "too many active sessions"
+			// AND "temporary usage/capacity limit for the requested accelerator".
+			// Check active sessions on server: if check fails or 0 active sessions, treat this card as unavailable and try the next card!
+			_, activeSessions, checkErr := e.FetchUsageAndSessions(ctx, profile)
+			if checkErr != nil {
+				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
+				sawCapacity = true
+				lastOutcome = core.ProvisionOutcome{
+					Kind:      core.OutcomeCapacity503,
+					Hardware:  target.Display,
+					Code:      "412_CHECK_ERR",
+					Message:   fmt.Sprintf("%s 暂时受限或查询波动，将自动改试下一张卡", target.Display),
+					RawDetail: preOutcome.RawDetail,
+				}
+				if onProgress != nil {
+					onProgress(fmt.Sprintf("%s 暂时受限，自动切换下一张卡…", target.Display))
+				}
+				return false, true
+			}
+			if len(activeSessions) == 0 {
+				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
+				sawCapacity = true
+				lastOutcome = core.ProvisionOutcome{
+					Kind:      core.OutcomeCapacity503,
+					Hardware:  target.Display,
+					Code:      "412_CAPACITY",
+					Message:   fmt.Sprintf("%s 暂时受限或满载，将自动改试下一张卡", target.Display),
+					RawDetail: preOutcome.RawDetail,
+				}
+				if onProgress != nil {
+					onProgress(fmt.Sprintf("%s 暂时受限，自动切换下一张卡…", target.Display))
+				}
+				return false, true
+			}
+			preOutcome.Message = fmt.Sprintf("账号里已有 %d 个运行中的机器，达到同时开机上限，请先关掉旧机器", len(activeSessions))
+			res.Outcome = preOutcome
+			return true, false
+		}
 		switch outcome.Kind {
 		case core.OutcomeAllocated:
 			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
@@ -660,31 +730,94 @@ func (e *Engine) ProvisionSession(
 			res.Outcome = outcome
 			return res
 		case core.OutcomePrecondition412:
-			// Official google-colab-cli 0.8.x uses HTTP 412 for BOTH "too many active sessions"
-			// AND "temporary usage/capacity limit for the requested accelerator".
-			// Check active sessions on server: if 0 active sessions, treat this card as unavailable and try the next card!
-			_, activeSessions, checkErr := e.FetchUsageAndSessions(ctx, profile)
-			if checkErr == nil && len(activeSessions) == 0 {
-				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
-				sawCapacity = true
-				lastOutcome = core.ProvisionOutcome{
-					Kind:      core.OutcomeCapacity503,
-					Hardware:  target.Display,
-					Code:      "412_CAPACITY",
-					Message:   fmt.Sprintf("%s 暂时受限或满载，将自动改试下一张卡", target.Display),
-					RawDetail: outcome.RawDetail,
-				}
-				if onProgress != nil {
-					onProgress(fmt.Sprintf("%s 暂时受限，自动切换下一张卡…", target.Display))
-				}
+			done, cont := handle412(outcome)
+			if done {
+				return res
+			}
+			if cont {
 				continue
 			}
-			if checkErr == nil && len(activeSessions) > 0 {
-				outcome.Message = fmt.Sprintf("账号里已有 %d 个运行中的机器，达到同时开机上限，请先关掉旧机器", len(activeSessions))
-			}
-			res.Outcome = outcome
-			return res
 		case core.OutcomeCapacity503:
+			if useHighMem {
+				waitDur := 2 * time.Second
+				canRetryStd := deadline == nil || time.Until(*deadline)-waitDur >= core.QueueMinProvisionBudget
+				if canRetryStd {
+					if onProgress != nil {
+						onProgress(fmt.Sprintf("%s 高内存暂缺，2 秒后尝试标准内存…", target.Display))
+					}
+					select {
+					case <-time.After(waitDur):
+					case <-ctx.Done():
+						res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "CANCELLED", Message: "已取消申请"}
+						return res
+					}
+					stdTimeout := 50 * time.Second
+					if deadline != nil {
+						rem := time.Until(*deadline)
+						if rem < core.QueueMinProvisionBudget {
+							res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeBudgetExhausted, Message: "已达排队总时长上限"}
+							return res
+						}
+						if rem < stdTimeout {
+							stdTimeout = time.Duration(math.Floor(rem.Seconds())) * time.Second
+						}
+					}
+					stdArgs := []string{"new", "-s", profile.SessionName}
+					if target.Flag != "" && target.Value != "" {
+						stdArgs = append(stdArgs, target.Flag, target.Value)
+					}
+					stdR := e.RunColab(ctx, profile, stdArgs, "", stdTimeout)
+					if stdR.ExitCode == 0 {
+						res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
+						res.UsedStandardRAM = true
+						res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeAllocated, Hardware: target.Display}
+						return res
+					}
+					stdOutcome := core.ClassifyProvisionFailure(stdR.ExitCode, stdR.TimedOut, stdR.Stdout, stdR.Stderr, target.Display)
+					switch stdOutcome.Kind {
+					case core.OutcomeAllocated:
+						res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
+						res.UsedStandardRAM = true
+						res.Outcome = stdOutcome
+						return res
+					case core.OutcomeRateLimited, core.OutcomeAuthError, core.OutcomeBudgetExhausted:
+						res.Outcome = stdOutcome
+						return res
+					case core.OutcomePrecondition412:
+						done, cont := handle412(stdOutcome)
+						if done {
+							return res
+						}
+						if cont {
+							continue
+						}
+					case core.OutcomeUnsupportedTier400:
+						if target.Value != "" {
+							res.UnsupportedValues[strings.ToUpper(target.Value)] = true
+						}
+						if !sawCapacity {
+							lastOutcome = stdOutcome
+						}
+						if onProgress != nil {
+							onProgress(fmt.Sprintf("当前账号无 %s 配额，自动跳过…", target.Display))
+						}
+						continue
+					case core.OutcomeTransientError:
+						if stdOutcome.Code == "TIMEOUT" {
+							done, cont := handleTimeout(stdOutcome, true)
+							if done {
+								return res
+							}
+							if cont {
+								continue
+							}
+						}
+						outcome = stdOutcome
+					default:
+						outcome = stdOutcome
+					}
+				}
+			}
 			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
 			sawCapacity = true
 			lastOutcome = outcome
@@ -703,9 +836,13 @@ func (e *Engine) ProvisionSession(
 			}
 		case core.OutcomeTransientError:
 			if outcome.Code == "TIMEOUT" {
-				// Do not blindly retry after an ambiguous timeout to avoid duplicate billing.
-				res.Outcome = outcome
-				return res
+				done, cont := handleTimeout(outcome, false)
+				if done {
+					return res
+				}
+				if cont {
+					continue
+				}
 			}
 			if !sawCapacity {
 				lastOutcome = outcome

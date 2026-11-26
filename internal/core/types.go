@@ -639,38 +639,83 @@ func (g GPUStrategyMode) DisplayName() string {
 	}
 }
 
+func isH3VideoRecipe(acc AccountProfile) bool {
+	return !acc.EnableLLMModule && acc.DeployRecipe == RecipeH3Video
+}
+
+// IsSmallVRAMHardware reports whether the hardware label refers to a small-VRAM GPU (L4 or T4).
+func IsSmallVRAMHardware(hardware string) bool {
+	u := strings.ToUpper(hardware)
+	return strings.Contains(u, "L4") || strings.Contains(u, "T4")
+}
+
+// ShouldCrossModelDowngrade reports whether an H3 31B account with explicit cross-model fallback
+// was allocated a small-VRAM card (L4/T4) and should automatically downgrade weights.
+func ShouldCrossModelDowngrade(acc AccountProfile, allocatedHardware string) bool {
+	return isH3VideoRecipe(acc) &&
+		acc.H3Variant == H3VariantOriginal &&
+		acc.AllowCrossModelFallback &&
+		IsSmallVRAMHardware(allocatedHardware)
+}
+
 // SmartQueueTargets derives the most reliable GPU priority order for a given subscription tier and task.
 func SmartQueueTargets(acc AccountProfile) []AcceleratorOption {
 	switch acc.Tier {
 	case TierFree:
 		return []AcceleratorOption{AccT4}
 	case TierAIPro, TierColabPro, TierPayAsYouGo:
-		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantFlashGGUF {
-			return []AcceleratorOption{AccL4, AccA100}
+		if isH3VideoRecipe(acc) {
+			switch acc.H3Variant {
+			case H3VariantOriginal:
+				// 31B Original strictly requires A100 on Pro/PAYG; never put L4/T4 in the queue.
+				return []AcceleratorOption{AccA100}
+			case H3VariantFlash:
+				// H3 Flash needs >=24GB VRAM; never put 16GB T4 in the queue.
+				return []AcceleratorOption{AccA100, AccL4}
+			case H3VariantFlashGGUF:
+				return []AcceleratorOption{AccL4, AccA100}
+			}
 		}
-		return []AcceleratorOption{AccA100, AccL4, AccT4}
+		return []AcceleratorOption{AccA100, AccL4}
 	default: // TierAIUltra, TierColabProPlus
-		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantOriginal {
-			// 31B Original stays strictly on high-VRAM GPUs and never blindly falls back to 24GB L4.
-			return []AcceleratorOption{AccG4, AccA100, AccH100}
-		}
-		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantFlashGGUF {
-			return []AcceleratorOption{AccL4, AccG4, AccA100}
+		if isH3VideoRecipe(acc) {
+			switch acc.H3Variant {
+			case H3VariantOriginal:
+				// 31B Original stays strictly on high-VRAM GPUs and never blindly falls back to 24GB L4.
+				return []AcceleratorOption{AccG4, AccA100, AccH100}
+			case H3VariantFlashGGUF:
+				return []AcceleratorOption{AccL4, AccG4, AccA100}
+			}
 		}
 		// H3 Flash, General ComfyUI, LLM Proxy, Pure Compute:
-		// prioritize G4 (96GB, ~7 CU/h), then A100 (~12 CU/h), then L4 fallback.
-		return []AcceleratorOption{AccG4, AccA100, AccL4}
+		// prioritize G4 and A100 in primary rounds, then EffectiveFallback appends L4 from round 3.
+		return []AcceleratorOption{AccG4, AccA100}
 	}
+}
+
+func ecoSaverQueueTargets(acc AccountProfile) []AcceleratorOption {
+	if acc.Tier == TierFree {
+		return []AcceleratorOption{AccT4}
+	}
+	if isH3VideoRecipe(acc) {
+		switch acc.H3Variant {
+		case H3VariantOriginal:
+			if acc.Tier == TierColabProPlus || acc.Tier == TierAIUltra {
+				return []AcceleratorOption{AccA100, AccG4}
+			}
+			return []AcceleratorOption{AccA100}
+		case H3VariantFlash, H3VariantFlashGGUF:
+			return []AcceleratorOption{AccL4}
+		}
+	}
+	return []AcceleratorOption{AccL4, AccT4}
 }
 
 // EffectiveQueueTargets is the single source of truth for which cards will be attempted and in what order.
 func EffectiveQueueTargets(acc AccountProfile) []AcceleratorOption {
 	switch acc.GPUStrategy {
 	case GPUStrategyEcoSaver:
-		if acc.Tier == TierFree {
-			return []AcceleratorOption{AccT4}
-		}
-		return []AcceleratorOption{AccL4, AccT4}
+		return SanitizedQueueTargets(ecoSaverQueueTargets(acc), acc.Tier)
 	case GPUStrategyCustom:
 		return SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
 	default:
@@ -686,7 +731,26 @@ func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, targe
 	case GPUStrategyCustom:
 		return acc.QueueFallbackEnabled, acc.QueueFallbackAfterRounds, acc.QueueFallbackTarget
 	default:
-		return false, 2, DefaultFallbackTarget(EffectiveQueueTargets(acc), acc.Tier)
+		if acc.Tier == TierFree {
+			return false, 2, AccT4
+		}
+		if isH3VideoRecipe(acc) {
+			switch acc.H3Variant {
+			case H3VariantOriginal:
+				return acc.AllowCrossModelFallback, 2, AccL4
+			case H3VariantFlashGGUF:
+				return false, 2, AccL4
+			case H3VariantFlash:
+				if acc.Tier == TierColabProPlus || acc.Tier == TierAIUltra {
+					return true, 2, AccL4
+				}
+				return false, 2, AccL4
+			}
+		}
+		if acc.Tier == TierColabProPlus || acc.Tier == TierAIUltra {
+			return true, 2, AccL4
+		}
+		return true, 2, AccT4
 	}
 }
 
@@ -771,6 +835,7 @@ type AccountProfile struct {
 	QueueFallbackEnabled     bool                `json:"queueFallbackEnabled"`
 	QueueFallbackAfterRounds int                 `json:"queueFallbackAfterRounds"`
 	QueueFallbackTarget      AcceleratorOption   `json:"queueFallbackTarget"`
+	AllowCrossModelFallback  bool                `json:"allowCrossModelFallback,omitempty"`
 
 	ScheduledStartEnabled     bool       `json:"scheduledStartEnabled"`
 	ScheduledStartHour        int        `json:"scheduledStartHour"`
@@ -1342,6 +1407,20 @@ type AccountRuntimeState struct {
 	LastErrorTitle        string
 	LastErrorAction       string // "", "retry", "stop_existing", "reauth", "clear_cooldown"
 	LastErrorRaw          string
+
+	// In-memory runtime ledger for current active session & last allocation
+	SessionStartedAt          time.Time
+	SessionStartBalance       float64
+	SessionStartBalanceValid  bool
+	SessionAdopted            bool
+	SessionMaxAssignments     int
+	SessionMeasuredSingleRate float64
+	SessionEstimatedCU        float64
+	SessionLastSampleAt       time.Time
+	SessionFallbackUsed       bool
+	SessionModelDowngraded    bool
+	SessionUsedStandardRAM    bool
+	LastAllocHadShortage      bool
 }
 
 func NewAccountRuntimeState() AccountRuntimeState {

@@ -469,6 +469,12 @@ func (p *PopoverUI) renderFooter(c *ui.Context, pal Palette) {
 			}
 		})
 		ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
+		ui.Text(c, "记录").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).OnClick(func() {
+			if p.OnOpenMain != nil {
+				p.OnOpenMain(app.SectionHistory)
+			}
+		})
+		ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
 		ui.Text(c, "设置").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).OnClick(func() {
 			if p.OnOpenMain != nil {
 				p.OnOpenMain(app.SectionSettings)

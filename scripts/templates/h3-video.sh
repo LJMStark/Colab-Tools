@@ -268,11 +268,21 @@ for _ in $(seq 1 10); do
   sleep 1
 done
 
+LOWVRAM_FLAG=""
+if [ "$H3_VARIANT" = "flash" ]; then
+  VRAM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+  if [ -n "$VRAM_MB" ] && [ "$VRAM_MB" -eq "$VRAM_MB" ] 2>/dev/null && [ "$VRAM_MB" -le 26000 ]; then
+    LOWVRAM_FLAG="--lowvram"
+    echo "[gpu] Detected ${VRAM_MB}MB VRAM (<=26000MB) with H3 Flash, enabling --lowvram"
+  fi
+fi
+
 nohup python3 "$COMFY_DIR/main.py" \
   --listen 127.0.0.1 \
   --port "$SERVICE_PORT" \
   --output-directory "$OUTPUT_DIR" \
   --disable-auto-launch \
+  ${LOWVRAM_FLAG:+$LOWVRAM_FLAG} \
   > "$LOG_FILE" 2>&1 &
 
 for _ in $(seq 1 60); do

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -22,12 +24,13 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.12"
+const AppVersion = "0.3.13"
 
 type MainSection int
 
 const (
 	SectionHome MainSection = iota
+	SectionHistory
 	SectionAccounts
 	SectionSettings
 
@@ -35,7 +38,7 @@ const (
 	SectionStatus = SectionHome
 )
 
-var MainSectionTitles = []string{"主页", "账号", "设置"}
+var MainSectionTitles = []string{"主页", "记录", "账号", "设置"}
 
 type deployWatchHandle struct {
 	token  string
@@ -43,8 +46,12 @@ type deployWatchHandle struct {
 }
 
 type queueHandle struct {
-	token  string
-	cancel context.CancelFunc
+	token          string
+	cancel         context.CancelFunc
+	startedAt      time.Time
+	targetsSummary string
+	rounds         int
+	allocLogged    bool
 }
 
 type Service struct {
@@ -53,6 +60,7 @@ type Service struct {
 	Settings        core.AppSettings
 	Runtime         map[string]core.AccountRuntimeState
 	Insights        core.AllocationInsights
+	History         *core.HistoryStore
 	EnvReport       doctor.Report
 	ClientDetection integrations.DetectionSnapshot
 
@@ -106,15 +114,19 @@ type Service struct {
 func NewService(skipBootstrap bool) *Service {
 	r := runner.NewOSRunner()
 	var v *vault.Vault
+	var hist *core.HistoryStore
 	if skipBootstrap {
 		v = vault.New(vault.NewMemoryBackend())
+		hist = core.NewMemoryHistoryStore()
 	} else {
 		v = vault.New(nil)
+		hist = core.LoadHistoryStore(core.HistoryFilePath())
 	}
 	s := &Service{
 		Settings:           core.DefaultAppSettings(),
 		Runtime:            map[string]core.AccountRuntimeState{},
 		Insights:           core.NewAllocationInsights(),
+		History:            hist,
 		CLIInstalled:       true,
 		OnboardingStep:     1,
 		queueCancels:       map[string]queueHandle{},
@@ -494,6 +506,62 @@ func (s *Service) InsightsSnapshot(hardware string) (total int, slots []core.Tim
 	return s.Insights.TotalAttempts(hardware),
 		s.Insights.SixSlotHeatmap(hardware),
 		s.Insights.RecommendedWindowSummary(hardware)
+}
+
+func (s *Service) HistorySnapshot(filter core.HistoryFilter) ([]core.HistoryRecord, core.HistorySummary) {
+	if s.History == nil {
+		return []core.HistoryRecord{}, core.HistorySummary{}
+	}
+	return s.History.Query(filter, time.Now())
+}
+
+func (s *Service) ExportHistoryCSV(filter core.HistoryFilter) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return "", fmt.Errorf("无法定位用户主目录")
+	}
+	targetDir := filepath.Join(home, "Downloads")
+	if info, statErr := os.Stat(targetDir); statErr != nil || !info.IsDir() {
+		targetDir = home
+	}
+	store := s.History
+	if store == nil {
+		store = core.NewMemoryHistoryStore()
+	}
+	now := time.Now()
+	csvContent := store.ExportCSV(filter, now)
+	outPath := filepath.Join(targetDir, fmt.Sprintf("colab-tools-history-%s.csv", now.Format("20060102-150405")))
+	if err := os.WriteFile(outPath, []byte(csvContent), 0o600); err != nil {
+		return "", err
+	}
+	s.ShowToast("已导出账单至 " + outPath)
+	return outPath, nil
+}
+
+func (s *Service) SwitchToLightGGUFAndStart(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	acc.H3Variant = core.H3VariantFlashGGUF
+	s.UpdateAccount(acc)
+	s.ClearAccountError(accountID)
+	s.DeployNow(accountID)
+}
+
+func (s *Service) QuickScheduleMorningStart(accountID string, hour, minute int) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	nf := core.NextScheduledFireDate(hour, minute, time.Now())
+	acc.ScheduledStartEnabled = true
+	acc.ScheduledStartHour = nf.Hour()
+	acc.ScheduledStartMinute = nf.Minute()
+	acc.ScheduledNextFireAt = &nf
+	s.UpdateAccount(acc)
+	s.ClearAccountError(accountID)
+	s.ShowToast(fmt.Sprintf("已预约每天 %02d:%02d 自动抢卡", acc.ScheduledStartHour, acc.ScheduledStartMinute))
 }
 
 func (s *Service) SelectAccount(accountID string) {
@@ -987,14 +1055,161 @@ func (s *Service) refreshAccount(accountID string, force, silent, settleBusy boo
 		s.mu.Unlock()
 		return false
 	}
-	primaryEndpoint, isRunning := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, now, settleBusy)
+	primaryEndpoint, isRunning, closedRec := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, now, settleBusy, "")
 	s.mu.Unlock()
+	if closedRec != nil {
+		s.recordHistory(*closedRec)
+	}
 	s.notifyUI()
 
 	if isRunning {
 		s.fetchAndApplyTelemetry(acc, primaryEndpoint)
 	}
 	return true
+}
+
+func (s *Service) recordHistory(rec core.HistoryRecord) {
+	if s.History != nil {
+		s.History.AddRecord(rec)
+	}
+}
+
+func mapShutdownReason(reason string) core.ShutdownReason {
+	switch strings.TrimSpace(reason) {
+	case "空闲自动关机":
+		return core.ShutdownAutoIdle
+	case "全部关机止损":
+		return core.ShutdownBatchStop
+	default:
+		return core.ShutdownManual
+	}
+}
+
+func recipeLabelForSession(acc core.AccountProfile, downgraded bool) string {
+	if acc.DeployRecipe == core.RecipeH3Video {
+		if downgraded {
+			return core.H3VariantFlashGGUF.DisplayName() + "（自动降级）"
+		}
+		return acc.H3Variant.DisplayName()
+	}
+	return acc.DeployRecipe.DisplayName()
+}
+
+func buildClosedSessionRecordLocked(
+	acc core.AccountProfile,
+	rt *core.AccountRuntimeState,
+	prevEndpoint string,
+	prevHardware string,
+	prevGPUName string,
+	prevUptime int,
+	usage *colab.UsageSnapshot,
+	reason core.ShutdownReason,
+	now time.Time,
+) core.HistoryRecord {
+	hw := core.NormalizeHardwareKey(prevHardware)
+	if hw == "" {
+		hw = core.NormalizeHardwareKey(prevGPUName)
+	}
+	if hw == "" {
+		hw = strings.TrimSpace(prevHardware)
+		if hw == "" {
+			hw = strings.TrimSpace(prevGPUName)
+		}
+	}
+	if !rt.SessionLastSampleAt.IsZero() && now.After(rt.SessionLastSampleAt) {
+		dt := now.Sub(rt.SessionLastSampleAt).Seconds()
+		rate := rt.SessionMeasuredSingleRate
+		if rate <= 0 {
+			rate = core.EstimatedHourlyCU(hw)
+		}
+		rt.SessionEstimatedCU += rate * dt / 3600.0
+	}
+
+	startedAt := rt.SessionStartedAt
+	if startedAt.IsZero() {
+		startedAt = now.Add(-time.Duration(max(0, prevUptime)) * time.Second)
+	}
+	durSec := int(now.Sub(startedAt).Seconds())
+	if prevUptime > durSec {
+		durSec = prevUptime
+	}
+	if durSec < 0 {
+		durSec = 0
+	}
+
+	if reason == "" {
+		if durSec >= acc.Tier.MaxSessionHours()*3600-300 {
+			reason = core.ShutdownCapReached
+		} else {
+			reason = core.ShutdownExternalOrLost
+		}
+	}
+
+	var basis core.BillingBasis
+	var consumed float64
+	if acc.Tier == core.TierFree {
+		basis = core.BillingFree
+		consumed = 0
+	} else {
+		est := rt.SessionEstimatedCU
+		if est <= 0 && durSec > 0 {
+			rate := rt.SessionMeasuredSingleRate
+			if rate <= 0 {
+				rate = core.EstimatedHourlyCU(hw)
+			}
+			est = rate * float64(durSec) / 3600.0
+		}
+		delta := 0.0
+		if usage != nil && rt.SessionStartBalanceValid {
+			delta = rt.SessionStartBalance - usage.Balance
+		}
+		if usage != nil &&
+			rt.SessionMaxAssignments <= 1 &&
+			!rt.SessionAdopted &&
+			rt.SessionStartBalanceValid &&
+			delta > 0 &&
+			(est <= 0.05 || (delta >= est*0.3 && delta <= est*2.5)) {
+			basis = core.BillingMeasured
+			consumed = delta
+		} else {
+			basis = core.BillingEstimated
+			consumed = est
+		}
+	}
+
+	endedAt := now
+	rec := core.HistoryRecord{
+		Kind:            core.HistoryKindSession,
+		AccountID:       acc.ID,
+		AccountName:     acc.DisplayName,
+		AccountColor:    acc.ColorTag,
+		SessionName:     acc.SessionName,
+		Endpoint:        prevEndpoint,
+		StartedAt:       startedAt,
+		EndedAt:         &endedAt,
+		DurationSec:     durSec,
+		Hardware:        hw,
+		HighMem:         core.EffectiveUseHighMem(acc) && !rt.SessionUsedStandardRAM,
+		RecipeLabel:     recipeLabelForSession(acc, rt.SessionModelDowngraded),
+		ConsumedCU:      consumed,
+		BillingBasis:    basis,
+		ShutdownReason:  reason,
+		FallbackUsed:    rt.SessionFallbackUsed,
+		ModelDowngraded: rt.SessionModelDowngraded,
+	}
+
+	rt.SessionStartedAt = time.Time{}
+	rt.SessionStartBalance = 0
+	rt.SessionStartBalanceValid = false
+	rt.SessionAdopted = false
+	rt.SessionMaxAssignments = 0
+	rt.SessionMeasuredSingleRate = 0
+	rt.SessionEstimatedCU = 0
+	rt.SessionLastSampleAt = time.Time{}
+	rt.SessionFallbackUsed = false
+	rt.SessionModelDowngraded = false
+	rt.SessionUsedStandardRAM = false
+	return rec
 }
 
 func (s *Service) applyServerSnapshotLocked(
@@ -1004,11 +1219,24 @@ func (s *Service) applyServerSnapshotLocked(
 	sessions []core.ColabSessionItem,
 	now time.Time,
 	settleBusy bool,
-) (primaryEndpoint string, isRunning bool) {
+	shutdownHint core.ShutdownReason,
+) (primaryEndpoint string, isRunning bool, closedRec *core.HistoryRecord) {
 	rt := s.Runtime[accountID]
 	if rt.ContextLimit == 0 {
 		rt = core.NewAccountRuntimeState()
 	}
+	// Do not let concurrent background refresh race with StopAccountSession verification
+	if rt.Phase.Kind == core.PhaseStopping && !settleBusy {
+		return rt.ActiveEndpoint, false, nil
+	}
+
+	prevEndpoint := rt.ActiveEndpoint
+	prevHardware := rt.ActiveHardware
+	prevGPUName := rt.GPUName
+	prevBalance := rt.CUBalance
+	prevBalanceValid := rt.LastUsageFetchAt != nil
+	prevUptime := rt.SessionUptimeSec
+
 	rt.LastError = ""
 	if usage != nil {
 		rt.CUBalance = usage.Balance
@@ -1027,10 +1255,59 @@ func (s *Service) applyServerSnapshotLocked(
 	}
 
 	if primary != nil {
-		if settleBusy || !rt.Phase.IsBusy() {
-			rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
-		}
-		if rt.ActiveEndpoint != primary.Endpoint {
+		if prevEndpoint == primary.Endpoint {
+			if usage != nil {
+				if usage.ActiveAssignments > rt.SessionMaxAssignments {
+					rt.SessionMaxAssignments = usage.ActiveAssignments
+				}
+				if usage.ActiveAssignments <= 1 && usage.RatePerHour > 0 {
+					rt.SessionMeasuredSingleRate = usage.RatePerHour
+				}
+				if !rt.SessionLastSampleAt.IsZero() && now.After(rt.SessionLastSampleAt) {
+					dt := now.Sub(rt.SessionLastSampleAt).Seconds()
+					rate := rt.SessionMeasuredSingleRate
+					if rate <= 0 {
+						rate = core.EstimatedHourlyCU(primary.Hardware)
+					}
+					rt.SessionEstimatedCU += rate * dt / 3600.0
+				}
+				rt.SessionLastSampleAt = now
+			}
+		} else {
+			if prevEndpoint != "" {
+				rec := buildClosedSessionRecordLocked(acc, &rt, prevEndpoint, prevHardware, prevGPUName, prevUptime, usage, core.ShutdownExternalOrLost, now)
+				closedRec = &rec
+			}
+			isFreshAlloc := rt.Phase.Kind == core.PhaseStarting || rt.Phase.Kind == core.PhaseQueuing
+			rt.SessionUptimeSec = 0
+			rt.IdleSeconds = 0
+			rt.WarnedForCurrentIdle = false
+			rt.SessionStartedAt = now
+			rt.SessionLastSampleAt = now
+			rt.SessionEstimatedCU = 0
+			rt.SessionAdopted = !isFreshAlloc
+			rt.SessionFallbackUsed = false
+			rt.SessionModelDowngraded = false
+			rt.SessionUsedStandardRAM = false
+			if isFreshAlloc && prevBalanceValid {
+				rt.SessionStartBalance = prevBalance
+				rt.SessionStartBalanceValid = true
+			} else {
+				rt.SessionStartBalance = 0
+				rt.SessionStartBalanceValid = false
+			}
+			if usage != nil {
+				rt.SessionMaxAssignments = usage.ActiveAssignments
+				if usage.ActiveAssignments <= 1 && usage.RatePerHour > 0 {
+					rt.SessionMeasuredSingleRate = usage.RatePerHour
+				} else {
+					rt.SessionMeasuredSingleRate = 0
+				}
+			} else {
+				rt.SessionMaxAssignments = 0
+				rt.SessionMeasuredSingleRate = 0
+			}
+
 			// Endpoint changed -> invalidate bound LLM URL & video deploy/auto-open state
 			rt.PublicURL = ""
 			rt.LLMURLBoundEndpoint = ""
@@ -1047,10 +1324,18 @@ func (s *Service) applyServerSnapshotLocked(
 			rt.SawQueueBusyThisRun = false
 			rt.AutoOpenedEndpoint = ""
 		}
+		if settleBusy || !rt.Phase.IsBusy() {
+			rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+		}
 		rt.ActiveEndpoint = primary.Endpoint
 		rt.ActiveHardware = primary.Hardware
 		s.Runtime[accountID] = rt
-		return primary.Endpoint, true
+		return primary.Endpoint, true, closedRec
+	}
+
+	if prevEndpoint != "" {
+		rec := buildClosedSessionRecordLocked(acc, &rt, prevEndpoint, prevHardware, prevGPUName, prevUptime, usage, shutdownHint, now)
+		closedRec = &rec
 	}
 
 	if settleBusy || (!rt.Phase.IsBusy() && !rt.Phase.IsQueuing()) {
@@ -1062,6 +1347,7 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.VRAMUsedMB = 0
 	rt.VRAMTotalMB = 0
 	rt.GPUUtilPercent = 0
+	rt.SessionUptimeSec = 0
 	rt.PublicURL = ""
 	rt.LLMURLBoundEndpoint = ""
 	rt.DisplayUIURL = ""
@@ -1079,10 +1365,11 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.QueueRunning = 0
 	rt.QueuePending = 0
 	rt.IdleSeconds = 0
+	rt.WarnedForCurrentIdle = false
 	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalUnknown}
 	rt.SignalSource = core.SignalSourceNone
 	s.Runtime[accountID] = rt
-	return "", false
+	return "", false, closedRec
 }
 
 func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoint string) {
@@ -1365,6 +1652,7 @@ func (s *Service) StartAccountSession(accountID string) {
 	rt.LastErrorTitle = ""
 	rt.LastErrorAction = ""
 	rt.LastErrorRaw = ""
+	rt.LastAllocHadShortage = false
 
 	if core.EffectiveAutoQueue(acc) {
 		if s.ActiveQueueAccountID != "" && s.ActiveQueueAccountID != accountID {
@@ -1374,15 +1662,23 @@ func (s *Service) StartAccountSession(accountID string) {
 		}
 		token := uuid.New().String()
 		ctx, cancel := context.WithCancel(context.Background())
+		targets := core.EffectiveQueueTargets(acc)
+		targetsSummary := core.QueueTargetsSummary(targets)
+		now := time.Now()
 		s.ActiveQueueAccountID = accountID
 		s.activeQueueToken = token
-		s.queueCancels[accountID] = queueHandle{token: token, cancel: cancel}
-		targets := core.EffectiveQueueTargets(acc)
+		s.queueCancels[accountID] = queueHandle{
+			token:          token,
+			cancel:         cancel,
+			startedAt:      now,
+			targetsSummary: targetsSummary,
+			rounds:         1,
+		}
 		rt.Phase = core.InstancePhase{
 			Kind:           core.PhaseQueuing,
 			QueueAttempt:   1,
 			QueueMax:       core.QueueMaxAttempts,
-			TargetsSummary: core.QueueTargetsSummary(targets),
+			TargetsSummary: targetsSummary,
 		}
 		s.Runtime[accountID] = rt
 		s.mu.Unlock()
@@ -1397,6 +1693,8 @@ func (s *Service) StartAccountSession(accountID string) {
 	s.notifyUI()
 
 	go func() {
+		startedAt := time.Now()
+		targetsSummary := core.QueueTargetsSummary(core.EffectiveQueueTargets(acc))
 		res := s.Engine.ProvisionSession(context.Background(), acc, nil, nil, nil, func(msg string) {
 			s.mu.Lock()
 			cur := s.Runtime[accountID]
@@ -1406,12 +1704,96 @@ func (s *Service) StartAccountSession(accountID string) {
 			s.notifyUI()
 		})
 		s.recordProbeInsights(res.ProbeRecords)
+		endedAt := time.Now()
+		durSec := max(0, int(endedAt.Sub(startedAt).Seconds()))
 		if res.Outcome.Kind == core.OutcomeAllocated {
-			s.handlePostAllocation(acc, res.Outcome.Hardware)
+			detail := "直连开机成功"
+			if res.UsedStandardRAM {
+				detail = "直连开机成功（高内存暂缺，已自动切标准内存）"
+			}
+			s.recordHistory(core.HistoryRecord{
+				Kind:           core.HistoryKindAllocation,
+				AccountID:      acc.ID,
+				AccountName:    acc.DisplayName,
+				AccountColor:   acc.ColorTag,
+				SessionName:    acc.SessionName,
+				StartedAt:      startedAt,
+				EndedAt:        &endedAt,
+				DurationSec:    durSec,
+				Hardware:       res.Outcome.Hardware,
+				HighMem:        core.EffectiveUseHighMem(acc) && !res.UsedStandardRAM,
+				RecipeLabel:    recipeLabelForSession(acc, false),
+				TargetsSummary: targetsSummary,
+				Rounds:         1,
+				AllocOutcome:   core.AllocTagSuccess,
+				Detail:         detail,
+			})
+			s.handlePostAllocation(acc, res.Outcome.Hardware, false, res.UsedStandardRAM)
 		} else {
+			tag := mapAllocOutcomeTag(res.Outcome)
+			s.recordHistory(core.HistoryRecord{
+				Kind:           core.HistoryKindAllocation,
+				AccountID:      acc.ID,
+				AccountName:    acc.DisplayName,
+				AccountColor:   acc.ColorTag,
+				SessionName:    acc.SessionName,
+				StartedAt:      startedAt,
+				EndedAt:        &endedAt,
+				DurationSec:    durSec,
+				Hardware:       res.Outcome.Hardware,
+				HighMem:        core.EffectiveUseHighMem(acc),
+				RecipeLabel:    recipeLabelForSession(acc, false),
+				TargetsSummary: targetsSummary,
+				Rounds:         1,
+				AllocOutcome:   tag,
+				Detail:         res.Outcome.Message,
+			})
 			s.handleProvisionFailure(acc, res.Outcome)
 		}
 	}()
+}
+
+func mapAllocOutcomeTag(outcome core.ProvisionOutcome) core.AllocationOutcomeTag {
+	if outcome.Code == "CANCELLED" {
+		return core.AllocTagCancelled
+	}
+	switch outcome.Kind {
+	case core.OutcomeAllocated:
+		return core.AllocTagSuccess
+	case core.OutcomeCapacity503, core.OutcomeBudgetExhausted:
+		return core.AllocTagShortage
+	case core.OutcomeRateLimited:
+		return core.AllocTagRateLimited
+	default:
+		return core.AllocTagError
+	}
+}
+
+func isHardwareFromOption(hardware string, opt core.AcceleratorOption) bool {
+	hwNorm := core.NormalizeHardwareKey(hardware)
+	hwRaw := strings.ToUpper(strings.TrimSpace(hardware))
+	for _, pt := range opt.ProbeTargets() {
+		ptNorm := core.NormalizeHardwareKey(pt.Display)
+		if hwNorm != "" && ptNorm != "" && hwNorm == ptNorm {
+			return true
+		}
+		if hwRaw != "" && (strings.EqualFold(hwRaw, pt.Display) || (pt.Value != "" && strings.EqualFold(hwRaw, pt.Value))) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFallbackAllocation(hardware string, attempt int, primaryTargets []core.AcceleratorOption, fbEnabled bool, fbAfter int, fbTarget core.AcceleratorOption) bool {
+	if !fbEnabled || attempt <= max(1, fbAfter) {
+		return false
+	}
+	for _, pt := range primaryTargets {
+		if pt == fbTarget || isHardwareFromOption(hardware, pt) {
+			return false
+		}
+	}
+	return isHardwareFromOption(hardware, fbTarget)
 }
 
 func (s *Service) isQueueTokenOwnerLocked(accountID, token string) bool {
@@ -1419,10 +1801,51 @@ func (s *Service) isQueueTokenOwnerLocked(accountID, token string) bool {
 	return ok && h.token == token
 }
 
+func (s *Service) markQueueAllocLoggedLocked(accountID, token string) bool {
+	h, ok := s.queueCancels[accountID]
+	if !ok || h.token != token || h.allocLogged {
+		return false
+	}
+	h.allocLogged = true
+	s.queueCancels[accountID] = h
+	return true
+}
+
 func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, token string) {
 	startedAt := time.Now()
 	deadline := startedAt.Add(core.QueueMaxTotalWait)
 	pruned := map[string]bool{}
+	roundsCompleted := 0
+	lastTargetsSummary := core.QueueTargetsSummary(core.EffectiveQueueTargets(acc))
+
+	logQueueOnce := func(hw string, usedFallback, usedStdRAM bool, tag core.AllocationOutcomeTag, detail string) {
+		s.mu.Lock()
+		canLog := s.markQueueAllocLoggedLocked(acc.ID, token)
+		s.mu.Unlock()
+		if !canLog {
+			return
+		}
+		endedAt := time.Now()
+		s.recordHistory(core.HistoryRecord{
+			Kind:            core.HistoryKindAllocation,
+			AccountID:       acc.ID,
+			AccountName:     acc.DisplayName,
+			AccountColor:    acc.ColorTag,
+			SessionName:     acc.SessionName,
+			StartedAt:       startedAt,
+			EndedAt:         &endedAt,
+			DurationSec:     max(0, int(endedAt.Sub(startedAt).Seconds())),
+			Hardware:        hw,
+			HighMem:         core.EffectiveUseHighMem(acc) && !usedStdRAM,
+			RecipeLabel:     recipeLabelForSession(acc, usedFallback && core.ShouldCrossModelDowngrade(acc, hw)),
+			FallbackUsed:    usedFallback,
+			ModelDowngraded: usedFallback && core.ShouldCrossModelDowngrade(acc, hw),
+			TargetsSummary:  lastTargetsSummary,
+			Rounds:          max(1, roundsCompleted),
+			AllocOutcome:    tag,
+			Detail:          detail,
+		})
+	}
 
 	defer func() {
 		s.mu.Lock()
@@ -1442,20 +1865,37 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 
 	for attempt := 1; attempt <= core.QueueMaxAttempts; attempt++ {
 		if ctx.Err() != nil {
+			logQueueOnce("", false, false, core.AllocTagCancelled, "排队已取消")
 			return
 		}
 		// Pre-flight check: verify session not already running on server
-		if _, sessions, err := s.Engine.FetchUsageAndSessions(ctx, acc); err == nil {
+		if preUsage, sessions, err := s.Engine.FetchUsageAndSessions(ctx, acc); err == nil {
 			for _, sess := range sessions {
 				if !sess.IsOrphan && sess.Name == acc.SessionName {
-					s.handlePostAllocation(acc, sess.Hardware)
+					logQueueOnce(sess.Hardware, false, false, core.AllocTagSuccess, "检测到目标会话已在线")
+					s.handlePostAllocation(acc, sess.Hardware, false, false)
 					return
 				}
 			}
+			if preUsage != nil {
+				s.mu.Lock()
+				if cur, ok := s.Runtime[acc.ID]; ok && !cur.Phase.IsRunning() {
+					now := time.Now()
+					cur.CUBalance = preUsage.Balance
+					cur.CURatePerHour = preUsage.RatePerHour
+					cur.ActiveAssignments = preUsage.ActiveAssignments
+					cur.LastUsageFetchAt = &now
+					s.Runtime[acc.ID] = cur
+				}
+				s.mu.Unlock()
+			}
 		}
 
+		primaryTargets := core.EffectiveQueueTargets(acc)
 		fbEnabled, fbAfter, fbTarget := core.EffectiveFallback(acc)
-		roundAccs := core.QueueTargetsForRound(attempt, core.EffectiveQueueTargets(acc), fbEnabled, fbAfter, fbTarget, acc.Tier)
+		roundAccs := core.QueueTargetsForRound(attempt, primaryTargets, fbEnabled, fbAfter, fbTarget, acc.Tier)
+		lastTargetsSummary = core.QueueTargetsSummary(roundAccs)
+		roundsCompleted = attempt
 		var probeTargets []core.ProbeTarget
 		for _, a := range roundAccs {
 			for _, pt := range a.ProbeTargets() {
@@ -1469,11 +1909,13 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 			owned := s.isQueueTokenOwnerLocked(acc.ID, token)
 			s.mu.RUnlock()
 			if owned {
-				s.handleProvisionFailure(acc, core.ProvisionOutcome{
+				outcome := core.ProvisionOutcome{
 					Kind:    core.OutcomeUnsupportedTier400,
 					Code:    "NO_SUPPORTED_TARGET",
 					Message: "当前顺位里的显卡均暂无配额，可切换到「省点模式 (L4)」或「智能挑卡」再试",
-				})
+				}
+				logQueueOnce("", false, false, core.AllocTagError, outcome.Message)
+				s.handleProvisionFailure(acc, outcome)
 			}
 			return
 		}
@@ -1483,13 +1925,17 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 			s.mu.Unlock()
 			return
 		}
+		h := s.queueCancels[acc.ID]
+		h.rounds = attempt
+		h.targetsSummary = lastTargetsSummary
+		s.queueCancels[acc.ID] = h
 		cur := s.Runtime[acc.ID]
 		cur.QueueInFlight = true
 		cur.Phase = core.InstancePhase{
 			Kind:           core.PhaseQueuing,
 			QueueAttempt:   attempt,
 			QueueMax:       core.QueueMaxAttempts,
-			TargetsSummary: core.QueueTargetsSummary(roundAccs),
+			TargetsSummary: lastTargetsSummary,
 		}
 		s.Runtime[acc.ID] = cur
 		s.mu.Unlock()
@@ -1523,20 +1969,33 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		}
 
 		if res.Outcome.Kind == core.OutcomeAllocated {
-			s.handlePostAllocation(acc, res.Outcome.Hardware)
+			usedFallback := isFallbackAllocation(res.Outcome.Hardware, attempt, primaryTargets, fbEnabled, fbAfter, fbTarget)
+			detail := fmt.Sprintf("第 %d 轮抢到 %s", attempt, res.Outcome.Hardware)
+			if usedFallback {
+				detail += "（保底显卡）"
+			}
+			if res.UsedStandardRAM {
+				detail += "（标准内存）"
+			}
+			logQueueOnce(res.Outcome.Hardware, usedFallback, res.UsedStandardRAM, core.AllocTagSuccess, detail)
+			s.handlePostAllocation(acc, res.Outcome.Hardware, usedFallback, res.UsedStandardRAM)
 			return
 		}
 		if !owned || ctx.Err() != nil {
+			logQueueOnce("", false, false, core.AllocTagCancelled, "排队已取消")
 			return
 		}
 		if res.Outcome.Kind != core.OutcomeCapacity503 {
+			logQueueOnce(res.Outcome.Hardware, false, false, mapAllocOutcomeTag(res.Outcome), res.Outcome.Message)
 			s.handleProvisionFailure(acc, res.Outcome)
 			return
 		}
 
 		delay, ok := core.NextQueueDelay(attempt, startedAt, time.Now(), rand.Float64())
 		if !ok {
-			s.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomeBudgetExhausted, Message: "已达 5 轮 / 40 分钟合规排队上限，暂未拿到目标卡"})
+			outcome := core.ProvisionOutcome{Kind: core.OutcomeBudgetExhausted, Message: "已达 5 轮 / 40 分钟合规排队上限，暂未拿到目标卡"}
+			logQueueOnce("", false, false, core.AllocTagShortage, outcome.Message)
+			s.handleProvisionFailure(acc, outcome)
 			return
 		}
 		nextAt := time.Now().Add(delay)
@@ -1551,7 +2010,7 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 			QueueAttempt:   attempt,
 			QueueMax:       core.QueueMaxAttempts,
 			NextRetryAt:    &nextAt,
-			TargetsSummary: core.QueueTargetsSummary(roundAccs),
+			TargetsSummary: lastTargetsSummary,
 		}
 		s.Runtime[acc.ID] = c
 		s.mu.Unlock()
@@ -1560,6 +2019,7 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
+			logQueueOnce("", false, false, core.AllocTagCancelled, "排队已取消")
 			return
 		}
 	}
@@ -1567,8 +2027,44 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 
 func (s *Service) CancelQueue(accountID string) {
 	s.mu.Lock()
-	h := s.queueCancels[accountID]
+	h, hasHandle := s.queueCancels[accountID]
 	inFlight := s.Runtime[accountID].QueueInFlight
+	var cancelRec *core.HistoryRecord
+	if hasHandle && !h.allocLogged {
+		h.allocLogged = true
+		var acc core.AccountProfile
+		for _, a := range s.Settings.Accounts {
+			if a.ID == accountID {
+				acc = a
+				break
+			}
+		}
+		endedAt := time.Now()
+		startedAt := h.startedAt
+		if startedAt.IsZero() {
+			startedAt = endedAt
+		}
+		targetsSummary := h.targetsSummary
+		if targetsSummary == "" && acc.ID != "" {
+			targetsSummary = core.QueueTargetsSummary(core.EffectiveQueueTargets(acc))
+		}
+		cancelRec = &core.HistoryRecord{
+			Kind:           core.HistoryKindAllocation,
+			AccountID:      accountID,
+			AccountName:    acc.DisplayName,
+			AccountColor:   acc.ColorTag,
+			SessionName:    acc.SessionName,
+			StartedAt:      startedAt,
+			EndedAt:        &endedAt,
+			DurationSec:    max(0, int(endedAt.Sub(startedAt).Seconds())),
+			HighMem:        core.EffectiveUseHighMem(acc),
+			RecipeLabel:    recipeLabelForSession(acc, false),
+			TargetsSummary: targetsSummary,
+			Rounds:         max(1, h.rounds),
+			AllocOutcome:   core.AllocTagCancelled,
+			Detail:         "用户手动取消排队",
+		}
+	}
 	delete(s.queueCancels, accountID)
 	if s.ActiveQueueAccountID == accountID {
 		s.ActiveQueueAccountID = ""
@@ -1582,6 +2078,9 @@ func (s *Service) CancelQueue(accountID string) {
 	}
 	s.mu.Unlock()
 
+	if cancelRec != nil {
+		s.recordHistory(*cancelRec)
+	}
 	if h.cancel != nil {
 		h.cancel()
 	}
@@ -1646,6 +2145,7 @@ func (s *Service) handleProvisionFailure(acc core.AccountProfile, outcome core.P
 	rt.LastErrorTitle = title
 	rt.LastErrorAction = action
 	rt.LastErrorRaw = outcome.RawDetail
+	rt.LastAllocHadShortage = outcome.Kind == core.OutcomeCapacity503 || outcome.Kind == core.OutcomeBudgetExhausted
 	// ONLY genuine rate-limit / abuse warnings trigger the 15-minute cooldown lock.
 	if outcome.Kind == core.OutcomeRateLimited {
 		until := time.Now().Add(core.QueueCircuitBreakerCooldown)
@@ -1682,6 +2182,7 @@ func (s *Service) ClearCooldown(accountID string) {
 	rt.LastErrorTitle = ""
 	rt.LastErrorAction = ""
 	rt.LastErrorRaw = ""
+	rt.LastAllocHadShortage = false
 	s.Runtime[accountID] = rt
 	if s.Settings.QueueCooldownsByAccount != nil {
 		delete(s.Settings.QueueCooldownsByAccount, accountID)
@@ -1700,6 +2201,7 @@ func (s *Service) ClearAccountError(accountID string) {
 	rt.LastErrorTitle = ""
 	rt.LastErrorAction = ""
 	rt.LastErrorRaw = ""
+	rt.LastAllocHadShortage = false
 	s.Runtime[accountID] = rt
 	s.mu.Unlock()
 	s.notifyUI()
@@ -1722,27 +2224,38 @@ func (s *Service) ResetAccountToRecommendedDefaults(accountID string) {
 	s.ShowToast("已恢复小白推荐默认配置（H3 Flash 极速版 · 智能挑卡 · 自动存片关机）")
 }
 
-func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string) {
+func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string, usedFallback, usedStandardRAM bool) {
 	estRate := core.EstimatedHourlyCU(hardware)
 	hwTitle := strings.TrimSpace(hardware)
 	if hwTitle == "" {
 		hwTitle = "云端显卡"
 	}
+	downgraded := core.ShouldCrossModelDowngrade(acc, hardware)
 	willAutoDeploy := acc.DeployRecipe.IsVideoComfy() ||
 		acc.EnableLLMModule ||
 		(acc.WorkloadKind != core.WorkloadGeneral && strings.TrimSpace(acc.DriveScriptPath) != "")
+	notifyTitle := fmt.Sprintf("抢到 %s 了！", hwTitle)
 	notifyBody := fmt.Sprintf("%s 已开机就绪（约 %.2f CU/h），可以开始使用", acc.DisplayName, estRate)
 	if willAutoDeploy {
 		notifyBody = fmt.Sprintf("%s 已开机（约 %.2f CU/h），正在自动装好环境，完成后会自动打开", acc.DisplayName, estRate)
 	}
-	s.SendNotification(fmt.Sprintf("抢到 %s 了！", hwTitle), notifyBody, true)
+	if downgraded {
+		notifyTitle = fmt.Sprintf("抢到保底 %s（已自动切轻量 GGUF）", hwTitle)
+		notifyBody = fmt.Sprintf("%s 已开机（约 %.2f CU/h），已自动切轻量 GGUF 部署，完成后会自动打开", acc.DisplayName, estRate)
+	} else if usedFallback {
+		notifyBody += "（保底显卡）"
+	}
+	s.SendNotification(notifyTitle, notifyBody, true)
 	// Always settle transitional PhaseStarting / PhaseQueuing via authoritative server fetch
 	if !s.refreshAccount(acc.ID, true, true, true) {
 		usage, sessions, err := s.Engine.FetchUsageAndSessions(context.Background(), acc)
 		if err == nil {
 			s.mu.Lock()
-			ep, running := s.applyServerSnapshotLocked(acc.ID, acc, usage, sessions, time.Now(), true)
+			ep, running, closedRec := s.applyServerSnapshotLocked(acc.ID, acc, usage, sessions, time.Now(), true, "")
 			s.mu.Unlock()
+			if closedRec != nil {
+				s.recordHistory(*closedRec)
+			}
 			s.notifyUI()
 			if running {
 				s.fetchAndApplyTelemetry(acc, ep)
@@ -1750,7 +2263,7 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string)
 		} else {
 			s.mu.Lock()
 			rt := s.Runtime[acc.ID]
-			if rt.Phase.Kind == core.PhaseStarting {
+			if rt.Phase.Kind == core.PhaseStarting || rt.Phase.Kind == core.PhaseQueuing {
 				rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
 				rt.ActiveHardware = hardware
 				s.Runtime[acc.ID] = rt
@@ -1760,8 +2273,25 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string)
 		}
 	}
 
+	s.mu.Lock()
+	if cur, ok := s.Runtime[acc.ID]; ok {
+		cur.LastAllocHadShortage = false
+		if cur.Phase.IsRunning() {
+			cur.SessionFallbackUsed = usedFallback
+			cur.SessionModelDowngraded = downgraded
+			cur.SessionUsedStandardRAM = usedStandardRAM
+		}
+		s.Runtime[acc.ID] = cur
+	}
+	s.mu.Unlock()
+	s.notifyUI()
+
 	if acc.DeployRecipe.IsVideoComfy() {
-		s.launchVideoDeployFlow(acc)
+		deployAcc := acc
+		if downgraded {
+			deployAcc.H3Variant = core.H3VariantFlashGGUF
+		}
+		s.launchVideoDeployFlow(deployAcc)
 		return
 	}
 
@@ -2087,9 +2617,16 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 		return
 	}
 
+	shutdownHint := core.ShutdownReason("")
+	if targetSession == acc.SessionName {
+		shutdownHint = mapShutdownReason(reason)
+	}
 	s.mu.Lock()
-	ep, isRunning := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, time.Now(), true)
+	ep, isRunning, closedRec := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, time.Now(), true, shutdownHint)
 	s.mu.Unlock()
+	if closedRec != nil {
+		s.recordHistory(*closedRec)
+	}
 	s.notifyUI()
 	if isRunning {
 		go s.fetchAndApplyTelemetry(acc, ep)

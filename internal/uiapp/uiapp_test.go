@@ -159,6 +159,98 @@ func makeDemoService(section app.MainSection, onboarding, idleHome bool) *app.Se
 		svc.Insights.Record("G4", i < 3, time.Date(2026, 11, 25, 10, 0, 0, 0, time.Local))
 		svc.Insights.Record("G4", i < 2, time.Date(2026, 11, 25, 21, 0, 0, 0, time.Local))
 	}
+
+	if svc.History != nil {
+		e1 := now.Add(-2 * time.Hour)
+		s1 := e1.Add(-96 * time.Minute)
+		svc.History.AddRecord(core.HistoryRecord{
+			Kind:           core.HistoryKindSession,
+			AccountID:      acc1.ID,
+			AccountName:    acc1.DisplayName,
+			AccountColor:   acc1.ColorTag,
+			SessionName:    acc1.SessionName,
+			StartedAt:      s1,
+			EndedAt:        &e1,
+			DurationSec:    96 * 60,
+			Hardware:       "NVIDIA A100-SXM4-80GB",
+			HighMem:        true,
+			RecipeLabel:    "H3 Flash 极速版",
+			ConsumedCU:     14.2,
+			BillingBasis:   core.BillingMeasured,
+			ShutdownReason: core.ShutdownAutoIdle,
+			Detail:         "队列清空且持续空闲后自动关机止损",
+		})
+
+		e2 := now.Add(-10 * time.Hour)
+		s2 := e2.Add(-110 * time.Minute)
+		svc.History.AddRecord(core.HistoryRecord{
+			Kind:           core.HistoryKindSession,
+			AccountID:      acc1.ID,
+			AccountName:    acc1.DisplayName,
+			AccountColor:   acc1.ColorTag,
+			SessionName:    acc1.SessionName,
+			StartedAt:      s2,
+			EndedAt:        &e2,
+			DurationSec:    110 * 60,
+			Hardware:       "NVIDIA RTX PRO 6000 (G4)",
+			HighMem:        true,
+			RecipeLabel:    "H3 原版 (31B)",
+			ConsumedCU:     21.6,
+			BillingBasis:   core.BillingEstimated,
+			ShutdownReason: core.ShutdownManual,
+			Detail:         "手动停止会话释放算力",
+		})
+
+		e3 := now.Add(-26 * time.Hour)
+		s3 := e3.Add(-118 * time.Minute)
+		svc.History.AddRecord(core.HistoryRecord{
+			Kind:            core.HistoryKindSession,
+			AccountID:       acc1.ID,
+			AccountName:     acc1.DisplayName,
+			AccountColor:    acc1.ColorTag,
+			SessionName:     acc1.SessionName,
+			StartedAt:       s3,
+			EndedAt:         &e3,
+			DurationSec:     118 * 60,
+			Hardware:        "NVIDIA L4",
+			RecipeLabel:     "H3 原版 → 轻量 GGUF",
+			ConsumedCU:      4.6,
+			BillingBasis:    core.BillingMeasured,
+			ShutdownReason:  core.ShutdownAutoIdle,
+			FallbackUsed:    true,
+			ModelDowngraded: true,
+			Detail:          "大卡 2 轮无货，L4 保底并自动切换轻量",
+		})
+
+		svc.History.AddRecord(core.HistoryRecord{
+			Kind:           core.HistoryKindAllocation,
+			AccountID:      acc1.ID,
+			AccountName:    acc1.DisplayName,
+			AccountColor:   acc1.ColorTag,
+			SessionName:    acc1.SessionName,
+			StartedAt:      now.Add(-30 * time.Hour),
+			DurationSec:    35 * 60,
+			TargetsSummary: "G4 → A100",
+			Rounds:         5,
+			AllocOutcome:   core.AllocTagShortage,
+			Detail:         "G4 / A100 暂无库存 (503)，已停止排队",
+		})
+
+		svc.History.AddRecord(core.HistoryRecord{
+			Kind:           core.HistoryKindAllocation,
+			AccountID:      acc2.ID,
+			AccountName:    acc2.DisplayName,
+			AccountColor:   acc2.ColorTag,
+			SessionName:    acc2.SessionName,
+			StartedAt:      now.Add(-36 * time.Hour),
+			DurationSec:    185,
+			Hardware:       "NVIDIA L4",
+			TargetsSummary: "L4 → T4",
+			Rounds:         2,
+			AllocOutcome:   core.AllocTagSuccess,
+			Detail:         "第 2 轮成功分配 NVIDIA L4",
+		})
+	}
 	return svc
 }
 
@@ -235,17 +327,48 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if acc, _ := idleSvc.SelectedAccount(); acc.GPUStrategy != core.GPUStrategyAutoSmart {
 		t.Fatalf("expected AutoSmart GPU strategy, got %q", acc.GPUStrategy)
 	}
+	if !idleTester.HasText("大卡 2 轮无货时，允许保底开 L4 并自动切轻量 GGUF") {
+		t.Fatalf("missing 31B cross-model fallback toggle in auto_smart options: %q", idleTester.Texts())
+	}
+	if err := idleTester.Click("大卡 2 轮无货时，允许保底开 L4 并自动切轻量 GGUF"); err != nil {
+		t.Fatalf("click 31B cross-model fallback toggle failed: %v", err)
+	}
+	if acc, _ := idleSvc.SelectedAccount(); !acc.AllowCrossModelFallback {
+		t.Fatalf("expected AllowCrossModelFallback enabled after click")
+	}
 	if err := idleTester.Click("完成"); err != nil {
 		t.Fatalf("click 完成 failed: %v", err)
 	}
+	if !idleTester.HasText("2轮保底 L4") {
+		t.Fatalf("expected 2轮保底 L4 badge on Bento strategy card: %q", idleTester.Texts())
+	}
 
-	// 2. Running Live Bento Console + 3-tab navigation (主页 / 账号 / 设置)
+	// 1b. 31B shortage error banner offers one-click "改用 L4 轻量版" and "预约 07:00 抢卡"
+	shortSvc := makeDemoService(app.SectionHome, false, true)
+	shortAccID := shortSvc.Settings.SelectedAccountID
+	shortAcc := shortSvc.Settings.Accounts[0]
+	shortAcc.DeployRecipe = core.RecipeH3Video
+	shortAcc.H3Variant = core.H3VariantOriginal
+	shortSvc.Settings.Accounts[0] = shortAcc
+	shortRT := shortSvc.Runtime[shortAccID]
+	shortRT.LastErrorTitle = "大卡暂时无货"
+	shortRT.LastError = "A100/G4 当前暂无库存 (503)"
+	shortRT.LastAllocHadShortage = true
+	shortSvc.Runtime[shortAccID] = shortRT
+	shortUI := uiapp.NewMainUI(shortSvc)
+	shortUI.ForceTheme = "dark"
+	shortTester := ui.NewTester(shortUI.View, 1160, 760)
+	if !shortTester.HasText("改用 L4 轻量版") || !shortTester.HasText("预约 07:00 抢卡") {
+		t.Fatalf("missing 31B shortage fallback recovery actions: %q", shortTester.Texts())
+	}
+
+	// 2. Running Live Bento Console + 4-tab navigation (主页 / 记录 / 账号 / 设置)
 	svc := makeDemoService(app.SectionHome, false, false)
 	mui := uiapp.NewMainUI(svc)
 	mui.ForceTheme = "dark"
 	tt := ui.NewTester(mui.View, 1160, 760)
 
-	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → A100 → L4") || !tt.HasText("开 ComfyUI") {
+	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → A100") || !tt.HasText("2轮保底 L4") || !tt.HasText("开 ComfyUI") {
 		t.Fatalf("missing primary live dashboard text: %q", tt.Texts())
 	}
 	if err := tt.Click("40m"); err != nil {
@@ -253,6 +376,19 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	}
 	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 40 || acc.QueueDrainMinutes != 40 {
 		t.Fatalf("expected 40m after click, got idle=%d drain=%d", acc.IdleTimeoutMinutes, acc.QueueDrainMinutes)
+	}
+	if err := tt.Click("记录"); err != nil {
+		t.Fatalf("click tab 记录 failed: %v", err)
+	}
+	for _, want := range []string{"累计消耗 CU", "看门狗止损", "算力账单", "抢卡记录", "导出 CSV"} {
+		if !tt.HasText(want) {
+			t.Fatalf("missing %q on history tab: %q", want, tt.Texts())
+		}
+	}
+	for _, filterBtn := range []string{"算力账单", "抢卡记录", "近 30 天", "近 7 天", "全部"} {
+		if err := tt.Click(filterBtn); err != nil {
+			t.Fatalf("click history filter %q failed: %v", filterBtn, err)
+		}
 	}
 	for _, tab := range []string{"账号", "设置", "主页"} {
 		if err := tt.Click(tab); err != nil {
@@ -273,7 +409,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	pop := uiapp.NewPopoverUI(svc)
 	pop.ForceTheme = "dark"
 	popTester := ui.NewTester(pop.View, 420, 620)
-	if !popTester.HasText("Colab Tools") || !popTester.HasText("2374.8") {
+	if !popTester.HasText("Colab Tools") || !popTester.HasText("2374.8") || !popTester.HasText("记录") {
 		t.Fatalf("missing popover elements: %q", popTester.Texts())
 	}
 
@@ -377,6 +513,13 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	obUI.ForceTheme = "dark"
 	renderPNG(t, obUI.View, 1160, 720, filepath.Join(outDir, "preview-onboarding.png"))
 
+	// 5b. History & Consumption Ledger tab (dark 1160x760)
+	histSvc := makeDemoService(app.SectionHistory, false, false)
+	histUI := uiapp.NewMainUI(histSvc)
+	histUI.PreviewMode = true
+	histUI.ForceTheme = "dark"
+	renderPNG(t, histUI.View, 1160, 760, filepath.Join(outDir, "preview-history.png"))
+
 	// 6. Popover single + multi-account
 	singleSvc := makeDemoService(app.SectionHome, false, false)
 	singleSvc.Settings.Accounts = singleSvc.Settings.Accounts[:1]
@@ -400,6 +543,26 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		setLight.PreviewMode = true
 		setLight.ForceTheme = "light"
 		renderPNG(t, setLight.View, 1160, 760, filepath.Join(qaDir, "qa-settings-light.png"))
+
+		histLight := uiapp.NewMainUI(makeDemoService(app.SectionHistory, false, false))
+		histLight.PreviewMode = true
+		histLight.ForceTheme = "light"
+		renderPNG(t, histLight.View, 1160, 760, filepath.Join(qaDir, "qa-history-light.png"))
+
+		shortSvc := makeDemoService(app.SectionHome, false, true)
+		sAcc := shortSvc.Settings.Accounts[0]
+		sAcc.DeployRecipe = core.RecipeH3Video
+		sAcc.H3Variant = core.H3VariantOriginal
+		shortSvc.Settings.Accounts[0] = sAcc
+		sRT := shortSvc.Runtime[sAcc.ID]
+		sRT.LastErrorTitle = "大卡暂时无货"
+		sRT.LastError = "G4 / A100 当前暂无库存 (503)，已停止排队"
+		sRT.LastAllocHadShortage = true
+		shortSvc.Runtime[sAcc.ID] = sRT
+		shortUI := uiapp.NewMainUI(shortSvc)
+		shortUI.PreviewMode = true
+		shortUI.ForceTheme = "dark"
+		renderPNG(t, shortUI.View, 1160, 760, filepath.Join(qaDir, "qa-shortage-fallback-dark.png"))
 
 		bareSvc := makeDemoService(app.SectionHome, false, false)
 		bAcc := bareSvc.Settings.Accounts[0]

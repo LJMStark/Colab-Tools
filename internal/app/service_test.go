@@ -2,6 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -13,10 +18,11 @@ import (
 )
 
 type fakeRunner struct {
-	mu       sync.Mutex
-	onShell  func(cmd string) runner.Result
-	onRun    func(name string, args []string) runner.Result
-	commands []string
+	mu          sync.Mutex
+	onShell     func(cmd string) runner.Result
+	onShellOpts func(cmd string, opts runner.RunOptions) runner.Result
+	onRun       func(name string, args []string) runner.Result
+	commands    []string
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args []string, _ runner.RunOptions) runner.Result {
@@ -30,11 +36,15 @@ func (f *fakeRunner) Run(_ context.Context, name string, args []string, _ runner
 	return runner.Result{ExitCode: 0}
 }
 
-func (f *fakeRunner) RunShell(_ context.Context, shellCmd string, _ runner.RunOptions) runner.Result {
+func (f *fakeRunner) RunShell(_ context.Context, shellCmd string, opts runner.RunOptions) runner.Result {
 	f.mu.Lock()
 	f.commands = append(f.commands, shellCmd)
+	fnOpts := f.onShellOpts
 	fn := f.onShell
 	f.mu.Unlock()
+	if fnOpts != nil {
+		return fnOpts(shellCmd, opts)
+	}
 	if fn != nil {
 		return fn(shellCmd)
 	}
@@ -87,7 +97,7 @@ func TestPhaseSettlementPostAllocAndStopVerification(t *testing.T) {
 	svc.Engine = colab.NewEngine(fr, svc.Vault)
 
 	// 1. handlePostAllocation must settle PhaseStarting -> PhaseRunning
-	svc.handlePostAllocation(acc, "L4")
+	svc.handlePostAllocation(acc, "L4", false, false)
 	got := svc.StateFor(acc.ID)
 	if !got.Phase.IsRunning() || got.ActiveEndpoint != "m-s-abc123" {
 		t.Fatalf("expected PhaseStarting to settle into PhaseRunning, got phase=%+v ep=%q", got.Phase, got.ActiveEndpoint)
@@ -421,7 +431,7 @@ func TestFailureNotificationsTestNotificationAndTrayLiveStatus(t *testing.T) {
 	mu.Lock()
 	notices = nil
 	mu.Unlock()
-	svc.handlePostAllocation(pureAcc, "L4")
+	svc.handlePostAllocation(pureAcc, "L4", false, false)
 	mu.Lock()
 	if len(notices) != 1 || notices[0].title != "抢到 L4 了！" || !strings.Contains(notices[0].body, "已开机就绪") {
 		t.Fatalf("unexpected pure-boot post-alloc notice: %+v", notices)
@@ -523,4 +533,310 @@ func TestDeployTruthfulnessAndOpenComfyUIGuards(t *testing.T) {
 	if !strings.Contains(svc.ToastMessage, "部署中断") {
 		t.Fatalf("expected deploy-failed OpenComfyUI hint, got %q", svc.ToastMessage)
 	}
+}
+
+func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
+	svc := NewService(true)
+	svc.NotifySender = func(_, _ string) {}
+	acc := core.NewDefaultAccountProfile("LedgerUser", "ledger@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeNone
+	acc.WorkloadKind = core.WorkloadGeneral
+	acc.EnableLLMModule = false
+	acc.DriveScriptPath = ""
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
+
+	// 1. Pre-boot usage refresh gives valid baseline balance (100.00 CU)
+	t0 := time.Now().Add(-2 * time.Hour)
+	svc.mu.Lock()
+	_, _, rec0 := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+		Balance: 100.0, RatePerHour: 0, ActiveAssignments: 0,
+	}, nil, t0, false, "")
+	svc.mu.Unlock()
+	if rec0 != nil {
+		t.Fatalf("offline initial snapshot must not emit closed record, got %+v", rec0)
+	}
+
+	// 2. Boot transition (PhaseStarting -> PhaseRunning) opens session ledger, clears uptime/idle
+	svc.mu.Lock()
+	rt := svc.Runtime[acc.ID]
+	rt.Phase = core.InstancePhase{Kind: core.PhaseStarting}
+	rt.SessionUptimeSec = 999
+	rt.IdleSeconds = 123
+	svc.Runtime[acc.ID] = rt
+	tBoot := t0.Add(2 * time.Minute)
+	_, running, rec1 := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+		Balance: 100.0, RatePerHour: 2.33, ActiveAssignments: 1,
+	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-1", Hardware: "L4"}}, tBoot, true, "")
+	svc.mu.Unlock()
+	if !running || rec1 != nil {
+		t.Fatalf("expected running without closed record, running=%v rec=%+v", running, rec1)
+	}
+	gotRT := svc.StateFor(acc.ID)
+	if gotRT.SessionUptimeSec != 0 || gotRT.IdleSeconds != 0 || !gotRT.SessionStartBalanceValid || gotRT.SessionStartBalance != 100.0 || gotRT.SessionAdopted {
+		t.Fatalf("unexpected opened ledger state: %+v", gotRT)
+	}
+
+	// 3. Mid-run sample 30m later accumulates estimated CU
+	tMid := tBoot.Add(30 * time.Minute)
+	svc.mu.Lock()
+	_, _, _ = svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+		Balance: 98.83, RatePerHour: 2.33, ActiveAssignments: 1,
+	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-1", Hardware: "L4"}}, tMid, false, "")
+	svc.mu.Unlock()
+
+	// 4. StopAccountSession (auto_idle) settles measured CU and prevents duplicate closed record
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 97.67 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		}
+		if strings.Contains(cmd, "sessions") {
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+	svc.StopAccountSession(acc.ID, "", "空闲自动关机")
+
+	recs, summary := svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindSession})
+	if len(recs) != 1 {
+		t.Fatalf("expected exactly 1 closed session record, got %d: %+v", len(recs), recs)
+	}
+	if recs[0].ShutdownReason != core.ShutdownAutoIdle || recs[0].BillingBasis != core.BillingMeasured {
+		t.Fatalf("expected auto_idle + measured billing, got reason=%v basis=%v", recs[0].ShutdownReason, recs[0].BillingBasis)
+	}
+	if recs[0].ConsumedCU < 2.32 || recs[0].ConsumedCU > 2.34 {
+		t.Fatalf("expected measured delta ~2.33 CU, got %.4f", recs[0].ConsumedCU)
+	}
+	if summary.WatchdogStops != 1 || summary.MeasuredSessions != 1 || summary.TopHardware != "L4" {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	if rtAfter := svc.StateFor(acc.ID); rtAfter.SessionUptimeSec != 0 || rtAfter.ActiveEndpoint != "" {
+		t.Fatalf("expected cleared uptime & endpoint after stop, got %+v", rtAfter)
+	}
+
+	// Second offline poll must NOT duplicate the closed session record
+	svc.mu.Lock()
+	_, _, recDup := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+		Balance: 97.67, RatePerHour: 0, ActiveAssignments: 0,
+	}, nil, time.Now(), false, "")
+	svc.mu.Unlock()
+	if recDup != nil {
+		t.Fatalf("expected no duplicate session record on subsequent offline poll, got %+v", recDup)
+	}
+
+	// 5. Concurrent multi-assignment session falls back to BillingEstimated & external drop near 24h logs ShutdownCapReached
+	svc.mu.Lock()
+	rt2 := svc.Runtime[acc.ID]
+	rt2.Phase = core.InstancePhase{Kind: core.PhaseStarting}
+	svc.Runtime[acc.ID] = rt2
+	t2Start := time.Now().Add(-24 * time.Hour)
+	_, _, _ = svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+		Balance: 97.67, RatePerHour: 7.0, ActiveAssignments: 2,
+	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-2", Hardware: "G4"}}, t2Start, true, "")
+	rt2 = svc.Runtime[acc.ID]
+	rt2.SessionUptimeSec = 24*3600 - 100
+	svc.Runtime[acc.ID] = rt2
+	_, _, recCap := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+		Balance: 50.0, RatePerHour: 0, ActiveAssignments: 0,
+	}, nil, time.Now(), false, "")
+	svc.mu.Unlock()
+	if recCap == nil || recCap.BillingBasis != core.BillingEstimated || recCap.ShutdownReason != core.ShutdownCapReached {
+		t.Fatalf("expected estimated billing + cap_reached on multi-assignment 24h disconnect, got %+v", recCap)
+	}
+
+	// 6. Allocation records: direct shortage sets LastAllocHadShortage, CancelQueue logs cancelled once
+	accDirect := acc
+	accDirect.GPUStrategy = core.GPUStrategyCustom
+	accDirect.EnablePoliteQueue = false
+	accDirect.QueueTargets = []core.AcceleratorOption{core.AccG4}
+	svc.UpdateAccount(accDirect)
+
+	frShortage := &fakeRunner{}
+	frShortage.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "--gpu") {
+			return runner.Result{ExitCode: 1, Stderr: "503 Service Unavailable"}
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	svc.Engine = colab.NewEngine(frShortage, svc.Vault)
+	svc.StartAccountSession(acc.ID)
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		allocs, _ := svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
+		if len(allocs) >= 1 && svc.StateFor(acc.ID).Phase.Kind == core.PhaseOffline {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	allocs, _ := svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
+	if len(allocs) != 1 || allocs[0].AllocOutcome != core.AllocTagShortage {
+		t.Fatalf("expected 1 shortage allocation record, got %+v", allocs)
+	}
+	if !svc.StateFor(acc.ID).LastAllocHadShortage {
+		t.Fatalf("expected LastAllocHadShortage=true after 503 failure")
+	}
+
+	// Queue + CancelQueue logs exactly 1 AllocTagCancelled
+	accQueue := acc
+	accQueue.GPUStrategy = core.GPUStrategyAutoSmart
+	svc.UpdateAccount(accQueue)
+	frBlock := &fakeRunner{}
+	blockCh := make(chan struct{})
+	frBlock.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "--gpu") {
+			<-blockCh
+			return runner.Result{ExitCode: 1, Stderr: "503 Service Unavailable"}
+		}
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 50.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		}
+		return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+	}
+	svc.Engine = colab.NewEngine(frBlock, svc.Vault)
+	svc.StartAccountSession(acc.ID)
+	time.Sleep(50 * time.Millisecond)
+	svc.CancelQueue(acc.ID)
+	close(blockCh)
+	time.Sleep(80 * time.Millisecond)
+
+	allocs, _ = svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
+	cancelCount := 0
+	for _, r := range allocs {
+		if r.AllocOutcome == core.AllocTagCancelled {
+			cancelCount++
+		}
+	}
+	if cancelCount != 1 {
+		t.Fatalf("expected exactly 1 cancelled allocation record, got %d (%+v)", cancelCount, allocs)
+	}
+
+	// 7. ExportHistoryCSV writes BOM CSV to ~/Downloads (or $HOME fallback) and shows toast
+	tmpHome := t.TempDir()
+	downloads := filepath.Join(tmpHome, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", tmpHome)
+	outPath, err := svc.ExportHistoryCSV(core.HistoryFilter{})
+	if err != nil {
+		t.Fatalf("ExportHistoryCSV failed: %v", err)
+	}
+	if !strings.HasPrefix(outPath, downloads) {
+		t.Fatalf("expected CSV in Downloads, got %q", outPath)
+	}
+	rawCSV, err := os.ReadFile(outPath)
+	if err != nil || !strings.HasPrefix(string(rawCSV), "\uFEFF") {
+		t.Fatalf("expected UTF-8 BOM CSV file, err=%v", err)
+	}
+}
+
+func TestCrossModelFallbackDoesNotMutateAccountAndQuickActions(t *testing.T) {
+	svc := NewService(true)
+	acc := core.NewDefaultAccountProfile("H3_31B", "h3@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.H3Variant = core.H3VariantOriginal
+	acc.AllowCrossModelFallback = true
+	acc.UseGoogleDrive = false
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
+
+	var mu sync.Mutex
+	var notices []string
+	var deployedH3Variant string
+	svc.NotifySender = func(title, body string) {
+		mu.Lock()
+		notices = append(notices, title+"|"+body)
+		mu.Unlock()
+	}
+
+	fr := &fakeRunner{}
+	fr.onShellOpts = func(cmd string, opts runner.RunOptions) runner.Result {
+		switch {
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 800.0 compute units\nUsage rate: 2.33/hr\nActive assignments: 1\n"}
+		case strings.Contains(cmd, "sessions"):
+			return runner.Result{ExitCode: 0, Stdout: "[" + acc.SessionName + "] m-s-l4fb | Hardware: L4 | Shape: Standard | Variant: GPU\n"}
+		case strings.Contains(cmd, "exec"):
+			if strings.Contains(opts.Stdin, "DEPLOY_LAUNCHED") {
+				re := regexp.MustCompile(`extra = json\.loads\(base64\.b64decode\("([^"]+)"\)\.decode\("utf-8"\)\)`)
+				if m := re.FindStringSubmatch(opts.Stdin); len(m) == 2 {
+					if rawEnv, err := base64.StdEncoding.DecodeString(m[1]); err == nil {
+						var envMap map[string]string
+						if json.Unmarshal(rawEnv, &envMap) == nil {
+							mu.Lock()
+							deployedH3Variant = envMap["H3_VARIANT"]
+							mu.Unlock()
+						}
+					}
+				}
+				return runner.Result{ExitCode: 0, Stdout: "DEPLOY_LAUNCHED=1\n"}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "NV=NVIDIA L4, 0, 23034, 0\nHEALTH=\nDEPLOY_ALIVE=0\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	svc.handlePostAllocation(acc, "L4", true, false)
+	defer svc.Shutdown()
+
+	// Original account config MUST still be H3VariantOriginal (31B)
+	persisted, ok := svc.accountByID(acc.ID)
+	if !ok || persisted.H3Variant != core.H3VariantOriginal {
+		t.Fatalf("cross-model fallback must NOT mutate account H3Variant, got %+v", persisted.H3Variant)
+	}
+	rt := svc.StateFor(acc.ID)
+	if !rt.SessionModelDowngraded || !rt.SessionFallbackUsed {
+		t.Fatalf("expected SessionModelDowngraded=true and SessionFallbackUsed=true, got %+v", rt)
+	}
+	if !strings.Contains(rt.WorkloadDetail, "H3 Flash 轻量 GGUF") {
+		t.Fatalf("expected temporary deploy detail to mention H3 Flash 轻量 GGUF, got %q", rt.WorkloadDetail)
+	}
+	mu.Lock()
+	if deployedH3Variant != string(core.H3VariantFlashGGUF) {
+		mu.Unlock()
+		t.Fatalf("expected deployed H3_VARIANT=%q, got %q", core.H3VariantFlashGGUF, deployedH3Variant)
+	}
+	mu.Unlock()
+	mu.Lock()
+	if len(notices) == 0 || !strings.Contains(notices[0], "抢到保底 L4（已自动切轻量 GGUF）") {
+		t.Fatalf("expected cross-model downgrade notification title, got %+v", notices)
+	}
+	mu.Unlock()
+
+	// QuickScheduleMorningStart sets schedule & clears error & shows toast
+	svc.mu.Lock()
+	rtErr := svc.Runtime[acc.ID]
+	rtErr.LastError = "没抢到"
+	svc.Runtime[acc.ID] = rtErr
+	svc.mu.Unlock()
+	svc.QuickScheduleMorningStart(acc.ID, 6, 30)
+	afterSched, _ := svc.accountByID(acc.ID)
+	if !afterSched.ScheduledStartEnabled || afterSched.ScheduledStartHour != 6 || afterSched.ScheduledStartMinute != 30 || afterSched.ScheduledNextFireAt == nil {
+		t.Fatalf("QuickScheduleMorningStart did not update schedule properly: %+v", afterSched)
+	}
+	if svc.StateFor(acc.ID).LastError != "" || !strings.Contains(svc.ToastMessage, "06:30") {
+		t.Fatalf("expected cleared error and schedule toast, err=%q toast=%q", svc.StateFor(acc.ID).LastError, svc.ToastMessage)
+	}
+
+	// SwitchToLightGGUFAndStart updates H3Variant to flash_gguf, clears error, and triggers DeployNow
+	svc.mu.Lock()
+	rtOff := core.NewAccountRuntimeState()
+	rtOff.LastError = "缺货"
+	svc.Runtime[acc.ID] = rtOff
+	svc.mu.Unlock()
+	svc.SwitchToLightGGUFAndStart(acc.ID)
+	afterGGUF, _ := svc.accountByID(acc.ID)
+	if afterGGUF.H3Variant != core.H3VariantFlashGGUF {
+		t.Fatalf("expected SwitchToLightGGUFAndStart to switch H3Variant to flash_gguf, got %v", afterGGUF.H3Variant)
+	}
+	if svc.StateFor(acc.ID).LastError != "" {
+		t.Fatalf("expected SwitchToLightGGUFAndStart to clear error, got %q", svc.StateFor(acc.ID).LastError)
+	}
+	svc.CancelQueue(acc.ID)
 }

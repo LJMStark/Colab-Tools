@@ -189,7 +189,10 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 			}
 		})
 
-		if acc.GPUStrategy == core.GPUStrategyCustom {
+		if acc.GPUStrategy == core.GPUStrategyAutoSmart {
+			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+			m.renderSmartStrategyDetails(c, pal, acc)
+		} else if acc.GPUStrategy == core.GPUStrategyCustom {
 			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 			m.renderCustomGPUStrategyDetails(c, pal, acc)
 		}
