@@ -8,240 +8,6 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// MARK: - Home Idle Launchpad (First-Principles Zero-Config Experience)
-
-func (m *MainUI) renderHomeIdleLaunchpad(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
-	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
-	moreSelected := acc.DeployRecipe == core.RecipeComfyUIGeneral ||
-		acc.DeployRecipe == core.RecipeNone ||
-		(acc.DeployRecipe == core.RecipeH3Video && (acc.H3Variant == core.H3VariantFlashGGUF || acc.H3Variant == core.H3VariantCustom))
-
-	// 1. Compact Account & Balance Strip (replaces 8 empty dashed monitoring cards while offline)
-	hrs, basis, hasEst := rt.EstimatedHoursRemaining(acc)
-	offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
-	ui.Row(c).FillWidth().Padding(16, 20).Radius(16).Background(pal.CardBg).Border(1, pal.CardBorder).AlignItems(ui.Center).Gap(14).Children(func() {
-		ui.Box(c).Width(10).Height(10).Radius(5).Background(AccountTagColor(pal, acc.ColorTag)).Shrink(0)
-		ui.Column(c).Grow(1).Gap(3).Children(func() {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, acc.DisplayName).FontSize(15).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
-				Badge(c, pal, acc.Tier.DisplayName(), nil)
-				if offlineBilling {
-					a := pal.Amber
-					Badge(c, pal, fmt.Sprintf("⚠ 外部会话计费 %.2f/h", rt.CURatePerHour), &a)
-				} else {
-					Badge(c, pal, "待机中 · 未计费", nil)
-				}
-			})
-			sub := "准备就绪，选好下面要跑的任务就能一键开跑"
-			if hasEst {
-				sub = fmt.Sprintf("按当前优先卡 %s 估算，余额约可用 %.0f 小时（单次最长 %d 小时）", basis, hrs, acc.Tier.MaxSessionHours())
-			} else if acc.Tier == core.TierFree {
-				sub = "免费体验池（T4 / CPU）· 单次最长 12 小时"
-			}
-			ui.Text(c, sub).FontSize(12).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
-		})
-		ui.Column(c).AlignItems(ui.End).Gap(2).Shrink(0).Children(func() {
-			ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
-				ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-				ui.Text(c, "CU").FontSize(12.5).FontWeight(600).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
-			})
-			if acc.GPUStrategy == core.GPUStrategyCustom {
-				ui.Text(c, "当前为自定义挑卡 · 点此切回智能挑卡").FontSize(11.5).TextColor(pal.Sky).OnClick(func() {
-					cp := acc
-					cp.GPUStrategy = core.GPUStrategyAutoSmart
-					cp.EnablePoliteQueue = true
-					m.Svc.UpdateAccount(cp)
-					m.Svc.ShowToast("已切换为智能挑卡（自动优先稳妥高配卡）")
-				})
-			}
-		})
-	})
-
-	// 2. Step 1: One-Click Scenario Picker (4 clean cards, H3 Flash selected by default)
-	SectionCard(c, pal, "你想用云端显卡干嘛？", "点一下选好就行，其他都已按最佳方案配齐", func() {
-		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
-			// Card 1: H3 Flash (Default Recommended)
-			flashSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlash
-			m.scenarioCard(c, pal, "H3 Flash 极速版", "默认推荐", "6 步出片 · 速度快省点数", "自动装 ComfyUI + 存 Drive", flashSel, true, func() {
-				m.selectH3Preset(acc, core.H3VariantFlash)
-				m.ShowMoreRecipes = false
-			})
-
-			// Card 2: H3 Original 31B
-			origSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal
-			m.scenarioCard(c, pal, "H3 原版 (31B)", "画质首选", "官方满血双权重 · 画质最高", "优先大显存卡 G4 / A100", origSel, false, func() {
-				m.selectH3Preset(acc, core.H3VariantOriginal)
-				m.ShowMoreRecipes = false
-			})
-
-			// Card 3: LLM Proxy
-			llmSel := acc.DeployRecipe == core.RecipeLLMProxy
-			m.scenarioCard(c, pal, "大模型代理", "编程用", "给 Claude / Codex / Cursor", "自动同步本地编程工具", llmSel, false, func() {
-				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
-				m.ShowMoreRecipes = false
-			})
-
-			// Card 4: More modes (GGUF / Custom / General ComfyUI / Pure Compute)
-			moreBadge := "更多"
-			if acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF {
-				moreBadge = "轻量 GGUF"
-			} else if acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom {
-				moreBadge = "自定义 H3"
-			} else if acc.DeployRecipe == core.RecipeComfyUIGeneral {
-				moreBadge = "ComfyUI"
-			} else if acc.DeployRecipe == core.RecipeNone {
-				moreBadge = "纯开机"
-			}
-			m.scenarioCard(c, pal, "更多玩法", moreBadge, "轻量 GGUF · 通用 ComfyUI", "或自定义模型 / 纯开机", moreSelected || m.ShowMoreRecipes, false, func() {
-				m.ShowMoreRecipes = !m.ShowMoreRecipes
-			})
-		})
-
-		// Expandable sub-row ONLY when user clicks "更多玩法" or already picked an extended recipe
-		if m.ShowMoreRecipes || moreSelected {
-			ui.Column(c).FillWidth().Padding(12).Gap(10).Radius(11).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).Children(func() {
-				ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "扩展模式：").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted)
-					m.modeChip(c, pal, "H3 轻量 GGUF（24G L4 可跑）", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF, func() {
-						m.selectH3Preset(acc, core.H3VariantFlashGGUF)
-					})
-					m.modeChip(c, pal, "自定义 HF / 只用 Drive 模型", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom, func() {
-						m.selectH3Preset(acc, core.H3VariantCustom)
-					})
-					m.modeChip(c, pal, "通用 ComfyUI", acc.DeployRecipe == core.RecipeComfyUIGeneral, func() {
-						m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeComfyUIGeneral)
-					})
-					m.modeChip(c, pal, "只开机不装模型", acc.DeployRecipe == core.RecipeNone, func() {
-						m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeNone)
-					})
-				})
-
-				if acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF {
-					ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "GGUF 精度：").FontSize(12.5).TextColor(pal.TextMuted)
-						for _, q := range []struct{ val, lbl string }{
-							{"Q4_K_M", "Q4_K_M（约 8GB · 推荐）"},
-							{"Q6_K", "Q6_K（约 11GB · 更细）"},
-							{"Q8_0", "Q8_0（约 15GB · 接近原版）"},
-						} {
-							qv := q.val
-							m.modeChip(c, pal, q.lbl, acc.H3GGUFQuant == qv, func() {
-								cp := acc
-								cp.H3GGUFQuant = qv
-								m.Svc.UpdateAccount(cp)
-							})
-						}
-					})
-				} else if acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom {
-					driveOnly := acc.H3DriveOnly
-					ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-						ui.Column(c).Grow(1).Gap(2).Children(func() {
-							ui.Text(c, "只用我 Google Drive 里的现成模型（不外网下载）").FontSize(13).FontWeight(500).TextColor(pal.TextPrimary)
-							ui.Text(c, "直接把你 Drive 里的 diffusion_models 拷到高速盘开跑。").FontSize(11.5).TextColor(pal.TextMuted)
-						})
-						if ui.Switch(c, &driveOnly).Clicked() || driveOnly != acc.H3DriveOnly {
-							cp := acc
-							cp.H3DriveOnly = driveOnly
-							m.Svc.UpdateAccount(cp)
-						}
-					})
-					if !acc.H3DriveOnly {
-						ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-							ui.TextInput(c, &m.H3CustomRepoDraft).Placeholder("HuggingFace 仓库，如 owner/repo").Width(240)
-							ui.TextInput(c, &m.H3CustomFilesDraft).Placeholder("模型文件名（多个用英文逗号隔开）").Grow(1)
-							SmallActionButton(c, pal, "保存来源", &pal.Amber, false, func() {
-								repo := strings.TrimSpace(m.H3CustomRepoDraft)
-								files := core.SanitizeCustomHFFiles(m.H3CustomFilesDraft)
-								if !core.IsValidHFRepo(repo) || files == "" {
-									m.Svc.ShowToast("仓库格式应为 owner/repo，且文件名不能包含空格或特殊字符")
-									return
-								}
-								cp := acc
-								cp.H3CustomHFRepo = repo
-								cp.H3CustomHFFiles = files
-								m.Svc.UpdateAccount(cp)
-								m.Svc.ShowToast("已保存自定义 H3 模型来源")
-							})
-						})
-					}
-				}
-			})
-		}
-	})
-
-	// 3. Step 2: Zero-Config Smart Summary + Big Primary Launch Button
-	isCooling := rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(timeNow())
-	ui.Column(c).FillWidth().Padding(18, 20).Gap(12).Radius(16).Background(pal.CardBg).Border(1, pal.CardBorder).Children(func() {
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(16).Children(func() {
-			ui.Column(c).Grow(1).Gap(6).Children(func() {
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "已帮你配好默认方案，直接点右边开跑就行").FontSize(14.5).FontWeight(600).TextColor(pal.TextPrimary)
-					if acc.ScheduledStartEnabled {
-						e := pal.Emerald
-						Badge(c, pal, fmt.Sprintf("已设预约 %02d:%02d", acc.ScheduledStartHour, acc.ScheduledStartMinute), &e)
-					}
-				})
-				m.summaryBullet(c, pal, pal.Amber, "挑卡策略："+core.EffectiveGPUPlanSummary(acc)+"，没货或无配额自动试下一张")
-				if isVideo {
-					driveText := "纯云端运行（未开 Drive，出片后请手动下载）"
-					if acc.UseGoogleDrive {
-						driveText = "联动 Google Drive（先拷本地高速盘不掉盘，每条成片实时存 Drive）"
-					}
-					if acc.AutoOpenComfyUI {
-						driveText += " · 装好自动加密直开 ComfyUI"
-					}
-					m.summaryBullet(c, pal, pal.Emerald, "模型与成片："+driveText)
-				} else if acc.DeployRecipe == core.RecipeLLMProxy {
-					m.summaryBullet(c, pal, pal.Sky, "编程接入：开机自动起大模型接口（:18080），已选的编程工具会自动同步")
-				} else {
-					m.summaryBullet(c, pal, pal.TextMuted, "纯净环境：只负责抢卡开机和空闲守护，不自动安装模型脚本")
-				}
-				shutText := "自动关机已关闭（用完请记得手动停卡，避免扣点）"
-				shutCol := pal.Coral
-				if acc.AutoShutdownEnabled {
-					shutCol = pal.Cyan
-					mins := acc.IdleTimeoutMinutes
-					if isVideo && acc.StopAfterQueueDrained {
-						mins = acc.QueueDrainMinutes
-						shutText = fmt.Sprintf("防忘关省点：视频队列全部跑完后空闲 %d 分钟自动停卡，并复查官网确认", mins)
-					} else {
-						shutText = fmt.Sprintf("防忘关省点：连续空闲 %d 分钟自动停卡，不怕挂一晚白扣点", mins)
-					}
-				}
-				m.summaryBullet(c, pal, shutCol, shutText)
-			})
-
-			ui.Column(c).AlignItems(ui.End).Gap(8).Shrink(0).Children(func() {
-				cta := "▶  一键开机并运行"
-				if acc.DeployRecipe == core.RecipeNone {
-					cta = "▶  一键开机"
-				}
-				disabled := !m.Svc.CLIInstalled || isCooling
-				PillButton(c, pal, cta, true, disabled, func() {
-					m.Svc.DeployNow(acc.ID)
-				})
-				optLabel := "调整显卡与选项 ▾"
-				if m.ShowHomeOptions {
-					optLabel = "收起选项 ▴"
-				}
-				SmallActionButton(c, pal, optLabel, nil, false, func() {
-					m.ShowHomeOptions = !m.ShowHomeOptions
-				})
-			})
-		})
-	})
-
-	// 4. Contextual LLM Integrations panel (ONLY visible when user picks LLM Proxy — zero clutter for video users)
-	if acc.DeployRecipe == core.RecipeLLMProxy {
-		m.renderIntegrationsPanel(c, pal, acc, rt)
-	}
-
-	// 5. Optional Collapsible Fine-Tuning Drawer (hidden by default for zero-config beginners)
-	if m.ShowHomeOptions {
-		m.renderHomeOptionsDrawer(c, pal, acc, rt)
-	}
-}
-
 func (m *MainUI) selectH3Preset(acc core.AccountProfile, variant core.H3Variant) {
 	cp := acc
 	cp.DeployRecipe = core.RecipeH3Video
@@ -260,32 +26,6 @@ func (m *MainUI) selectH3Preset(acc core.AccountProfile, variant core.H3Variant)
 	m.Svc.ClearAccountError(acc.ID)
 }
 
-func (m *MainUI) scenarioCard(c *ui.Context, pal Palette, title, badge, line1, line2 string, selected, recommend bool, onClick func()) {
-	bg := pal.SubtleBg
-	border := pal.SubtleBorder
-	if selected {
-		bg = WithAlpha(pal.Amber, 0.14)
-		border = WithAlpha(pal.Amber, 0.65)
-	}
-	ui.Column(c).FillWidth().Padding(13).Gap(5).Radius(13).Background(bg).Border(1, border).OnClick(onClick).Children(func() {
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
-			ui.Text(c, title).FontSize(14).Bold().TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
-			ui.Spacer(c)
-			var bt *ui.Color
-			if selected {
-				t := pal.Amber
-				bt = &t
-			} else if recommend {
-				t := pal.Emerald
-				bt = &t
-			}
-			Badge(c, pal, badge, bt)
-		})
-		ui.Text(c, line1).FontSize(12).FontWeight(500).TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
-		ui.Text(c, line2).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
-	})
-}
-
 func (m *MainUI) modeChip(c *ui.Context, pal Palette, label string, active bool, onClick func()) {
 	var tint *ui.Color
 	if active {
@@ -295,16 +35,112 @@ func (m *MainUI) modeChip(c *ui.Context, pal Palette, label string, active bool,
 	SmallActionButton(c, pal, label, tint, false, onClick)
 }
 
-func (m *MainUI) summaryBullet(c *ui.Context, pal Palette, dotCol ui.Color, text string) {
-	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
-		ui.Box(c).Width(6).Height(6).Radius(3).Background(dotCol).Shrink(0)
-		ui.Text(c, text).FontSize(12.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+func (m *MainUI) compactOverlayChip(c *ui.Context, pal Palette, label string, active bool, onClick func()) {
+	bg := pal.SubtleBg
+	border := pal.SubtleBorder
+	fg := pal.TextPrimary
+	fw := 500
+	if active {
+		bg = WithAlpha(pal.Amber, 0.16)
+		border = WithAlpha(pal.Amber, 0.50)
+		fg = pal.Amber
+		fw = 600
+	}
+	el := ui.Row(c).Padding(5, 8).Radius(7).Background(bg).Border(1, border).
+		AlignItems(ui.Center).Justify(ui.Center).Shrink(0).Cursor(ui.CursorPointer)
+	if onClick != nil {
+		el.OnClick(onClick)
+	}
+	el.Children(func() {
+		ui.Text(c, label).FontSize(11.5).FontWeight(fw).TextColor(fg).MaxLines(1)
 	})
 }
 
-// renderHomeOptionsDrawer renders the clean, consolidated customization drawer (GPU strategy + Drive/ComfyUI + single Shutdown setting).
+// renderHomeOptionsDrawer renders the clean, consolidated inspector inside the centered ui.Overlay
+// (Extended recipe quick-switcher + GPU strategy + Drive/ComfyUI or LLM integrations + unified Auto-Shutdown).
 func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
+
+	// Top Block: Extended Mode Quick-Switcher + Contextual Sub-Options
+	activeRecipeLabel := acc.DeployRecipe.DisplayName()
+	if acc.DeployRecipe == core.RecipeH3Video {
+		activeRecipeLabel = acc.H3Variant.DisplayName()
+	}
+	SectionCard(c, pal, "扩展模式快捷切", activeRecipeLabel, func() {
+		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
+			m.compactOverlayChip(c, pal, "H3 Flash", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlash, func() {
+				m.selectH3Preset(acc, core.H3VariantFlash)
+			})
+			m.compactOverlayChip(c, pal, "H3 原版", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal, func() {
+				m.selectH3Preset(acc, core.H3VariantOriginal)
+			})
+			m.compactOverlayChip(c, pal, "轻量 GGUF", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF, func() {
+				m.selectH3Preset(acc, core.H3VariantFlashGGUF)
+			})
+			m.compactOverlayChip(c, pal, "自定义 HF 或 Drive", acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom, func() {
+				m.selectH3Preset(acc, core.H3VariantCustom)
+			})
+			m.compactOverlayChip(c, pal, "通用 ComfyUI", acc.DeployRecipe == core.RecipeComfyUIGeneral, func() {
+				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeComfyUIGeneral)
+			})
+			m.compactOverlayChip(c, pal, "大模型代理", acc.DeployRecipe == core.RecipeLLMProxy, func() {
+				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
+			})
+			m.compactOverlayChip(c, pal, "只开机", acc.DeployRecipe == core.RecipeNone, func() {
+				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeNone)
+			})
+		})
+
+		if acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF {
+			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "GGUF 精度：").FontSize(12).TextColor(pal.TextMuted)
+				for _, q := range []struct{ val, lbl string }{
+					{"Q4_K_M", "Q4_K_M（约 8GB · 推荐）"},
+					{"Q6_K", "Q6_K（约 11GB · 更细）"},
+					{"Q8_0", "Q8_0（约 15GB · 接近原版）"},
+				} {
+					qv := q.val
+					m.modeChip(c, pal, q.lbl, acc.H3GGUFQuant == qv, func() {
+						cp := acc
+						cp.H3GGUFQuant = qv
+						m.Svc.UpdateAccount(cp)
+					})
+				}
+			})
+		} else if acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantCustom {
+			driveOnly := acc.H3DriveOnly
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					ui.Text(c, "只用我 Google Drive 里的现成模型（不外网下载）").FontSize(12.5).FontWeight(500).TextColor(pal.TextPrimary)
+					ui.Text(c, "直接把你 Drive 里的 diffusion_models 拷到高速盘开跑。").FontSize(11.5).TextColor(pal.TextMuted)
+				})
+				if ui.Switch(c, &driveOnly).Clicked() || driveOnly != acc.H3DriveOnly {
+					cp := acc
+					cp.H3DriveOnly = driveOnly
+					m.Svc.UpdateAccount(cp)
+				}
+			})
+			if !acc.H3DriveOnly {
+				ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+					ui.TextInput(c, &m.H3CustomRepoDraft).Placeholder("HuggingFace 仓库，如 owner/repo").Width(220)
+					ui.TextInput(c, &m.H3CustomFilesDraft).Placeholder("模型文件名（多个用英文逗号隔开）").Grow(1)
+					SmallActionButton(c, pal, "保存来源", &pal.Amber, false, func() {
+						repo := strings.TrimSpace(m.H3CustomRepoDraft)
+						files := core.SanitizeCustomHFFiles(m.H3CustomFilesDraft)
+						if !core.IsValidHFRepo(repo) || files == "" {
+							m.Svc.ShowToast("仓库格式应为 owner/repo，且文件名不能包含空格或特殊字符")
+							return
+						}
+						cp := acc
+						cp.H3CustomHFRepo = repo
+						cp.H3CustomHFFiles = files
+						m.Svc.UpdateAccount(cp)
+						m.Svc.ShowToast("已保存自定义 H3 模型来源")
+					})
+				})
+			}
+		}
+	})
 
 	// Block A: Simplified 3-Option GPU Picker (with optional Advanced Custom expansion)
 	SectionCard(c, pal, "显卡怎么挑", core.EffectiveGPUPlanSummary(acc), func() {
@@ -324,11 +160,13 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 				sel := acc.GPUStrategy == it.mode
 				bg := pal.SubtleBg
 				border := pal.SubtleBorder
+				borderW := float32(1)
 				if sel {
-					bg = WithAlpha(pal.Amber, 0.13)
-					border = WithAlpha(pal.Amber, 0.60)
+					bg = WithAlpha(pal.Amber, 0.08)
+					border = WithAlpha(pal.Amber, 0.72)
+					borderW = 1.5
 				}
-				ui.Column(c).FillWidth().Padding(11, 12).Gap(4).Radius(11).Background(bg).Border(1, border).OnClick(func() {
+				ui.Column(c).FillWidth().Padding(11, 12).Gap(4).Radius(11).Background(bg).Border(borderW, border).Cursor(ui.CursorPointer).OnClick(func() {
 					cp := acc
 					cp.GPUStrategy = it.mode
 					if it.mode != core.GPUStrategyCustom {
@@ -357,7 +195,10 @@ func (m *MainUI) renderHomeOptionsDrawer(c *ui.Context, pal Palette, acc core.Ac
 		}
 	})
 
-	// Block B: Video Drive & ComfyUI Options (only for video recipes)
+	// Block B: Video Drive & ComfyUI Options or LLM Coding Tool Integrations
+	if acc.DeployRecipe == core.RecipeLLMProxy {
+		m.renderIntegrationsPanel(c, pal, acc, rt)
+	}
 	if isVideo {
 		SectionCard(c, pal, "Google Drive 存片与打开方式", "默认已开齐，一般不用改", func() {
 			useDrive := acc.UseGoogleDrive

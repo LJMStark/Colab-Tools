@@ -182,7 +182,7 @@ func renderPNG(t *testing.T, view func(*ui.Context), width, height int, outPath 
 }
 
 func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
-	// 1. Offline Beginner Launchpad: zero-config defaults + collapsible options + cooldown clear
+	// 1. Offline Standby 4x2 Bento: zero-config task switching + centered Overlay options + cooldown clear
 	idleSvc := makeDemoService(app.SectionHome, false, true)
 	accID := idleSvc.Settings.SelectedAccountID
 	until := time.Now().Add(12 * time.Minute)
@@ -194,10 +194,10 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	idleSvc.Runtime[accID] = rt
 
 	idleUI := uiapp.NewMainUI(idleSvc)
-	idleUI.ForceTheme = "light"
+	idleUI.ForceTheme = "dark"
 	idleTester := ui.NewTester(idleUI.View, 1160, 760)
-	if !idleTester.HasText("H3 Flash 极速版") || !idleTester.HasText("一键开机并运行") || !idleTester.HasText("解除等待") {
-		t.Fatalf("missing beginner launchpad or cooldown clear controls: %q", idleTester.Texts())
+	if !idleTester.HasText("当前任务") || !idleTester.HasText("H3 Flash 极速版") || !idleTester.HasText("一键开机并运行") || !idleTester.HasText("解除等待") {
+		t.Fatalf("missing standby bento or cooldown clear controls: %q", idleTester.Texts())
 	}
 	if err := idleTester.Click("解除等待"); err != nil {
 		t.Fatalf("click 解除等待 failed: %v", err)
@@ -211,11 +211,32 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if acc, _ := idleSvc.SelectedAccount(); acc.H3Variant != core.H3VariantOriginal {
 		t.Fatalf("expected H3 original variant, got %q", acc.H3Variant)
 	}
-	if err := idleTester.Click("调整显卡与选项 ▾"); err != nil {
-		t.Fatalf("click expand options failed: %v", err)
+	if err := idleTester.Click("调整显卡与选项"); err != nil {
+		t.Fatalf("click open overlay options failed: %v", err)
 	}
 	if !idleTester.HasText("智能挑卡") || !idleTester.HasText("省点模式") || !idleTester.HasText("高级自定义") {
-		t.Fatalf("missing simplified 3-mode GPU picker: %q", idleTester.Texts())
+		t.Fatalf("missing simplified 3-mode GPU picker in overlay: %q", idleTester.Texts())
+	}
+	if err := idleTester.Click("省点模式"); err != nil {
+		t.Fatalf("click 省点模式 failed: %v", err)
+	}
+	if acc, _ := idleSvc.SelectedAccount(); acc.GPUStrategy != core.GPUStrategyEcoSaver {
+		t.Fatalf("expected EcoSaver GPU strategy, got %q", acc.GPUStrategy)
+	}
+	if err := idleTester.Click("高级自定义"); err != nil {
+		t.Fatalf("click 高级自定义 failed: %v", err)
+	}
+	if acc, _ := idleSvc.SelectedAccount(); acc.GPUStrategy != core.GPUStrategyCustom {
+		t.Fatalf("expected Custom GPU strategy, got %q", acc.GPUStrategy)
+	}
+	if err := idleTester.Click("智能挑卡"); err != nil {
+		t.Fatalf("click 智能挑卡 failed: %v", err)
+	}
+	if acc, _ := idleSvc.SelectedAccount(); acc.GPUStrategy != core.GPUStrategyAutoSmart {
+		t.Fatalf("expected AutoSmart GPU strategy, got %q", acc.GPUStrategy)
+	}
+	if err := idleTester.Click("完成"); err != nil {
+		t.Fatalf("click 完成 failed: %v", err)
 	}
 
 	// 2. Running Live Bento Console + 3-tab navigation (主页 / 账号 / 设置)
@@ -224,7 +245,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	mui.ForceTheme = "dark"
 	tt := ui.NewTester(mui.View, 1160, 760)
 
-	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("A100 → G4 → L4") || !tt.HasText("开 ComfyUI") {
+	if !tt.HasText("2374.8") || !tt.HasText("Personal") || !tt.HasText("G4 → A100 → L4") || !tt.HasText("开 ComfyUI") {
 		t.Fatalf("missing primary live dashboard text: %q", tt.Texts())
 	}
 	if err := tt.Click("40m"); err != nil {
@@ -264,21 +285,21 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		t.Skip("set COLABTOOLS_EXPORT_DIR to export official @2x screenshots")
 	}
 
-	// 1. Live running status console (dark)
+	// 1. Live running status console (dark 4x2 Bento)
 	runSvc := makeDemoService(app.SectionHome, false, false)
 	runUI := uiapp.NewMainUI(runSvc)
 	runUI.PreviewMode = true
 	runUI.ForceTheme = "dark"
 	renderPNG(t, runUI.View, 1160, 760, filepath.Join(outDir, "preview-main-status.png"))
 
-	// 2. Clean zero-config Home Launchpad (idle beginner view — H3 Flash default)
+	// 2. Clean standby 4x2 Bento dashboard (dark, standard 1160x760)
 	idleSvc := makeDemoService(app.SectionHome, false, true)
 	idleUI := uiapp.NewMainUI(idleSvc)
 	idleUI.PreviewMode = true
 	idleUI.ForceTheme = "dark"
-	renderPNG(t, idleUI.View, 1160, 680, filepath.Join(outDir, "preview-deploy-h3.png"))
+	renderPNG(t, idleUI.View, 1160, 760, filepath.Join(outDir, "preview-deploy-h3.png"))
 
-	// 3. Expanded custom GPU strategy & morning schedule drawer
+	// 3. Centered Overlay options inspector over 4x2 Bento
 	customSvc := makeDemoService(app.SectionHome, false, true)
 	cAcc := customSvc.Settings.Accounts[0]
 	cAcc.GPUStrategy = core.GPUStrategyCustom
@@ -296,15 +317,16 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	customUI.PreviewMode = true
 	customUI.ForceTheme = "dark"
 	customUI.ShowHomeOptions = true
-	renderPNG(t, customUI.View, 1160, 1205, filepath.Join(outDir, "preview-settings-queue.png"))
+	renderPNG(t, customUI.View, 1160, 760, filepath.Join(outDir, "preview-settings-queue.png"))
 
-	// 4. Contextual LLM Proxy mode showing native integrations right on Home
+	// 4. LLM Proxy mode with centered Overlay integrations inspector (1160x760)
 	llmSvc := makeDemoService(app.SectionHome, false, true)
 	llmSvc.ApplyDeployRecipe(llmSvc.Settings.Accounts[0].ID, core.RecipeLLMProxy)
 	llmUI := uiapp.NewMainUI(llmSvc)
 	llmUI.PreviewMode = true
 	llmUI.ForceTheme = "dark"
-	renderPNG(t, llmUI.View, 1160, 1020, filepath.Join(outDir, "preview-settings-integrations.png"))
+	llmUI.ShowHomeOptions = true
+	renderPNG(t, llmUI.View, 1160, 760, filepath.Join(outDir, "preview-settings-integrations.png"))
 
 	// 5. Onboarding wizard
 	obSvc := makeDemoService(app.SectionHome, true, false)
@@ -330,7 +352,7 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		idleLight := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, true))
 		idleLight.PreviewMode = true
 		idleLight.ForceTheme = "light"
-		renderPNG(t, idleLight.View, 1160, 680, filepath.Join(qaDir, "qa-home-idle-light.png"))
+		renderPNG(t, idleLight.View, 1160, 760, filepath.Join(qaDir, "qa-home-idle-light.png"))
 
 		setLight := uiapp.NewMainUI(makeDemoService(app.SectionSettings, false, true))
 		setLight.PreviewMode = true

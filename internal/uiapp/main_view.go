@@ -25,9 +25,7 @@ type MainUI struct {
 	ShowAccountDropdown  bool
 	AgreedRemoteScript   bool
 	ShowInstallLogs      bool
-	ShowHomeOptions      bool // Idle launchpad collapsible options drawer (collapsed by default)
-	ShowMoreRecipes      bool // Extended recipes row under "更多玩法"
-	ShowRunningDrawer    bool // On-demand scheme/integration drawer when running
+	ShowHomeOptions      bool // Centered overlay inspector for recipe, GPU strategy & options
 	ShowErrorRaw         bool // Toggle raw CLI snippet in error banner
 	ShowAdvancedSettings bool // Collapsible advanced parameters in Settings (collapsed by default)
 	EditingTierAccountID string
@@ -117,6 +115,8 @@ func (m *MainUI) View(c *ui.Context) {
 		From:  pal.BgTop,
 		To:    pal.BgBottom,
 		Angle: 180,
+	}).Draw(func(p *ui.Painter, r ui.Rect) {
+		DrawPrecisionBackdrop(p, r, pal)
 	}).Children(func() {
 		if m.Svc.ShowingOnboarding {
 			m.renderOnboarding(c, pal)
@@ -125,7 +125,7 @@ func (m *MainUI) View(c *ui.Context) {
 			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
 			body := func() {
-				ui.Column(c).FillWidth().Padding(18, 24, 24, 24).Gap(14).Children(func() {
+				ui.Column(c).FillWidth().Padding(16, 24, 22, 24).Gap(14).Children(func() {
 					switch m.Svc.SelectedSection {
 					case app.SectionHome:
 						m.renderStatusPage(c, pal)
@@ -145,6 +145,11 @@ func (m *MainUI) View(c *ui.Context) {
 		}
 	})
 
+	// Centered Inspector Modal Overlay for GPU strategy & run options
+	if m.ShowHomeOptions {
+		m.renderHomeOptionsOverlay(c, pal)
+	}
+
 	// Floating bottom-right toast banner (non-blocking PassThrough so clicks underneath always work)
 	if toast := m.Svc.ToastMessage; toast != "" {
 		ui.Overlay(c, func() {
@@ -158,6 +163,52 @@ func (m *MainUI) View(c *ui.Context) {
 			})
 		})
 	}
+}
+
+func (m *MainUI) renderHomeOptionsOverlay(c *ui.Context, pal Palette) {
+	acc, hasAcc := m.Svc.SelectedAccount()
+	if !hasAcc {
+		return
+	}
+	rt := m.Svc.StateFor(acc.ID)
+
+	ui.Overlay(c, func() {
+		// Full-screen translucent scrim (click outside card to close)
+		ui.Box(c).Absolute().Top(0).Left(0).Right(0).Bottom(0).
+			Background(ui.RGBA(0, 0, 0, 0.45)).
+			OnClick(func() {
+				m.ShowHomeOptions = false
+			})
+
+		// PassThrough wrapper centers the PrecisionCard without swallowing outside clicks
+		ui.Column(c).Absolute().Top(0).Left(0).Right(0).Bottom(0).
+			PassThrough().
+			Padding(16, 24).
+			AlignItems(ui.Center).
+			Justify(ui.Center).
+			Children(func() {
+				card := PrecisionCard(c, pal, 20, 18, func() {
+					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(12).Children(func() {
+						DrawPrecisionLED(c, pal.Amber, 12)
+						ui.Text(c, "任务方案与显卡选项").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
+						ui.Spacer(c)
+						SmallActionButton(c, pal, "完成", nil, false, func() {
+							m.ShowHomeOptions = false
+						})
+					})
+
+					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+
+					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(592).Children(func() {
+						ui.Column(c).FillWidth().Gap(12).Padding(2, 4, 4, 0).Children(func() {
+							m.renderHomeOptionsDrawer(c, pal, acc, rt)
+						})
+					})
+				}).Width(780).MaxHeight(676).Gap(12).
+					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.42))
+				_ = card
+			})
+	})
 }
 
 func (m *MainUI) centeredWorkbench(c *ui.Context, fn func()) {
@@ -181,17 +232,24 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 	ui.Row(c).FillWidth().Padding(topPad, 24, 14, leftPad).AlignItems(ui.Center).DragWindow().Children(func() {
 		// Left multi-account selector pill
 		if len(accounts) >= 2 && hasSel {
-			ui.Row(c).Gap(6).Padding(6, 12).Radius(999).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).AlignItems(ui.Center).OnClick(func() {
-				// Cycle account quickly on click
-				for i, a := range accounts {
-					if a.ID == selAcc.ID {
-						next := accounts[(i+1)%len(accounts)]
-						m.Svc.SelectAccount(next.ID)
-						break
+			ui.Row(c).Gap(7).Padding(6, 12).Radius(999).
+				Background(pal.SubtleBg).
+				Border(1, ui.Color{}).
+				BorderLinearGradient(ui.LinearGradient{From: pal.CardBorderTop, To: pal.CardBorderBottom, Angle: 180}).
+				InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+				AlignItems(ui.Center).
+				Cursor(ui.CursorPointer).
+				OnClick(func() {
+					// Cycle account quickly on click
+					for i, a := range accounts {
+						if a.ID == selAcc.ID {
+							next := accounts[(i+1)%len(accounts)]
+							m.Svc.SelectAccount(next.ID)
+							break
+						}
 					}
-				}
-			}).Children(func() {
-				ui.Box(c).Width(8).Height(8).Radius(4).Background(AccountTagColor(pal, selAcc.ColorTag))
+				}).Children(func() {
+				DrawPrecisionLED(c, AccountTagColor(pal, selAcc.ColorTag), 10)
 				ui.Text(c, selAcc.DisplayName).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
 				ui.Text(c, "▾").FontSize(11).TextColor(pal.TextMuted)
 			})
@@ -199,8 +257,14 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 
 		ui.Spacer(c)
 
-		// Centered Mole floating capsule navigation
-		ui.Row(c).Gap(4).Padding(5, 6).Radius(999).Background(pal.NavBg).Border(1, pal.SubtleBorder).AlignItems(ui.Center).Children(func() {
+		// Centered Mole floating capsule navigation with metallic bevel & inner highlight
+		ui.Row(c).Gap(4).Padding(5, 6).Radius(999).
+			Background(pal.NavBg).
+			Border(1, ui.Color{}).
+			BorderLinearGradient(ui.LinearGradient{From: pal.CardBorderTop, To: pal.CardBorderBottom, Angle: 180}).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			Shadow(0, 4, 14, -4, pal.CardShadow).
+			AlignItems(ui.Center).Children(func() {
 			if appIconBitmap != nil {
 				ui.Image(c, appIconBitmap).Width(26).Height(26).Radius(13).Clip()
 			} else {
@@ -211,9 +275,11 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 			for idx, title := range app.MainSectionTitles {
 				sec := app.MainSection(idx)
 				selected := m.Svc.SelectedSection == sec
-				el := ui.Row(c).Padding(6, 15).Radius(999).AlignItems(ui.Center)
+				el := ui.Row(c).Padding(6, 15).Radius(999).AlignItems(ui.Center).Cursor(ui.CursorPointer)
 				if selected {
-					el.Background(pal.NavPillBg).Shadow(0, 1, 5, 0, ui.RGBA(0, 0, 0, 0.18))
+					el.Background(pal.NavPillBg).
+						InsetShadow(0, 1, 0, 0, ui.RGBA(255, 255, 255, 0.24)).
+						Shadow(0, 2, 7, 0, ui.RGBA(0, 0, 0, 0.20))
 				}
 				el.OnClick(func() {
 					m.Svc.SetSection(sec)
@@ -231,17 +297,27 @@ func (m *MainUI) renderTopCapsuleBar(c *ui.Context, pal Palette) {
 
 		ui.Spacer(c)
 
-		// Right live status pill
+		// Right live status pill with aligned refresh vector icon
 		pillColor, pillLabel := m.topRightPill(pal)
-		ui.Row(c).Gap(7).Padding(6, 13).Radius(999).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).AlignItems(ui.Center).OnClick(func() {
-			if !m.Svc.CLIInstalled {
-				m.Svc.ReopenOnboarding()
-			} else {
-				go m.Svc.RefreshAllAccounts(true, false)
-			}
-		}).Children(func() {
-			ui.Box(c).Width(8).Height(8).Radius(4).Background(pillColor)
+		ui.Row(c).Gap(7).Padding(6, 13).Radius(999).
+			Background(pal.SubtleBg).
+			Border(1, ui.Color{}).
+			BorderLinearGradient(ui.LinearGradient{From: pal.CardBorderTop, To: pal.CardBorderBottom, Angle: 180}).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			AlignItems(ui.Center).
+			Cursor(ui.CursorPointer).
+			OnClick(func() {
+				if !m.Svc.CLIInstalled {
+					m.Svc.ReopenOnboarding()
+				} else {
+					go m.Svc.RefreshAllAccounts(true, false)
+				}
+			}).Children(func() {
+			DrawPrecisionLED(c, pillColor, 10)
 			ui.Text(c, pillLabel).FontSize(12.5).FontWeight(500).FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
+			if m.Svc.CLIInstalled {
+				ToolbarIcon(c, "refresh", 13, pal.TextMuted)
+			}
 		})
 	})
 }
@@ -252,7 +328,7 @@ func (m *MainUI) topRightPill(pal Palette) (ui.Color, string) {
 	}
 	running := m.Svc.RunningAccountCount()
 	if running >= 2 {
-		return pal.Emerald, fmt.Sprintf("%d 运行中 · 刷新", running)
+		return pal.Emerald, fmt.Sprintf("%d 运行中", running)
 	}
 	if running == 1 {
 		for _, a := range m.Svc.AccountsSnapshot() {
@@ -268,17 +344,27 @@ func (m *MainUI) topRightPill(pal Palette) (ui.Color, string) {
 			return pal.Amber, fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
 		}
 	}
-	return pal.TextFaint, fmt.Sprintf("v%s · 刷新", app.AppVersion)
+	return pal.TextFaint, fmt.Sprintf("v%s", app.AppVersion)
+}
+
+func drawBannerSemanticBar(p *ui.Painter, r ui.Rect, col ui.Color) {
+	h := max(float32(16), r.H-16)
+	p.Fill(ui.Rect{X: r.X + 4, Y: r.Y + (r.H-h)/2, W: 4, H: h}, col, 2)
 }
 
 // MARK: - Tab 1: Mole-Style 4x2 Bento Status Dashboard + Bottom Live Session Table
 
 func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 	if !m.Svc.CLIInstalled {
-		ui.Row(c).FillWidth().Padding(14).Radius(14).
-			Background(WithAlpha(pal.Amber, 0.12)).Border(1, WithAlpha(pal.Amber, 0.34)).
+		ui.Row(c).FillWidth().Padding(14, 16, 14, 18).Radius(14).
+			Background(WithAlpha(pal.Amber, 0.10)).
+			Border(1, WithAlpha(pal.Amber, 0.30)).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			DrawOver(func(p *ui.Painter, r ui.Rect) {
+				drawBannerSemanticBar(p, r, pal.Amber)
+			}).
 			AlignItems(ui.Center).Gap(12).Children(func() {
-			ui.Box(c).Width(10).Height(10).Radius(5).Background(pal.Amber)
+			DrawPrecisionLED(c, pal.Amber, 12)
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "未检测到可用的官方 google-colab-cli").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 				detail := "打开开箱体检向导即可一键安装并绑定你的 Google Colab 账号。"
@@ -327,12 +413,21 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 			rem := max(0, int(math.Ceil(time.Until(*rt.Phase.NextRetryAt).Seconds())))
 			countdown = fmt.Sprintf("暂未有货，%02d:%02d 后自动再试下一轮", rem/60, rem%60)
 		}
-		ui.Row(c).FillWidth().Padding(10, 14).Radius(12).
-			Background(WithAlpha(pal.Amber, 0.13)).Border(1, WithAlpha(pal.Amber, 0.34)).
+		ui.Row(c).FillWidth().Padding(11, 14, 11, 18).Radius(14).
+			Background(WithAlpha(pal.Amber, 0.11)).
+			Border(1, WithAlpha(pal.Amber, 0.30)).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			DrawOver(func(p *ui.Painter, r ui.Rect) {
+				drawBannerSemanticBar(p, r, pal.Amber)
+			}).
 			AlignItems(ui.Center).Gap(10).Children(func() {
-			ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Amber)
-			ui.Textf(c, "自动排队拿卡中 · 第 %d/%d 轮（%s）· %s", rt.Phase.QueueAttempt, rt.Phase.QueueMax, rt.Phase.TargetsSummary, countdown).
-				FontSize(13).FontWeight(500).FontFeatures("tnum").TextColor(pal.TextPrimary).Grow(1)
+			DrawPrecisionLED(c, pal.Amber, 12)
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Textf(c, "自动排队抢卡中 · 第 %d/%d 轮（%s）· %s", rt.Phase.QueueAttempt, rt.Phase.QueueMax, rt.Phase.TargetsSummary, countdown).
+					FontSize(13).FontWeight(500).FontFeatures("tnum").TextColor(pal.TextPrimary)
+				ui.Text(c, "可以关掉或切走窗口去忙别的，顶部菜单栏会实时显示进度，抢到/装好或未抢到都会弹窗响铃通知你。").
+					FontSize(11.5).TextColor(pal.TextMuted)
+			})
 			SmallActionButton(c, pal, "取消排队", &pal.Coral, false, func() {
 				m.Svc.CancelQueue(acc.ID)
 			})
@@ -349,10 +444,15 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		} else {
 			detail = fmt.Sprintf("%s（还剩约 %d 分钟）", detail, remMin)
 		}
-		ui.Column(c).FillWidth().Padding(12, 14).Gap(8).Radius(12).
-			Background(WithAlpha(pal.Coral, 0.12)).Border(1, WithAlpha(pal.Coral, 0.34)).Children(func() {
+		ui.Column(c).FillWidth().Padding(12, 14, 12, 18).Gap(8).Radius(14).
+			Background(WithAlpha(pal.Coral, 0.10)).
+			Border(1, WithAlpha(pal.Coral, 0.30)).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			DrawOver(func(p *ui.Painter, r ui.Rect) {
+				drawBannerSemanticBar(p, r, pal.Coral)
+			}).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
-				ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Coral).Shrink(0)
+				DrawPrecisionLED(c, pal.Coral, 12)
 				ui.Column(c).Grow(1).Gap(2).Children(func() {
 					ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 					ui.Text(c, detail).FontSize(12).TextColor(pal.TextMuted)
@@ -379,10 +479,15 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		if title == "" {
 			title = "刚才这次申请没成功"
 		}
-		ui.Column(c).FillWidth().Padding(12, 14).Gap(8).Radius(12).
-			Background(WithAlpha(pal.Amber, 0.12)).Border(1, WithAlpha(pal.Amber, 0.35)).Children(func() {
+		ui.Column(c).FillWidth().Padding(12, 14, 12, 18).Gap(8).Radius(14).
+			Background(WithAlpha(pal.Amber, 0.10)).
+			Border(1, WithAlpha(pal.Amber, 0.30)).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			DrawOver(func(p *ui.Painter, r ui.Rect) {
+				drawBannerSemanticBar(p, r, pal.Amber)
+			}).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
-				ui.Box(c).Width(8).Height(8).Radius(4).Background(pal.Amber).Shrink(0)
+				DrawPrecisionLED(c, pal.Amber, 12)
 				ui.Column(c).Grow(1).Gap(2).Children(func() {
 					ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 					ui.Text(c, rt.LastError).FontSize(12).TextColor(pal.TextMuted)
@@ -420,25 +525,10 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		})
 	}
 
-	// Smart dual-mode Home:
-	// - Offline idle -> clean zero-config Launchpad (one click to run, no empty dashed cards)
-	// - Running / Starting / Queuing / Stopping -> live 4x2 Bento telemetry console
-	if !rt.Phase.IsRunning() && !rt.Phase.IsQueuing() && !rt.Phase.IsBusy() {
-		m.centeredWorkbench(c, func() {
-			m.renderHomeIdleLaunchpad(c, pal, acc, rt)
-			accounts := m.Svc.AccountsSnapshot()
-			hasExtra := len(rt.Sessions) > 0 || rt.CURatePerHour > 0
-			if len(accounts) >= 2 || hasExtra {
-				m.renderLiveAccountsTable(c, pal, acc)
-			}
-		})
-		return
-	}
-
-	// 4x2 Mole Bento Grid (Live Console when Active/Queuing/Starting)
+	// Unified 4x2 Precision Bento Dashboard (both Idle and Active) + Bottom Live Session Table
 	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(14).Children(func() {
 		m.bentoHealthCU(c, pal, acc, rt)
-		m.bentoVRAM(c, pal, rt)
+		m.bentoVRAM(c, pal, acc, rt)
 		m.bentoGPU(c, pal, acc, rt)
 		m.bentoWorkload(c, pal, acc, rt)
 		m.bentoBatteryQuota(c, pal, acc, rt)
@@ -446,23 +536,6 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		m.bentoStrategy(c, pal, acc)
 		m.bentoQuickIntegrations(c, pal, acc, rt)
 	})
-
-	// Optional inline drawer when user clicks "换 H3 版本 / 调整方案 / 配置接入" while running
-	if m.ShowRunningDrawer {
-		m.centeredWorkbench(c, func() {
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "当前任务方案与工具配置").FontSize(15).FontWeight(600).TextColor(pal.TextPrimary)
-				ui.Spacer(c)
-				SmallActionButton(c, pal, "收起 ▴", nil, false, func() {
-					m.ShowRunningDrawer = false
-				})
-			})
-			if acc.DeployRecipe == core.RecipeLLMProxy {
-				m.renderIntegrationsPanel(c, pal, acc, rt)
-			}
-			m.renderHomeOptionsDrawer(c, pal, acc, rt)
-		})
-	}
 
 	// Bottom Live Sessions & Multi-Account Table
 	m.renderLiveAccountsTable(c, pal, acc)
@@ -505,7 +578,7 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 		}
 	}
 
-	BentoCard(c, pal, 176, func() {
+	card := PrecisionCard(c, pal, 16, 16, func() {
 		TileHeader(c, pal, pal.Emerald, "算力状态", acc.Tier.ShortBadge(), nil)
 
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
@@ -550,65 +623,155 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 			})
 		} else {
 			blocked := isCooling || !m.Svc.CLIInstalled
-			label := "▶  一键启动"
-			if core.EffectiveAutoQueue(acc) {
-				label = "▶  一键开机"
+			label := "一键开机并运行"
+			if acc.DeployRecipe == core.RecipeNone {
+				label = "一键开机"
 			}
-			bg := pal.NavPillBg
-			fg := pal.NavPillText
-			if blocked {
-				bg = pal.SubtleBg
-				fg = pal.TextFaint
-			}
-			el := ui.Row(c).FillWidth().Padding(7, 10).Radius(8).Background(bg).Justify(ui.Center)
-			if !blocked {
-				el.OnClick(func() { m.Svc.DeployNow(acc.ID) })
-			}
-			el.Children(func() {
-				ui.Text(c, label).FontSize(12.5).FontWeight(600).TextColor(fg)
+			CompactAmberLaunchButton(c, pal, label, blocked, func() {
+				m.Svc.DeployNow(acc.ID)
 			})
 		}
+	}).Height(176).Gap(8)
+	if rt.Phase.IsRunning() {
+		card.Draw(func(p *ui.Painter, r ui.Rect) {
+			p.FillRadialGradient(r, ui.RadialGradient{
+				Center: ui.Point{X: 0.78, Y: 0.32},
+				Radius: max(r.W, r.H) * 0.72,
+				Stops: []ui.GradientStop{
+					{Color: WithAlpha(pal.Emerald, 0.06), At: 0.0},
+					{Color: WithAlpha(pal.Emerald, 0.0), At: 1.0},
+				},
+			}, 16)
+		})
+	}
+}
+
+func (m *MainUI) bentoVRAM(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
+	if rt.Phase.IsRunning() || rt.VRAMTotalMB > 0 {
+		pct := int(math.Round(rt.VRAMRatio() * 100))
+		badge := "未加载"
+		var tint *ui.Color
+		barTint := pal.Emerald
+		if rt.VRAMTotalMB > 0 {
+			if pct >= 94 {
+				badge = "高占用"
+				t := pal.Amber
+				tint = &t
+				barTint = pal.Amber
+			} else {
+				badge = "压力正常"
+			}
+		}
+		BentoCard(c, pal, 176, func() {
+			TileHeader(c, pal, pal.Emerald, "显存", badge, tint)
+			ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
+				if rt.VRAMTotalMB > 0 {
+					ui.Textf(c, "%d", pct).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+					ui.Text(c, "%").FontSize(14).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+				} else {
+					ui.Text(c, "—").FontSize(28).Bold().TextColor(pal.TextPrimary)
+				}
+			})
+			DrawVRAMSegments(c, pal, rt.VRAMRatio(), barTint, 26)
+			ui.Spacer(c)
+			foot := "等待 GPU 分配"
+			if rt.VRAMTotalMB > 0 {
+				foot = fmt.Sprintf("%.1f GB / %.1f GB", float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0)
+			}
+			ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+		})
+		return
+	}
+
+	// Standby mode: compact 2x2 task selector inside Bento Card 2
+	taskBadge := "H3 Flash"
+	taskFoot := "6 步快出片 · 自动装 ComfyUI"
+	badgeTint := pal.Amber
+	switch acc.DeployRecipe {
+	case core.RecipeH3Video:
+		switch acc.H3Variant {
+		case core.H3VariantOriginal:
+			taskBadge = "H3 原版"
+			taskFoot = "31B 满血双权重 · 画质最高"
+		case core.H3VariantFlashGGUF:
+			taskBadge = "轻量 GGUF"
+			taskFoot = fmt.Sprintf("GGUF %s · 24G L4 可跑", acc.H3GGUFQuant)
+		case core.H3VariantCustom:
+			taskBadge = "自定义 H3"
+			taskFoot = "自定义 HF 仓库 / 仅用 Drive"
+		}
+	case core.RecipeComfyUIGeneral:
+		taskBadge = "ComfyUI"
+		taskFoot = "纯净 ComfyUI · 自由装节点"
+	case core.RecipeLLMProxy:
+		taskBadge = "大模型"
+		taskFoot = "自动同步 Claude / Codex / OpenCode"
+		badgeTint = pal.Sky
+	case core.RecipeNone:
+		taskBadge = "纯开机"
+		taskFoot = "纯净裸机环境 · 仅抢卡与守护"
+	}
+
+	flashSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlash
+	origSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal
+	llmSel := acc.DeployRecipe == core.RecipeLLMProxy
+	moreSel := !flashSel && !origSel && !llmSel
+
+	BentoCard(c, pal, 176, func() {
+		TileHeader(c, pal, badgeTint, "当前任务", taskBadge, &badgeTint)
+		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(6).Children(func() {
+			m.bentoTaskChip(c, pal, "H3 Flash 极速版", flashSel, func() {
+				m.selectH3Preset(acc, core.H3VariantFlash)
+			})
+			m.bentoTaskChip(c, pal, "H3 原版 (31B)", origSel, func() {
+				m.selectH3Preset(acc, core.H3VariantOriginal)
+			})
+			m.bentoTaskChip(c, pal, "大模型代理", llmSel, func() {
+				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
+			})
+			m.bentoTaskChip(c, pal, "更多玩法", moreSel, func() {
+				m.ShowHomeOptions = true
+			})
+		})
+		ui.Spacer(c)
+		ui.Text(c, taskFoot).FontSize(12).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
 	})
 }
 
-func (m *MainUI) bentoVRAM(c *ui.Context, pal Palette, rt core.AccountRuntimeState) {
-	pct := int(math.Round(rt.VRAMRatio() * 100))
-	badge := "未加载"
-	var tint *ui.Color
-	barTint := pal.Emerald
-	if rt.VRAMTotalMB > 0 {
-		if pct >= 94 {
-			badge = "高占用"
-			t := pal.Amber
-			tint = &t
-			barTint = pal.Amber
-		} else {
-			badge = "压力正常"
-		}
+func (m *MainUI) bentoTaskChip(c *ui.Context, pal Palette, label string, selected bool, onClick func()) {
+	bg := pal.SubtleBg
+	border := pal.SubtleBorder
+	borderW := float32(1)
+	fw := 500
+	if selected {
+		bg = WithAlpha(pal.Amber, 0.14)
+		border = WithAlpha(pal.Amber, 0.72)
+		borderW = 1.2
+		fw = 600
 	}
-	BentoCard(c, pal, 176, func() {
-		TileHeader(c, pal, pal.Emerald, "显存", badge, tint)
-		ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
-			if rt.VRAMTotalMB > 0 {
-				ui.Textf(c, "%d", pct).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-				ui.Text(c, "%").FontSize(14).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
-			} else {
-				ui.Text(c, "—").FontSize(28).Bold().TextColor(pal.TextPrimary)
-			}
-		})
-		DrawVRAMSegments(c, pal, rt.VRAMRatio(), barTint, 26)
-		ui.Spacer(c)
-		foot := "等待 GPU 分配"
-		if rt.VRAMTotalMB > 0 {
-			foot = fmt.Sprintf("%.1f GB / %.1f GB", float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0)
-		}
-		ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+	el := ui.Row(c).FillWidth().Padding(7, 6).Radius(8).
+		Background(bg).Border(borderW, border).
+		AlignItems(ui.Center).Justify(ui.Center).Cursor(ui.CursorPointer)
+	if !selected && el.Hovered() {
+		el.Background(pal.CardTop).Border(1, pal.CardBorderBottom)
+	}
+	if onClick != nil {
+		el.OnClick(onClick)
+	}
+	el.Children(func() {
+		ui.Text(c, label).FontSize(11.5).FontWeight(fw).TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
 	})
 }
 
 func (m *MainUI) bentoGPU(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
-	badge := acc.PreferredAccelerator.ShortChipLabel()
+	primaryChip := acc.PreferredAccelerator.ShortChipLabel()
+	if targets := core.EffectiveQueueTargets(acc); len(targets) > 0 {
+		primaryChip = targets[0].ShortChipLabel()
+	}
+	estRate := core.EstimatedHourlyCU(primaryChip)
+
+	badge := "待机就绪"
 	var bTint *ui.Color
 	if rt.Phase.IsRunning() {
 		badge = rt.ShortGPUName()
@@ -617,8 +780,15 @@ func (m *MainUI) bentoGPU(c *ui.Context, pal Palette, acc core.AccountProfile, r
 		t := pal.Amber
 		bTint = &t
 	}
-	foot := "当前未计费"
+
+	foot := fmt.Sprintf("%s · 约 %.2f CU/h", acc.GPUStrategy.DisplayName(), estRate)
+	if acc.Tier == core.TierFree {
+		foot = "免费体验池 · 按需排队"
+	}
 	footColor := pal.TextMuted
+	sparkPts := []float64{24, 26, 25, 27, 26, 25, 26}
+	sparkTint := WithAlpha(pal.Amber, 0.52)
+
 	if rt.Phase.IsRunning() {
 		rateStr := "速率待同步"
 		if rt.LastUsageFetchAt != nil || rt.CURatePerHour > 0 {
@@ -629,26 +799,29 @@ func (m *MainUI) bentoGPU(c *ui.Context, pal Palette, acc core.AccountProfile, r
 		} else {
 			foot = "低负载 · " + rateStr
 		}
+		sparkPts = rt.GPUUtilHistory
+		sparkTint = pal.Amber
 	} else if offlineBilling {
 		foot = fmt.Sprintf("其他会话计费 · %.2f CU/h", rt.CURatePerHour)
 		footColor = pal.Amber
-	} else if rt.LastUsageFetchAt == nil {
-		foot = "等待同步用量"
 	}
 
 	BentoCard(c, pal, 176, func() {
 		TileHeader(c, pal, pal.Amber, "GPU", badge, bTint)
-		ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
+		ui.Row(c).AlignItems(ui.End).Gap(5).Children(func() {
 			if rt.Phase.IsRunning() {
 				ui.Textf(c, "%d", rt.GPUUtilPercent).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
 				ui.Text(c, "%").FontSize(14).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
-			} else {
+			} else if offlineBilling {
 				ui.Text(c, "—").FontSize(28).Bold().TextColor(pal.TextPrimary)
+			} else {
+				ui.Text(c, primaryChip).FontSize(28).Bold().TextColor(pal.TextPrimary).MaxLines(1)
+				ui.Text(c, "首选").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 			}
 		})
-		DrawSparkline(c, pal, rt.GPUUtilHistory, pal.Amber, 30)
+		DrawSparkline(c, pal, sparkPts, sparkTint, 30)
 		ui.Spacer(c)
-		ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(footColor).MaxLines(1)
+		ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(footColor).MaxLines(1).Ellipsis("…")
 	})
 }
 
@@ -660,48 +833,70 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 	tint := WorkloadColor(pal, kind)
 
 	BentoCard(c, pal, 176, func() {
-		if kind == core.WorkloadLLM {
-			TileHeader(c, pal, tint, "上下文", fmt.Sprintf("%dK", rt.ContextLimit/1024), nil)
-			ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
-				if rt.Phase.IsRunning() && rt.ServerHealthy {
-					ui.Text(c, core.FormatTokens(rt.PromptTokens)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-					ui.Text(c, "tok").FontSize(13.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
-				} else {
-					ui.Text(c, "—").FontSize(28).Bold().TextColor(pal.TextPrimary)
+		if acc.DeployRecipe == core.RecipeLLMProxy || kind == core.WorkloadLLM {
+			ctxBadge := fmt.Sprintf("%dK", rt.ContextLimit/1024)
+			if rt.Phase.IsRunning() {
+				TileHeader(c, pal, pal.Sky, "上下文", ctxBadge, nil)
+				ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
+					if rt.ServerHealthy {
+						ui.Text(c, core.FormatTokens(rt.PromptTokens)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+						ui.Text(c, "tok").FontSize(13.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+					} else {
+						ui.Text(c, "启动中").FontSize(25).Bold().TextColor(pal.TextPrimary)
+					}
+				})
+				prog := 0.0
+				if rt.ServerHealthy {
+					prog = rt.ContextRatio()
 				}
-			})
-			prog := 0.0
-			if rt.ServerHealthy {
-				prog = rt.ContextRatio()
+				ui.Box(c).Height(4)
+				DrawHorizonBar(c, pal, prog, pal.Sky, 8)
+				ui.Spacer(c)
+				foot := "等待模型服务在线"
+				if rt.ServerHealthy {
+					foot = fmt.Sprintf("已用 %d%% · %s KV · #%d", int(math.Round(rt.ContextRatio()*100)), rt.KVQuant, max(0, rt.LastTaskID))
+				}
+				ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+			} else {
+				TileHeader(c, pal, pal.Sky, "大模型代理", ctxBadge, nil)
+				ui.Row(c).AlignItems(ui.End).Gap(5).Children(func() {
+					ui.Text(c, "已就绪").FontSize(25).Bold().TextColor(pal.TextPrimary)
+					ui.Textf(c, ":%d", acc.RemoteServicePort).FontSize(13).FontFeatures("tnum").TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+				})
+				ui.Box(c).Height(4)
+				DrawHorizonBar(c, pal, 0.85, WithAlpha(pal.Sky, 0.85), 8)
+				ui.Spacer(c)
+				ui.Text(c, "开机自动同步编程工具").FontSize(12).TextColor(pal.TextMuted).MaxLines(1)
 			}
-			ui.Box(c).Height(4)
-			DrawHorizonBar(c, pal, prog, tint, 8)
-			ui.Spacer(c)
-			foot := "等待模型服务在线"
-			if rt.ServerHealthy {
-				foot = fmt.Sprintf("已用 %d%% · %s KV · #%d", int(math.Round(rt.ContextRatio()*100)), rt.KVQuant, max(0, rt.LastTaskID))
-			}
-			ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
 		} else if acc.DeployRecipe.IsVideoComfy() || kind == core.WorkloadVideo {
 			title := "视频部署与队列"
-			badge := acc.H3Variant.DisplayName()
+			badge := "纯云端"
 			var bTint *ui.Color
-			if acc.DeployRecipe == core.RecipeComfyUIGeneral {
-				badge = "ComfyUI"
-			}
-			if rt.DeployRunning {
-				title = "部署进度"
-				a := pal.Amber
-				bTint = &a
-			} else if rt.Phase.IsRunning() && rt.RenderedVideoCount > 0 {
-				badge = fmt.Sprintf("已出 %d 条", rt.RenderedVideoCount)
-				e := pal.Emerald
-				bTint = &e
-			} else if rt.Phase.IsRunning() && rt.ServerHealthy {
+			if acc.UseGoogleDrive {
+				badge = "Drive 存片"
 				e := pal.Emerald
 				bTint = &e
 			}
-			TileHeader(c, pal, tint, title, badge, bTint)
+			if rt.Phase.IsRunning() {
+				badge = acc.H3Variant.DisplayName()
+				if acc.DeployRecipe == core.RecipeComfyUIGeneral {
+					badge = "ComfyUI"
+				}
+				bTint = nil
+				if rt.DeployRunning {
+					title = "部署进度"
+					a := pal.Amber
+					bTint = &a
+				} else if rt.RenderedVideoCount > 0 {
+					badge = fmt.Sprintf("已出 %d 条", rt.RenderedVideoCount)
+					e := pal.Emerald
+					bTint = &e
+				} else if rt.ServerHealthy {
+					e := pal.Emerald
+					bTint = &e
+				}
+			}
+			TileHeader(c, pal, pal.Violet, title, badge, bTint)
 
 			ui.Row(c).AlignItems(ui.End).Gap(6).Children(func() {
 				if rt.Phase.IsRunning() {
@@ -715,15 +910,23 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 						ui.Text(c, "已就绪").FontSize(25).Bold().TextColor(pal.Emerald)
 						ui.Text(c, ":8188").FontSize(13).FontFeatures("tnum").TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 					} else {
-						ui.Text(c, "待启动").FontSize(25).Bold().TextColor(pal.TextPrimary)
+						ui.Text(c, "启动中").FontSize(25).Bold().TextColor(pal.TextPrimary)
 					}
 				} else {
-					ui.Text(c, "待开机").FontSize(25).Bold().TextColor(pal.TextPrimary)
+					subNote := "本机加密通道"
+					if acc.AutoOpenComfyUI {
+						subNote = "自动开 ComfyUI"
+					}
+					ui.Text(c, "已配齐").FontSize(25).Bold().TextColor(pal.TextPrimary)
+					ui.Text(c, subNote).FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 				}
 			})
 
-			prog := 0.0
+			prog := 0.85
+			barCol := WithAlpha(pal.Violet, 0.85)
 			if rt.Phase.IsRunning() {
+				barCol = pal.Violet
+				prog = 0.0
 				if rt.WorkloadMetricRatio != nil {
 					prog = *rt.WorkloadMetricRatio
 				} else if rt.QueueRunning > 0 {
@@ -733,9 +936,12 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 				}
 			}
 			ui.Box(c).Height(4)
-			DrawHorizonBar(c, pal, prog, tint, 8)
+			DrawHorizonBar(c, pal, prog, barCol, 8)
 			ui.Spacer(c)
-			foot := "开机自动装好模型并打开 ComfyUI"
+			foot := "开机自动装好 · 纯云端暂存"
+			if acc.UseGoogleDrive {
+				foot = "开机自动装好 · 成片直存 Drive"
+			}
 			if rt.Phase.IsRunning() {
 				if rt.WorkloadDetail != "" {
 					foot = rt.WorkloadDetail
@@ -751,8 +957,12 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 			if rt.DetectedServicePort != nil {
 				port = *rt.DetectedServicePort
 			}
-			TileHeader(c, pal, tint, kind.MetricCardTitle(), fmt.Sprintf(":%d", port), nil)
-			ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
+			cardTitle := kind.MetricCardTitle()
+			if acc.DeployRecipe == core.RecipeNone {
+				cardTitle = "运行环境"
+			}
+			TileHeader(c, pal, tint, cardTitle, fmt.Sprintf(":%d", port), nil)
+			ui.Row(c).AlignItems(ui.End).Gap(5).Children(func() {
 				if rt.Phase.IsRunning() {
 					v := rt.WorkloadMetricValue
 					u := rt.WorkloadMetricUnit
@@ -763,10 +973,11 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 					ui.Text(c, v).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
 					ui.Text(c, u).FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 				} else {
-					ui.Text(c, "—").FontSize(28).Bold().TextColor(pal.TextPrimary)
+					ui.Text(c, "裸机就绪").FontSize(25).Bold().TextColor(pal.TextPrimary)
+					ui.Text(c, "纯算力").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 				}
 			})
-			prog := 0.0
+			prog := 0.65
 			if rt.Phase.IsRunning() {
 				if rt.WorkloadMetricRatio != nil {
 					prog = *rt.WorkloadMetricRatio
@@ -777,11 +988,14 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 			ui.Box(c).Height(4)
 			DrawHorizonBar(c, pal, prog, tint, 8)
 			ui.Spacer(c)
-			foot := fmt.Sprintf("%s · CUDA %d 进程", kind.DisplayName(), rt.CUDAProcessCount)
-			if rt.WorkloadDetail != "" {
-				foot = rt.WorkloadDetail
+			foot := "仅抢卡与守护 · 不装额外模型"
+			if rt.Phase.IsRunning() {
+				foot = fmt.Sprintf("%s · CUDA %d 进程", kind.DisplayName(), rt.CUDAProcessCount)
+				if rt.WorkloadDetail != "" {
+					foot = rt.WorkloadDetail
+				}
 			}
-			ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+			ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
 		}
 	})
 }
@@ -794,7 +1008,7 @@ func (m *MainUI) bentoBatteryQuota(c *ui.Context, pal Palette, acc core.AccountP
 	}
 	hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
 
-	BentoCard(c, pal, 176, func() {
+	card := PrecisionCard(c, pal, 16, 16, func() {
 		TileHeader(c, pal, pal.Emerald, "算力续航", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), nil)
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 			if ok {
@@ -824,7 +1038,19 @@ func (m *MainUI) bentoBatteryQuota(c *ui.Context, pal Palette, acc core.AccountP
 			foot = fmt.Sprintf("按 %s 估算 · %s", basis, acc.WorkloadKind.DisplayName())
 		}
 		ui.Text(c, foot).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
-	})
+	}).Height(176).Gap(8)
+	if rt.Phase.IsRunning() {
+		card.Draw(func(p *ui.Painter, r ui.Rect) {
+			p.FillRadialGradient(r, ui.RadialGradient{
+				Center: ui.Point{X: 0.78, Y: 0.45},
+				Radius: max(r.W, r.H) * 0.72,
+				Stops: []ui.GradientStop{
+					{Color: WithAlpha(pal.Emerald, 0.06), At: 0.0},
+					{Color: WithAlpha(pal.Emerald, 0.0), At: 1.0},
+				},
+			}, 16)
+		})
+	}
 }
 
 func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
@@ -839,7 +1065,7 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 			if enabled {
 				dot = pal.Cyan
 			}
-			ui.Box(c).Width(8).Height(8).Radius(4).Background(dot)
+			DrawPrecisionLED(c, dot, 12)
 			ui.Text(c, "空闲关机").FontSize(13).FontWeight(500).TextColor(pal.TextMuted)
 			ui.Spacer(c)
 			if ui.Switch(c, &enabled).Clicked() || enabled != acc.AutoShutdownEnabled {
@@ -953,14 +1179,10 @@ func (m *MainUI) bentoStrategy(c *ui.Context, pal Palette, acc core.AccountProfi
 			}
 		})
 		ui.Spacer(c)
-		btnTxt := "调整方案与显卡"
-		if m.ShowRunningDrawer {
-			btnTxt = "收起方案抽屉"
-		}
-		ui.Row(c).FillWidth().Padding(6, 10).Radius(8).Background(pal.SubtleBg).AlignItems(ui.Center).OnClick(func() {
-			m.ShowRunningDrawer = !m.ShowRunningDrawer
+		ui.Row(c).FillWidth().Padding(6, 10).Radius(8).Background(pal.SubtleBg).AlignItems(ui.Center).Cursor(ui.CursorPointer).OnClick(func() {
+			m.ShowHomeOptions = !m.ShowHomeOptions
 		}).Children(func() {
-			ui.Text(c, btnTxt).FontSize(12).FontWeight(500).TextColor(pal.TextPrimary)
+			ui.Text(c, "调整显卡与选项").FontSize(12).FontWeight(500).TextColor(pal.TextPrimary)
 			ui.Spacer(c)
 			ui.Text(c, "›").FontSize(14).TextColor(pal.TextMuted)
 		})
@@ -988,8 +1210,8 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 					m.quickCardBtn(c, pal, "开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
 						go m.Svc.OpenComfyUI(acc.ID)
 					})
-					m.quickCardBtn(c, pal, "调整方案", m.ShowRunningDrawer, false, func() {
-						m.ShowRunningDrawer = !m.ShowRunningDrawer
+					m.quickCardBtn(c, pal, "更多玩法", m.ShowHomeOptions, false, func() {
+						m.ShowHomeOptions = true
 					})
 				})
 				ui.Row(c).FillWidth().Gap(7).Children(func() {
@@ -1032,20 +1254,24 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 				syncLabel := "配置接入"
 				if allSynced {
 					syncLabel = "✓ 已同步"
-				} else if rt.PublicURL != "" {
+				} else if rt.PublicURL != "" && hasTargets {
 					syncLabel = "同步工具"
 				}
-				m.quickCardBtn(c, pal, syncLabel, allSynced, false, func() {
-					if hasTargets && rt.PublicURL != "" {
+				m.quickCardBtn(c, pal, syncLabel, allSynced || m.ShowHomeOptions, false, func() {
+					if hasTargets && rt.PublicURL != "" && !allSynced {
 						go m.Svc.SyncAllEnabledClients(acc.ID, false)
 					} else {
-						m.ShowRunningDrawer = true
+						m.ShowHomeOptions = true
 					}
 				})
 
 				if acc.EnableLLMModule {
 					m.quickCardBtn(c, pal, ">_ Claude", false, !rt.Phase.IsRunning() || rt.PublicURL == "", func() {
 						m.Svc.LaunchClaudeTerminal(acc.ID)
+					})
+				} else if acc.DeployRecipe == core.RecipeNone {
+					m.quickCardBtn(c, pal, "更多玩法", m.ShowHomeOptions, false, func() {
+						m.ShowHomeOptions = true
 					})
 				} else {
 					m.quickCardBtn(c, pal, acc.WorkloadKind.WebUIButtonTitle(), false, !rt.Phase.IsRunning(), func() {
@@ -1106,7 +1332,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 		colAct  float32 = 116
 	)
 
-	ui.Column(c).FillWidth().Padding(18).Gap(10).Radius(16).Background(pal.CardBg).Border(1, pal.CardBorder).Children(func() {
+	PrecisionCard(c, pal, 16, 18, func() {
 		ui.Row(c).FillWidth().Gap(10).Padding(0, 6).AlignItems(ui.Center).Children(func() {
 			ui.Row(c).Grow(1).MinWidth(220).Gap(10).AlignItems(ui.Center).Children(func() {
 				ui.Textf(c, "账号与活跃会话 (%d)", len(accounts)).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
@@ -1116,11 +1342,11 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 					})
 				}
 			})
-			ui.Text(c, "硬件与形态").FontSize(12).FontWeight(500).TextColor(pal.TextFaint).Width(colHW).MaxLines(1)
-			ui.Text(c, "显存占用").FontSize(12).FontWeight(500).TextColor(pal.TextFaint).Width(colVRAM).MaxLines(1)
-			ui.Text(c, "CU 余额").FontSize(12).FontWeight(500).TextColor(pal.TextFaint).Width(colCU).TextAlign(ui.End).MaxLines(1)
-			ui.Text(c, "消耗速率").FontSize(12).FontWeight(500).TextColor(pal.TextFaint).Width(colRate).TextAlign(ui.End).MaxLines(1)
-			ui.Text(c, "快捷操作").FontSize(12).FontWeight(500).TextColor(pal.TextFaint).Width(colAct).TextAlign(ui.End).MaxLines(1)
+			ui.Text(c, "硬件与形态").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colHW).MaxLines(1)
+			ui.Text(c, "显存占用").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colVRAM).MaxLines(1)
+			ui.Text(c, "CU 余额").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colCU).TextAlign(ui.End).MaxLines(1)
+			ui.Text(c, "消耗速率").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colRate).TextAlign(ui.End).MaxLines(1)
+			ui.Text(c, "快捷操作").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colAct).TextAlign(ui.End).MaxLines(1)
 		})
 
 		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
@@ -1148,7 +1374,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 				ui.Row(c).Grow(1).MinWidth(220).Gap(10).AlignItems(ui.Center).OnClick(func() {
 					m.Svc.SelectAccount(accCopy.ID)
 				}).Children(func() {
-					ui.Box(c).Width(9).Height(9).Radius(4.5).Background(dotCol).Shrink(0)
+					DrawPrecisionLED(c, dotCol, 12)
 					ui.Column(c).Grow(1).Gap(2).Children(func() {
 						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 							ui.Text(c, accCopy.DisplayName).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
@@ -1268,7 +1494,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 				})
 			}
 		}
-	})
+	}).Gap(10)
 }
 
 func stringsContainsTrimmed(s string) bool {

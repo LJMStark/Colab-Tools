@@ -6,7 +6,7 @@
 
 **One-click H3 video model deployment, polite GPU queueing, and auto-shutdown money saver for Google Colab (macOS & Windows).**
 
-No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (or any custom weight) and click Start · Smart Google Drive copy & real-time output backup · Also switches cleanly to LLM proxy mode for coding tools.
+No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (or any custom weight) and click Start · Smart Google Drive copy & real-time output backup · No babysitting: live queue progress in the menu bar, plus sound & popup notifications when allocated, ready, or stopped · Also switches cleanly to LLM proxy mode for coding tools.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [Download Latest](https://github.com/LJMStark/Colab-Tools/releases/latest) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
@@ -86,8 +86,8 @@ Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大
 
 ### Option 1: Download Prebuilt App (Recommended)
 1. Grab the archive for your OS from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest):
-   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.10-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
-   - **Windows (x64)**: `Colab-Tools-v0.3.10-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
+   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.11-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
+   - **Windows (x64)**: `Colab-Tools-v0.3.11-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
 2. Finish the 3-step setup wizard, then on the **Home** tab simply click **Start & Run** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
 
 > **Signature notes:** Community builds are self-signed. On macOS, right-click → **Open** (or `xattr -cr "/Applications/Colab Tools.app"`). On Windows SmartScreen, click **More info → Run anyway**.

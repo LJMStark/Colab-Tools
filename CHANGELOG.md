@@ -3,6 +3,24 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.11] - 2026-11-26
+
+### Changed
+- **深色暖石墨 4×2 Bento 统一仪表盘美学重构（Dark Warm-Graphite 4×2 Bento Unified Console）**:
+  - 待机与运行态实现 **4×2 Bento 网格完全同构**与零空洞占位（主窗口默认深色主题 `dark`，兼容浅色模式切换）；
+  - 升级双层金属高光 `PrecisionCard`、发光微 LED 指示灯、全套矢量 SVG 工具栏图标，并将任务方案、显卡策略与定时预约等参数面板收纳至居中 `ui.Overlay` 悬浮卡片中。
+- **客观统一的 GPU 自动降级顺位（Objective GPU Auto-Fallback Priority）**:
+  - 依据客观硬件规格与点数性价比将 **G4（96GB GDDR7 Blackwell）** 置为默认首选：
+  - **H3 Flash 极速版 / 大模型代理 / 通用 ComfyUI / 纯开机**：统一按 **`G4 → A100 → L4`** 顺位自动降级；
+  - **H3 原版（31B）**：严格仅在 **`G4 → A100 → H100`** 大显存卡间降级，不再盲目降级至 24GB L4；
+  - **轻量 GGUF**：省点优先按 **`L4 → G4 → A100`** 顺位自动尝试。
+
+### Added
+- **免盯守抢卡提醒闭环（Hands-Free Queue & Notification Loop）**:
+  - **顶部菜单栏实时战报**：实时显示 `抢卡 1/5` / `部署中` / `1 GPU` / `未抢到`，排队横幅同步提示可随时关掉或切走窗口去忙别的；
+  - **全节点带声弹窗必达通知**：抢卡成功、ComfyUI 装好就绪、排队耗尽未抢到以及异常/限流停下均会触发带提示音弹窗通知，配合 macOS 原生通知与 Dock 图标弹跳提醒兜底；
+  - **设置页「测试通知」按钮**：可在设置页随时一键测试弹窗与响铃提醒是否正常生效。
+
 ## [0.3.10] - 2026-11-26
 
 ### Changed

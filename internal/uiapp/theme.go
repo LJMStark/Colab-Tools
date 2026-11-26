@@ -54,95 +54,134 @@ func TrayIconPNG(running bool) []byte {
 }
 
 type Palette struct {
-	Dark         bool
-	BgTop        ui.Color
-	BgBottom     ui.Color
-	CardBg            ui.Color
-	CardBorder        ui.Color
-	SubtleBg          ui.Color
-	SubtleBorder      ui.Color
-	DisabledBg        ui.Color
-	DisabledBorder    ui.Color
-	RowSelectedBg     ui.Color
-	RowSelectedBorder ui.Color
-	RowDivider        ui.Color
-	Divider           ui.Color
-	TextPrimary  ui.Color
-	TextMuted    ui.Color
-	TextFaint    ui.Color
-	NavBg        ui.Color
-	NavPillBg    ui.Color
-	NavPillText  ui.Color
-	Emerald      ui.Color
-	Amber        ui.Color
-	Sky          ui.Color
-	Coral        ui.Color
-	Cyan         ui.Color
-	Violet       ui.Color
-	PrimaryBtnBg ui.Color
-	PrimaryBtnFg ui.Color
+	Dark                   bool
+	BgTop                  ui.Color
+	BgBottom               ui.Color
+	CardBg                 ui.Color
+	CardTop                ui.Color
+	CardBottom             ui.Color
+	CardBorder             ui.Color
+	CardBorderTop          ui.Color
+	CardBorderBottom       ui.Color
+	CardInnerTopLight      ui.Color
+	CardShadow             ui.Color
+	RecessedBg             ui.Color
+	RecessedBorder         ui.Color
+	RecessedInnerShadow    ui.Color
+	SubtleBg               ui.Color
+	SubtleBorder           ui.Color
+	DisabledBg             ui.Color
+	DisabledBorder         ui.Color
+	RowSelectedBg          ui.Color
+	RowSelectedBorder      ui.Color
+	RowDivider             ui.Color
+	Divider                ui.Color
+	TextPrimary            ui.Color
+	TextMuted              ui.Color
+	TextFaint              ui.Color
+	NavBg                  ui.Color
+	NavPillBg              ui.Color
+	NavPillText            ui.Color
+	Emerald                ui.Color
+	Amber                  ui.Color
+	Sky                    ui.Color
+	Coral                  ui.Color
+	Cyan                   ui.Color
+	Violet                 ui.Color
+	PrimaryBtnBg           ui.Color
+	PrimaryBtnFg           ui.Color
+	PrimaryBtnTop          ui.Color
+	PrimaryBtnBottom       ui.Color
+	PrimaryBtnBorderTop    ui.Color
+	PrimaryBtnBorderBottom ui.Color
 }
 
 func PaletteFor(dark bool) Palette {
 	if dark {
 		return Palette{
-			Dark:         true,
-			BgTop:        ui.RGB(38, 34, 26),
-			BgBottom:     ui.RGB(28, 26, 23),
-			CardBg:            ui.RGBA(255, 255, 255, 0.048),
-			CardBorder:        ui.RGBA(255, 255, 255, 0.095),
-			SubtleBg:          ui.RGBA(255, 255, 255, 0.068),
-			SubtleBorder:      ui.RGBA(255, 255, 255, 0.115),
-			DisabledBg:        ui.RGBA(255, 255, 255, 0.025),
-			DisabledBorder:    ui.RGBA(255, 255, 255, 0.055),
-			RowSelectedBg:     ui.RGBA(255, 255, 255, 0.06),
-			RowSelectedBorder: ui.RGBA(255, 255, 255, 0.115),
-			RowDivider:        ui.RGBA(255, 255, 255, 0.055),
-			Divider:           ui.RGBA(255, 255, 255, 0.09),
-			TextPrimary:  ui.RGBA(255, 255, 255, 0.94),
-			TextMuted:    ui.RGBA(255, 255, 255, 0.64),
-			TextFaint:    ui.RGBA(255, 255, 255, 0.44),
-			NavBg:        ui.RGBA(255, 255, 255, 0.075),
-			NavPillBg:    ui.RGBA(255, 255, 255, 0.96),
-			NavPillText:  ui.RGB(24, 22, 20),
-			Emerald:      ui.RGB(48, 209, 132),
-			Amber:        ui.RGB(245, 166, 35),
-			Sky:          ui.RGB(90, 168, 255),
-			Coral:        ui.RGB(240, 96, 86),
-			Cyan:         ui.RGB(72, 200, 220),
-			Violet:       ui.RGB(154, 118, 250),
-			PrimaryBtnBg: ui.RGB(245, 166, 35),
-			PrimaryBtnFg: ui.RGB(22, 20, 18),
+			Dark:                   true,
+			BgTop:                  ui.RGB(34, 32, 28),
+			BgBottom:               ui.RGB(24, 23, 20),
+			CardBg:                 ui.RGB(40, 38, 34),
+			CardTop:                ui.RGB(45, 42, 37),
+			CardBottom:             ui.RGB(36, 34, 30),
+			CardBorder:             ui.RGBA(255, 255, 255, 0.095),
+			CardBorderTop:          ui.RGBA(255, 255, 255, 0.14),
+			CardBorderBottom:       ui.RGBA(255, 255, 255, 0.04),
+			CardInnerTopLight:      ui.RGBA(255, 255, 255, 0.09),
+			CardShadow:             ui.RGBA(0, 0, 0, 0.34),
+			RecessedBg:             ui.RGB(23, 21, 18),
+			RecessedBorder:         ui.RGBA(255, 255, 255, 0.06),
+			RecessedInnerShadow:    ui.RGBA(0, 0, 0, 0.36),
+			SubtleBg:               ui.RGBA(255, 255, 255, 0.055),
+			SubtleBorder:           ui.RGBA(255, 255, 255, 0.10),
+			DisabledBg:             ui.RGBA(255, 255, 255, 0.025),
+			DisabledBorder:         ui.RGBA(255, 255, 255, 0.055),
+			RowSelectedBg:          ui.RGBA(255, 255, 255, 0.06),
+			RowSelectedBorder:      ui.RGBA(255, 255, 255, 0.115),
+			RowDivider:             ui.RGBA(255, 255, 255, 0.055),
+			Divider:                ui.RGBA(255, 255, 255, 0.09),
+			TextPrimary:            ui.RGBA(252, 250, 245, 0.94),
+			TextMuted:              ui.RGBA(252, 250, 245, 0.64),
+			TextFaint:              ui.RGBA(252, 250, 245, 0.42),
+			NavBg:                  ui.RGBA(255, 255, 255, 0.075),
+			NavPillBg:              ui.RGBA(252, 250, 245, 0.94),
+			NavPillText:            ui.RGB(24, 22, 20),
+			Emerald:                ui.RGB(48, 209, 132),
+			Amber:                  ui.RGB(245, 166, 35),
+			Sky:                    ui.RGB(90, 168, 255),
+			Coral:                  ui.RGB(240, 96, 86),
+			Cyan:                   ui.RGB(72, 200, 220),
+			Violet:                 ui.RGB(154, 118, 250),
+			PrimaryBtnBg:           ui.RGB(245, 166, 35),
+			PrimaryBtnFg:           ui.RGB(22, 20, 18),
+			PrimaryBtnTop:          ui.RGB(255, 184, 61),
+			PrimaryBtnBottom:       ui.RGB(235, 142, 10),
+			PrimaryBtnBorderTop:    ui.RGB(255, 226, 163),
+			PrimaryBtnBorderBottom: ui.RGB(182, 105, 0),
 		}
 	}
 	return Palette{
-		Dark:         false,
-		BgTop:        ui.RGB(246, 245, 243),
-		BgBottom:     ui.RGB(238, 239, 242),
-		CardBg:            ui.RGBA(255, 255, 255, 0.88),
-		CardBorder:        ui.RGBA(18, 22, 30, 0.095),
-		SubtleBg:          ui.RGBA(18, 22, 30, 0.058),
-		SubtleBorder:      ui.RGBA(18, 22, 30, 0.11),
-		DisabledBg:        ui.RGBA(18, 22, 30, 0.025),
-		DisabledBorder:    ui.RGBA(18, 22, 30, 0.055),
-		RowSelectedBg:     ui.RGBA(217, 130, 12, 0.085),
-		RowSelectedBorder: ui.RGBA(217, 130, 12, 0.24),
-		RowDivider:        ui.RGBA(18, 22, 30, 0.055),
-		Divider:           ui.RGBA(18, 22, 30, 0.09),
-		TextPrimary:  ui.RGB(22, 24, 29),
-		TextMuted:    ui.RGBA(22, 24, 29, 0.64),
-		TextFaint:    ui.RGBA(22, 24, 29, 0.44),
-		NavBg:        ui.RGBA(18, 22, 30, 0.065),
-		NavPillBg:    ui.RGB(34, 37, 44),
-		NavPillText:  ui.RGB(255, 255, 255),
-		Emerald:      ui.RGB(16, 164, 98),
-		Amber:        ui.RGB(217, 130, 12),
-		Sky:          ui.RGB(36, 118, 228),
-		Coral:        ui.RGB(218, 66, 56),
-		Cyan:         ui.RGB(16, 148, 174),
-		Violet:       ui.RGB(122, 82, 230),
-		PrimaryBtnBg: ui.RGB(245, 166, 35),
-		PrimaryBtnFg: ui.RGB(22, 20, 18),
+		Dark:                   false,
+		BgTop:                  ui.RGB(238, 236, 231),
+		BgBottom:               ui.RGB(228, 226, 220),
+		CardBg:                 ui.RGBA(252, 251, 248, 0.95),
+		CardTop:                ui.RGBA(255, 254, 251, 0.96),
+		CardBottom:             ui.RGBA(248, 247, 243, 0.94),
+		CardBorder:             ui.RGBA(24, 22, 18, 0.11),
+		CardBorderTop:          ui.RGBA(255, 255, 255, 0.92),
+		CardBorderBottom:       ui.RGBA(24, 22, 18, 0.12),
+		CardInnerTopLight:      ui.RGBA(255, 255, 255, 0.90),
+		CardShadow:             ui.RGBA(24, 22, 18, 0.07),
+		RecessedBg:             ui.RGB(234, 231, 224),
+		RecessedBorder:         ui.RGBA(24, 22, 18, 0.09),
+		RecessedInnerShadow:    ui.RGBA(24, 22, 18, 0.08),
+		SubtleBg:               ui.RGBA(24, 22, 18, 0.045),
+		SubtleBorder:           ui.RGBA(24, 22, 18, 0.09),
+		DisabledBg:             ui.RGBA(24, 22, 18, 0.025),
+		DisabledBorder:         ui.RGBA(24, 22, 18, 0.055),
+		RowSelectedBg:          ui.RGBA(224, 132, 8, 0.08),
+		RowSelectedBorder:      ui.RGBA(224, 132, 8, 0.24),
+		RowDivider:             ui.RGBA(24, 22, 18, 0.055),
+		Divider:                ui.RGBA(24, 22, 18, 0.09),
+		TextPrimary:            ui.RGB(25, 24, 22),
+		TextMuted:              ui.RGBA(25, 24, 22, 0.62),
+		TextFaint:              ui.RGBA(25, 24, 22, 0.42),
+		NavBg:                  ui.RGBA(24, 22, 18, 0.065),
+		NavPillBg:              ui.RGB(34, 32, 29),
+		NavPillText:            ui.RGB(252, 250, 245),
+		Emerald:                ui.RGB(16, 164, 98),
+		Amber:                  ui.RGB(224, 132, 8),
+		Sky:                    ui.RGB(36, 118, 228),
+		Coral:                  ui.RGB(218, 66, 56),
+		Cyan:                   ui.RGB(16, 148, 174),
+		Violet:                 ui.RGB(122, 82, 230),
+		PrimaryBtnBg:           ui.RGB(245, 166, 35),
+		PrimaryBtnFg:           ui.RGB(22, 20, 18),
+		PrimaryBtnTop:          ui.RGB(255, 178, 46),
+		PrimaryBtnBottom:       ui.RGB(232, 138, 6),
+		PrimaryBtnBorderTop:    ui.RGB(255, 222, 148),
+		PrimaryBtnBorderBottom: ui.RGB(186, 108, 0),
 	}
 }
 
@@ -244,15 +283,17 @@ func SmallActionButton(c *ui.Context, pal Palette, label string, tint *ui.Color,
 }
 
 func BentoCard(c *ui.Context, pal Palette, height float32, fn func()) {
-	el := ui.Column(c).FillWidth().Padding(16).Gap(8).Radius(16).Background(pal.CardBg).Border(1, pal.CardBorder)
+	el := PrecisionCard(c, pal, 16, 16, nil).Gap(8)
 	if height > 0 {
 		el.Height(height)
 	}
-	el.Children(fn)
+	if fn != nil {
+		el.Children(fn)
+	}
 }
 
 func SectionCard(c *ui.Context, pal Palette, title, rightNote string, fn func()) {
-	ui.Column(c).FillWidth().Padding(18).Gap(12).Radius(16).Background(pal.CardBg).Border(1, pal.CardBorder).Children(func() {
+	PrecisionCard(c, pal, 16, 18, func() {
 		if title != "" {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 				ui.Text(c, title).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
@@ -262,13 +303,15 @@ func SectionCard(c *ui.Context, pal Palette, title, rightNote string, fn func())
 				}
 			})
 		}
-		fn()
-	})
+		if fn != nil {
+			fn()
+		}
+	}).Gap(12)
 }
 
 func TileHeader(c *ui.Context, pal Palette, dot ui.Color, title, badge string, badgeTint *ui.Color) {
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(7).Children(func() {
-		ui.Box(c).Width(8).Height(8).Radius(4).Background(dot).Shrink(0)
+		DrawPrecisionLED(c, dot, 12)
 		ui.Text(c, title).FontSize(13).FontWeight(500).TextColor(pal.TextMuted).MaxLines(1)
 		ui.Spacer(c)
 		if badge != "" {

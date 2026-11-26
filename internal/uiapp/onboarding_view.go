@@ -19,7 +19,7 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 				// Top header
 				ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(14).Children(func() {
 					if appIconBitmap != nil {
-						ui.Image(c, appIconBitmap).Width(48).Height(48).Radius(12).Clip()
+						ui.Image(c, appIconBitmap).Width(48).Height(48).Radius(12).Clip().Border(1, pal.SubtleBorder)
 					}
 					ui.Column(c).Grow(1).Gap(3).Children(func() {
 						ui.Text(c, "欢迎使用 Colab Tools").FontSize(22).Bold().TextColor(pal.TextPrimary)
@@ -36,24 +36,28 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 					for i, title := range steps {
 						stepNum := i + 1
 						active := m.Svc.OnboardingStep == stepNum
-						bg := pal.SubtleBg
-						border := pal.SubtleBorder
+						bg := pal.RecessedBg
+						border := pal.RecessedBorder
 						fg := pal.TextMuted
 						if active {
-							bg = WithAlpha(pal.Amber, 0.14)
-							border = WithAlpha(pal.Amber, 0.65)
+							bg = WithAlpha(pal.Amber, 0.11)
+							border = WithAlpha(pal.Amber, 0.58)
 							fg = pal.TextPrimary
 						}
-						ui.Row(c).FillWidth().Padding(10, 14).Radius(11).Background(bg).Border(1, border).Justify(ui.Center).AlignItems(ui.Center).Gap(8).OnClick(func() {
+						el := ui.Row(c).FillWidth().Padding(10, 14).Radius(11).Background(bg).Border(1, border).Justify(ui.Center).AlignItems(ui.Center).Gap(8).OnClick(func() {
 							m.Svc.OnboardingStep = stepNum
-						}).Children(func() {
-							numBg := pal.TextFaint
+						})
+						if active {
+							el.InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight)
+						} else {
+							el.InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow)
+						}
+						el.Children(func() {
 							if active {
-								numBg = pal.Amber
+								DrawPrecisionLED(c, pal.Amber, 12)
+							} else {
+								DrawPrecisionLED(c, pal.TextFaint, 10)
 							}
-							ui.Row(c).Width(20).Height(20).Radius(10).Background(numBg).Justify(ui.Center).AlignItems(ui.Center).Children(func() {
-								ui.Textf(c, "%d", stepNum).FontSize(11).Bold().TextColor(pal.PrimaryBtnFg)
-							})
 							ui.Text(c, title).FontSize(13).FontWeight(600).TextColor(fg)
 						})
 					}
@@ -88,11 +92,11 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 				ui.Text(c, "本机运行环境体检").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
 				ui.Text(c, "Colab Tools 完全基于 Google 官方 google-colab-cli 驱动，不私自绕过任何官方接口。").FontSize(12.5).TextColor(pal.TextMuted)
 			})
-			lbl := "↻ 重新体检"
+			lbl := "重新体检"
 			if m.Svc.IsCheckingEnv {
 				lbl = "检测中…"
 			}
-			SmallActionButton(c, pal, lbl, nil, m.Svc.IsCheckingEnv || m.Svc.IsInstallingCLI, func() {
+			onboardingRefreshButton(c, pal, lbl, m.Svc.IsCheckingEnv || m.Svc.IsInstallingCLI, func() {
 				go m.Svc.RefreshEnvironmentCheck()
 			})
 		})
@@ -188,27 +192,27 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 	})
 }
 
-
 func (m *MainUI) doctorRow(c *ui.Context, pal Palette, title string, ok bool, detail string) {
-	ui.Row(c).FillWidth().Padding(12, 14).Radius(11).Background(pal.SubtleBg).AlignItems(ui.Center).Gap(12).Children(func() {
+	ui.Row(c).FillWidth().Padding(12, 14).Radius(12).
+		Background(pal.RecessedBg).
+		Border(1, pal.RecessedBorder).
+		InsetShadow(0, 1, 2, 0, pal.RecessedInnerShadow).
+		AlignItems(ui.Center).Gap(12).Children(func() {
 		dotCol := pal.Amber
 		badgeText := "待完成"
 		if ok {
 			dotCol = pal.Emerald
 			badgeText = "已就绪"
 		}
-		ui.Row(c).Width(22).Height(22).Radius(11).Background(dotCol).Justify(ui.Center).AlignItems(ui.Center).Shrink(0).Children(func() {
-			mark := "!"
-			if ok {
-				mark = "✓"
-			}
-			ui.Text(c, mark).FontSize(12).Bold().TextColor(pal.PrimaryBtnFg)
-		})
+		DrawPrecisionLED(c, dotCol, 14)
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
 			ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 			ui.Text(c, detail).FontSize(12).TextColor(pal.TextMuted)
 		})
-		Badge(c, pal, badgeText, &dotCol)
+		ui.Row(c).Padding(4, 9).Radius(7).Background(pal.CardTop).Border(1, pal.SubtleBorder).Gap(5).AlignItems(ui.Center).Shrink(0).Children(func() {
+			DrawPrecisionLED(c, dotCol, 8)
+			ui.Text(c, badgeText).FontSize(11.5).FontWeight(600).TextColor(pal.TextMuted).MaxLines(1)
+		})
 	})
 }
 
@@ -234,8 +238,8 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 		if len(accounts) > 0 {
 			for _, acc := range accounts {
 				rt := m.Svc.StateFor(acc.ID)
-				ui.Row(c).FillWidth().Padding(12).Radius(11).Background(WithAlpha(pal.Emerald, 0.09)).AlignItems(ui.Center).Gap(10).Children(func() {
-					ui.Box(c).Width(10).Height(10).Radius(5).Background(AccountTagColor(pal, acc.ColorTag))
+				ui.Row(c).FillWidth().Padding(12).Radius(12).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 2, 0, pal.RecessedInnerShadow).AlignItems(ui.Center).Gap(10).Children(func() {
+					DrawPrecisionLED(c, AccountTagColor(pal, acc.ColorTag), 13)
 					ui.Column(c).Grow(1).Gap(2).Children(func() {
 						ui.Textf(c, "%s · %s", acc.DisplayName, acc.Tier.DisplayName()).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 						email := acc.Email
@@ -245,8 +249,10 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 						ui.Text(c, email).FontSize(12).TextColor(pal.TextMuted)
 					})
 					ui.Textf(c, "%.1f CU", rt.CUBalance).FontSize(14).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
-					e := pal.Emerald
-					Badge(c, pal, "已绑定", &e)
+					ui.Row(c).Padding(4, 9).Radius(7).Background(pal.CardTop).Border(1, pal.SubtleBorder).Gap(5).AlignItems(ui.Center).Shrink(0).Children(func() {
+						DrawPrecisionLED(c, pal.Emerald, 8)
+						ui.Text(c, "已绑定").FontSize(11.5).FontWeight(600).TextColor(pal.TextMuted).MaxLines(1)
+					})
 				})
 			}
 			ui.Row(c).FillWidth().Padding(6, 0, 0, 0).Children(func() {
@@ -271,9 +277,9 @@ func (m *MainUI) onboardingStep3Tour(c *ui.Context, pal Palette) {
 		})
 
 		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(12).Children(func() {
-			m.tourTile(c, pal, pal.Violet, "一键部署 H3 视频模型", "默认选「H3 原版」或「H3 Flash 极速版」，也能换轻量 GGUF 或自定义链接；开机自动装好并通过本机加密通道打开 ComfyUI。")
-			m.tourTile(c, pal, pal.Emerald, "跑完自动关机省点数", "视频队列全部生成完就自动倒计时停卡，并去官网再查一次确认停了——再也不用担心忘关机挂一晚白扣几十点。")
-			m.tourTile(c, pal, pal.Amber, "顺位抢卡 + 大模型代理", "热门 A100 / G4 没货时按顺位自动排队，还能约清晨低峰开机；想跑大模型给 Claude / OpenCode 用，切一下模式就行。")
+			m.tourTile(c, pal, "original", pal.Violet, "一键部署 H3 视频模型", "默认选「H3 原版」或「H3 Flash 极速版」，也能换轻量 GGUF 或自定义链接；开机自动装好并通过本机加密通道打开 ComfyUI。")
+			m.tourTile(c, pal, "flash", pal.Emerald, "跑完自动关机省点数", "视频队列全部生成完就自动倒计时停卡，并去官网再查一次确认停了——再也不用担心忘关机挂一晚白扣几十点。")
+			m.tourTile(c, pal, "llm", pal.Amber, "顺位抢卡 + 大模型代理", "热门 A100 / G4 没货时按顺位自动排队，还能约清晨低峰开机；想跑大模型给 Claude / OpenCode 用，切一下模式就行。")
 		})
 
 		ui.Row(c).FillWidth().Padding(8, 0, 0, 0).Children(func() {
@@ -288,10 +294,47 @@ func (m *MainUI) onboardingStep3Tour(c *ui.Context, pal Palette) {
 	})
 }
 
-func (m *MainUI) tourTile(c *ui.Context, pal Palette, tint ui.Color, title, desc string) {
-	ui.Column(c).FillWidth().Padding(16).Gap(8).Radius(13).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).Children(func() {
-		ui.Box(c).Width(28).Height(28).Radius(8).Background(WithAlpha(tint, 0.22)).Border(1, WithAlpha(tint, 0.45))
+func (m *MainUI) tourTile(c *ui.Context, pal Palette, iconKind string, tint ui.Color, title, desc string) {
+	PrecisionCard(c, pal, 14, 16, func() {
+		ScenarioIcon(c, pal, iconKind, tint, true)
 		ui.Text(c, title).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
 		ui.Text(c, desc).FontSize(12).TextColor(pal.TextMuted)
+	}).Gap(10)
+}
+
+func onboardingRefreshButton(c *ui.Context, pal Palette, label string, disabled bool, onClick func()) {
+	el := ui.Row(c).
+		Padding(6, 12).
+		Radius(8).
+		Gap(6).
+		AlignItems(ui.Center).
+		Justify(ui.Center).
+		Shrink(0)
+
+	fg := pal.TextPrimary
+	icCol := pal.TextMuted
+	if disabled {
+		fg = pal.TextFaint
+		icCol = pal.TextFaint
+		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
+	} else {
+		top := pal.CardTop
+		bot := pal.RecessedBg
+		if el.Hovered() {
+			top = top.Mix(ui.RGB(255, 255, 255), 0.06)
+			bot = bot.Mix(pal.CardTop, 0.35)
+		}
+		el.LinearGradient(ui.LinearGradient{From: top, To: bot, Angle: 180}).
+			Border(1, pal.SubtleBorder).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			Shadow(0, 1, 3, 0, pal.CardShadow).
+			Cursor(ui.CursorPointer)
+		if onClick != nil {
+			el.OnClick(onClick)
+		}
+	}
+	el.Children(func() {
+		ToolbarIcon(c, "refresh", 13, icCol)
+		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
 	})
 }

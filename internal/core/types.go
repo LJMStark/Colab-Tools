@@ -651,14 +651,15 @@ func SmartQueueTargets(acc AccountProfile) []AcceleratorOption {
 		return []AcceleratorOption{AccA100, AccL4, AccT4}
 	default: // TierAIUltra, TierColabProPlus
 		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantOriginal {
+			// 31B Original stays strictly on high-VRAM GPUs and never blindly falls back to 24GB L4.
 			return []AcceleratorOption{AccG4, AccA100, AccH100}
 		}
 		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantFlashGGUF {
-			return []AcceleratorOption{AccL4, AccA100}
+			return []AcceleratorOption{AccL4, AccG4, AccA100}
 		}
-		// Default for H3 Flash, General ComfyUI, LLM Proxy, Pure Compute:
-		// try A100 first (reliably available & fast), then G4, then L4 fallback.
-		return []AcceleratorOption{AccA100, AccG4, AccL4}
+		// H3 Flash, General ComfyUI, LLM Proxy, Pure Compute:
+		// prioritize G4 (96GB, ~7 CU/h), then A100 (~12 CU/h), then L4 fallback.
+		return []AcceleratorOption{AccG4, AccA100, AccL4}
 	}
 }
 
@@ -685,10 +686,6 @@ func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, targe
 	case GPUStrategyCustom:
 		return acc.QueueFallbackEnabled, acc.QueueFallbackAfterRounds, acc.QueueFallbackTarget
 	default:
-		// H3 Original prioritizes G4/A100/H100 first, then adds L4 after 2 rounds if scarce.
-		if acc.DeployRecipe == RecipeH3Video && acc.H3Variant == H3VariantOriginal && slices.Contains(acc.Tier.QueueableAccelerators(), AccL4) {
-			return true, 2, AccL4
-		}
 		return false, 2, DefaultFallbackTarget(EffectiveQueueTargets(acc), acc.Tier)
 	}
 }
@@ -737,19 +734,19 @@ func EffectiveIdleTimeoutMinutes(acc AccountProfile, rt AccountRuntimeState) int
 
 // AccountProfile persists a single Google Colab account's preferences.
 type AccountProfile struct {
-	ID                   string              `json:"id"`
-	DisplayName          string              `json:"displayName"`
-	Email                string              `json:"email"`
-	ColorTag             AccountColorTag     `json:"colorTag"`
-	Tier                 SubscriptionTier    `json:"tier"`
-	AuthMode             AccountAuthMode     `json:"authMode"`
-	SessionName          string              `json:"sessionName"`
-	GPUStrategy          GPUStrategyMode     `json:"gpuStrategy,omitempty"`
-	PreferredAccelerator AcceleratorOption   `json:"preferredAccelerator"`
-	HighMem              bool                `json:"highMem"`
-	WorkloadKind         WorkloadKind        `json:"workloadKind"`
-	EnableLLMModule      bool                `json:"enableLLMModule"`
-	EnableHardwareIdle   bool                `json:"enableHardwareIdleFallback"`
+	ID                   string            `json:"id"`
+	DisplayName          string            `json:"displayName"`
+	Email                string            `json:"email"`
+	ColorTag             AccountColorTag   `json:"colorTag"`
+	Tier                 SubscriptionTier  `json:"tier"`
+	AuthMode             AccountAuthMode   `json:"authMode"`
+	SessionName          string            `json:"sessionName"`
+	GPUStrategy          GPUStrategyMode   `json:"gpuStrategy,omitempty"`
+	PreferredAccelerator AcceleratorOption `json:"preferredAccelerator"`
+	HighMem              bool              `json:"highMem"`
+	WorkloadKind         WorkloadKind      `json:"workloadKind"`
+	EnableLLMModule      bool              `json:"enableLLMModule"`
+	EnableHardwareIdle   bool              `json:"enableHardwareIdleFallback"`
 
 	// Built-in Video / H3 One-Click Deployment & Google Drive Sync
 	DeployRecipe          DeployRecipe `json:"deployRecipe,omitempty"`
@@ -987,7 +984,7 @@ func DefaultAppSettings() AppSettings {
 		ManualRefreshDebounceSec: 5,
 		EnableNotifications:      true,
 		HasCompletedOnboarding:   false,
-		ThemePreference:          "system",
+		ThemePreference:          "dark",
 		QueueCooldownsByAccount:  map[string]time.Time{},
 	}
 }

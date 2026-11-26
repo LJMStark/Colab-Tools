@@ -62,20 +62,36 @@ func TestSubscriptionTierAndOfflineHoursEstimation(t *testing.T) {
 	}
 
 	// Smart strategy auto-adapts GPU priority per scenario:
-	// H3 Flash -> A100 -> G4 -> L4; H3 Original -> G4 -> A100 -> H100; GGUF -> L4 -> A100
+	// H3 Flash / ComfyUI / LLM / None -> G4 -> A100 -> L4; H3 Original -> G4 -> A100 -> H100 (no fallback); GGUF -> L4 -> G4 -> A100
 	acc.GPUStrategy = core.GPUStrategyAutoSmart
 	acc.DeployRecipe = core.RecipeH3Video
 	acc.H3Variant = core.H3VariantFlash
-	if got := core.EffectiveQueueTargets(acc); len(got) < 3 || got[0] != core.AccA100 || got[1] != core.AccG4 || got[2] != core.AccL4 {
-		t.Fatalf("expected H3 Flash smart order A100->G4->L4, got %v", got)
+	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
+		t.Fatalf("expected H3 Flash smart order G4->A100->L4, got %v", got)
 	}
+	acc.DeployRecipe = core.RecipeComfyUIGeneral
+	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
+		t.Fatalf("expected General ComfyUI smart order G4->A100->L4, got %v", got)
+	}
+	acc.DeployRecipe = core.RecipeLLMProxy
+	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
+		t.Fatalf("expected LLM Proxy smart order G4->A100->L4, got %v", got)
+	}
+	acc.DeployRecipe = core.RecipeNone
+	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccL4 {
+		t.Fatalf("expected Pure Compute smart order G4->A100->L4, got %v", got)
+	}
+	acc.DeployRecipe = core.RecipeH3Video
 	acc.H3Variant = core.H3VariantOriginal
-	if got := core.EffectiveQueueTargets(acc); len(got) < 3 || got[0] != core.AccG4 || got[1] != core.AccA100 {
+	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccG4 || got[1] != core.AccA100 || got[2] != core.AccH100 {
 		t.Fatalf("expected H3 Original smart order G4->A100->H100, got %v", got)
 	}
+	if fbEnabled, _, _ := core.EffectiveFallback(acc); fbEnabled {
+		t.Fatal("expected EffectiveFallback to stay disabled for H3 Original under auto_smart")
+	}
 	acc.H3Variant = core.H3VariantFlashGGUF
-	if got := core.EffectiveQueueTargets(acc); len(got) < 2 || got[0] != core.AccL4 {
-		t.Fatalf("expected H3 GGUF smart order L4->A100, got %v", got)
+	if got := core.EffectiveQueueTargets(acc); len(got) != 3 || got[0] != core.AccL4 || got[1] != core.AccG4 || got[2] != core.AccA100 {
+		t.Fatalf("expected H3 GGUF smart order L4->G4->A100, got %v", got)
 	}
 
 	// Free tier without paid balance is restricted from SSH/WebUI

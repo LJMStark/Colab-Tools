@@ -66,28 +66,64 @@ func main() {
 		if tray == nil {
 			return
 		}
-		running := svc.RunningAccountCount()
-		bal, _ := svc.TotalBalanceAndRate()
-		_ = tray.SetIcon(uiapp.TrayIconPNG(running > 0), true)
+		st := svc.TrayLiveStatus()
+		_ = tray.SetIcon(uiapp.TrayIconPNG(st.RunningCount > 0), true)
+
+		var title string
+		var tooltip string
+		switch {
+		case st.Queuing:
+			title = fmt.Sprintf(" 抢卡 %d/%d", st.QueueAttempt, st.QueueMax)
+			if st.TargetsSummary != "" {
+				tooltip = fmt.Sprintf("Colab Tools v%s — 正在抢卡第 %d/%d 轮（%s）", app.AppVersion, st.QueueAttempt, st.QueueMax, st.TargetsSummary)
+			} else {
+				tooltip = fmt.Sprintf("Colab Tools v%s — 正在抢卡第 %d/%d 轮", app.AppVersion, st.QueueAttempt, st.QueueMax)
+			}
+		case st.Deploying || st.Starting:
+			if st.Deploying && st.HardwareLabel != "" {
+				title = fmt.Sprintf(" 部署 %s", st.HardwareLabel)
+				tooltip = fmt.Sprintf("Colab Tools v%s — 正在自动部署 %s", app.AppVersion, st.HardwareLabel)
+			} else if st.Deploying {
+				title = " 部署中"
+				tooltip = fmt.Sprintf("Colab Tools v%s — 正在自动部署环境", app.AppVersion)
+			} else if st.HardwareLabel != "" {
+				title = fmt.Sprintf(" 部署 %s", st.HardwareLabel)
+				tooltip = fmt.Sprintf("Colab Tools v%s — 正在开机 %s", app.AppVersion, st.HardwareLabel)
+			} else {
+				title = " 开机中"
+				tooltip = fmt.Sprintf("Colab Tools v%s — 正在申请开机", app.AppVersion)
+			}
+		case st.RunningCount > 0:
+			if st.StatusBarMode == "detailed" {
+				title = fmt.Sprintf(" %d GPU · %.0f CU", st.RunningCount, st.TotalBalance)
+			} else {
+				title = fmt.Sprintf(" %d GPU", st.RunningCount)
+			}
+			tooltip = fmt.Sprintf("Colab Tools v%s — %d 运行中 · %.1f CU", app.AppVersion, st.RunningCount, st.TotalBalance)
+		case st.FocusHasError:
+			title = " 未抢到"
+			if st.FocusErrorText != "" {
+				tooltip = fmt.Sprintf("Colab Tools v%s — 未抢到（%s）", app.AppVersion, st.FocusErrorText)
+			} else {
+				tooltip = fmt.Sprintf("Colab Tools v%s — 上次抢卡未成功", app.AppVersion)
+			}
+		default:
+			if st.StatusBarMode == "detailed" {
+				title = fmt.Sprintf(" %.0f CU", st.TotalBalance)
+			} else {
+				title = ""
+			}
+			tooltip = fmt.Sprintf("Colab Tools v%s — %d 运行中 · %.1f CU", app.AppVersion, st.RunningCount, st.TotalBalance)
+		}
+
 		if runtime.GOOS == "darwin" {
-			switch svc.Settings.StatusBarMode {
-			case "icon_only":
+			if st.StatusBarMode == "icon_only" {
 				tray.SetTitle("")
-			case "detailed":
-				if running > 0 {
-					tray.SetTitle(fmt.Sprintf(" %d GPU · %.0f CU", running, bal))
-				} else {
-					tray.SetTitle(fmt.Sprintf(" %.0f CU", bal))
-				}
-			default:
-				if running > 0 {
-					tray.SetTitle(fmt.Sprintf(" %d GPU", running))
-				} else {
-					tray.SetTitle("")
-				}
+			} else {
+				tray.SetTitle(title)
 			}
 		}
-		tray.SetToolTip(fmt.Sprintf("Colab Tools v%s — %d 运行中 · %.1f CU", app.AppVersion, running, bal))
+		tray.SetToolTip(tooltip)
 	}
 
 	svc.OnOpenMainWin = openMainWindow

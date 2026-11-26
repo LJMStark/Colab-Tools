@@ -121,19 +121,24 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 	}
 
 	ui.Row(c).FillWidth().Padding(12, 16).AlignItems(ui.Center).Gap(8).Children(func() {
-		ui.Box(c).Width(8).Height(8).Radius(4).Background(dotCol).Shrink(0)
+		if appIconBitmap != nil {
+			ui.Image(c, appIconBitmap).Width(20).Height(20).Radius(5).Clip().Shrink(0)
+		}
+		DrawPrecisionLED(c, dotCol, 12)
 		ui.Text(c, "Colab Tools").FontSize(14.5).Bold().TextColor(pal.TextPrimary).MaxLines(1)
-		Badge(c, pal, pill, nil)
+		ui.Row(c).Padding(3, 8).Radius(6).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Shrink(0).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, pill).FontSize(11).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+		})
 		ui.Spacer(c)
 		SmallActionButton(c, pal, "大屏", nil, false, func() {
 			if p.OnOpenMain != nil {
 				p.OnOpenMain(app.SectionStatus)
 			}
 		})
-		SmallActionButton(c, pal, "↻", nil, false, func() {
+		popoverIconButton(c, pal, "refresh", func() {
 			go p.Svc.RefreshAllAccounts(true, false)
 		})
-		SmallActionButton(c, pal, "⚙", nil, false, func() {
+		popoverIconButton(c, pal, "settings", func() {
 			if p.OnOpenMain != nil {
 				p.OnOpenMain(app.SectionSettings)
 			}
@@ -196,7 +201,7 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 				dot = pal.Emerald
 			}
 			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Box(c).Width(8).Height(8).Radius(4).Background(dot)
+				DrawPrecisionLED(c, dot, 11)
 				ui.Column(c).Grow(1).Gap(2).OnClick(func() {
 					p.OverviewMode = false
 					p.Svc.SelectAccount(acc.ID)
@@ -299,7 +304,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 				p.Svc.CancelQueue(acc.ID)
 			})
 		} else {
-			PillButton(c, pal, "▶ 启动", true, !p.Svc.CLIInstalled, func() {
+			popoverLaunchButton(c, pal, "启动", !p.Svc.CLIInstalled, func() {
 				p.Svc.DeployNow(acc.ID)
 			})
 		}
@@ -335,6 +340,11 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 
 	// Quota + active scheme summary
 	hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
+	energyRatio := 0.0
+	if ok {
+		capHours := float64(max(24, acc.Tier.MaxSessionHours()))
+		energyRatio = math.Min(1.0, math.Max(0.05, hrs/capHours))
+	}
 	SectionCard(c, pal, "算力续航与方案", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
@@ -351,6 +361,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 				}
 			})
 		})
+		drawPopoverAmberEnergyBar(c, pal, energyRatio, !ok)
 	})
 
 	// Idle Watchdog + Quick Actions card
@@ -436,5 +447,94 @@ func (p *PopoverUI) renderFooter(c *ui.Context, pal Palette) {
 				p.OnQuit()
 			}
 		})
+	})
+}
+
+func popoverIconButton(c *ui.Context, pal Palette, iconName string, onClick func()) {
+	el := ui.Row(c).
+		Width(28).
+		Height(26).
+		Radius(7).
+		AlignItems(ui.Center).
+		Justify(ui.Center).
+		Shrink(0)
+
+	top := pal.SubtleBg
+	if el.Hovered() {
+		top = pal.CardTop
+	}
+	el.Background(top).
+		Border(1, pal.SubtleBorder).
+		InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight)
+	if onClick != nil {
+		el.Cursor(ui.CursorPointer).OnClick(onClick)
+	}
+	el.Children(func() {
+		ToolbarIcon(c, iconName, 14, pal.TextMuted)
+	})
+}
+
+func popoverLaunchButton(c *ui.Context, pal Palette, label string, disabled bool, onClick func()) {
+	el := ui.Row(c).
+		Height(34).
+		Padding(0, 15).
+		Radius(9).
+		Gap(6).
+		Shrink(0).
+		AlignItems(ui.Center).
+		Justify(ui.Center)
+
+	fg := pal.PrimaryBtnFg
+	if disabled {
+		fg = pal.TextFaint
+		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
+	} else {
+		topCol := pal.PrimaryBtnTop
+		botCol := pal.PrimaryBtnBottom
+		shadowBlur := float32(12)
+		shadowAlpha := float32(0.36)
+		if el.Hovered() {
+			topCol = topCol.Mix(ui.RGB(255, 255, 255), 0.08)
+			botCol = botCol.Mix(ui.RGB(255, 255, 255), 0.06)
+			shadowBlur = 16
+			shadowAlpha = 0.46
+		}
+		el.LinearGradient(ui.LinearGradient{From: topCol, To: botCol, Angle: 180}).
+			Border(1, ui.Color{}).
+			BorderLinearGradient(ui.LinearGradient{From: pal.PrimaryBtnBorderTop, To: pal.PrimaryBtnBorderBottom, Angle: 180}).
+			InsetShadow(0, 1, 0, 0, ui.RGBA(255, 255, 255, 0.48)).
+			Shadow(0, 4, shadowBlur, -2, ui.RGBA(235, 148, 14, shadowAlpha)).
+			Cursor(ui.CursorPointer)
+		if onClick != nil {
+			el.OnClick(onClick)
+		}
+	}
+
+	el.Children(func() {
+		ToolbarIcon(c, "play", 11, fg)
+		ui.Text(c, label).FontSize(13).FontWeight(600).TextColor(fg).MaxLines(1)
+	})
+}
+
+func drawPopoverAmberEnergyBar(c *ui.Context, pal Palette, ratio float64, neutral bool) {
+	prog := float32(math.Min(1.0, math.Max(0.0, ratio)))
+	ui.Box(c).FillWidth().Height(5).Draw(func(p *ui.Painter, r ui.Rect) {
+		rad := r.H / 2
+		p.Fill(r, pal.RecessedBg, rad)
+		p.Stroke(r, pal.RecessedBorder, rad, 0.8)
+		if prog <= 0 {
+			return
+		}
+		w := max(r.H, r.W*prog)
+		fillRect := ui.Rect{X: r.X, Y: r.Y, W: w, H: r.H}
+		if neutral {
+			p.Fill(fillRect, WithAlpha(pal.TextMuted, 0.45), rad)
+			return
+		}
+		p.FillGradient(fillRect, ui.LinearGradient{
+			From:  ui.RGB(245, 158, 11),
+			To:    ui.RGB(255, 209, 120),
+			Angle: 90,
+		}, rad)
 	})
 }

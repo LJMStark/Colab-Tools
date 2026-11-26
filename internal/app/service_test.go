@@ -305,3 +305,126 @@ func TestProvisionAutoSkips400AndEmpty412AndManualCooldownClear(t *testing.T) {
 		t.Fatalf("expected clean beginner defaults after reset, got %+v", resetAcc)
 	}
 }
+
+func TestFailureNotificationsTestNotificationAndTrayLiveStatus(t *testing.T) {
+	svc := NewService(true)
+	svc.Settings.EnableNotifications = false // critical alerts & test notifications must still fire
+	acc := core.NewDefaultAccountProfile("VideoUser", "video@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
+
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.00 compute units\nUsage rate: 2.33/hr\nActive assignments: 1\n"}
+		}
+		if strings.Contains(cmd, "sessions") {
+			return runner.Result{ExitCode: 0, Stdout: "[" + acc.SessionName + "] m-s-pure1 | Hardware: L4 | Shape: Standard | Variant: GPU\n"}
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	type sentNotice struct {
+		title string
+		body  string
+	}
+	var mu sync.Mutex
+	var notices []sentNotice
+	svc.NotifySender = func(title, body string) {
+		mu.Lock()
+		notices = append(notices, sentNotice{title: title, body: body})
+		mu.Unlock()
+	}
+
+	// 1. User cancellation stays silent; all failure endings notify critically
+	svc.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomeTransientError, Code: "CANCELLED", Message: "已取消"})
+	mu.Lock()
+	if len(notices) != 0 {
+		t.Fatalf("cancelled outcome must not notify, got %+v", notices)
+	}
+	mu.Unlock()
+
+	failureCases := []core.ProvisionOutcome{
+		{Kind: core.OutcomeBudgetExhausted, Code: "BUDGET", Message: "已达 5 轮 / 40 分钟合规排队上限，暂未拿到目标卡"},
+		{Kind: core.OutcomeTransientError, Code: "TIMEOUT", Message: "本次申请超时未响应"},
+		{Kind: core.OutcomePrecondition412, Code: "412", Message: "已有运行中机器，请先关机再试"},
+		{Kind: core.OutcomeAuthError, Code: "401", Message: "授权已过期，请重新登录"},
+		{Kind: core.OutcomeRateLimited, Code: "429", Message: "请求偏频繁，先冷静等一下"},
+	}
+	for _, fc := range failureCases {
+		svc.handleProvisionFailure(acc, fc)
+	}
+	mu.Lock()
+	if len(notices) != len(failureCases) {
+		t.Fatalf("expected %d failure notifications, got %d: %+v", len(failureCases), len(notices), notices)
+	}
+	for i, fc := range failureCases {
+		if notices[i].title == "" || notices[i].body != fc.Message {
+			t.Fatalf("unexpected notification[%d]: got %+v want body %q", i, notices[i], fc.Message)
+		}
+	}
+	mu.Unlock()
+
+	// 2. TrayLiveStatus reflects focus error when idle, queuing, deploying, and running
+	stErr := svc.TrayLiveStatus()
+	if !stErr.FocusHasError || stErr.Queuing || stErr.Deploying || stErr.RunningCount != 0 {
+		t.Fatalf("expected FocusHasError in tray status, got %+v", stErr)
+	}
+
+	svc.mu.Lock()
+	rt := svc.Runtime[acc.ID]
+	rt.Phase = core.InstancePhase{Kind: core.PhaseQueuing, QueueAttempt: 2, QueueMax: 5, TargetsSummary: "G4 → A100 → L4"}
+	svc.Runtime[acc.ID] = rt
+	svc.mu.Unlock()
+	stQueue := svc.TrayLiveStatus()
+	if !stQueue.Queuing || stQueue.QueueAttempt != 2 || stQueue.QueueMax != 5 || stQueue.TargetsSummary != "G4 → A100 → L4" {
+		t.Fatalf("expected queuing tray status, got %+v", stQueue)
+	}
+
+	svc.mu.Lock()
+	rt = svc.Runtime[acc.ID]
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveHardware = "G4"
+	rt.DeployRunning = true
+	svc.Runtime[acc.ID] = rt
+	svc.mu.Unlock()
+	stDeploy := svc.TrayLiveStatus()
+	if !stDeploy.Deploying || stDeploy.HardwareLabel != "G4" || stDeploy.RunningCount != 1 {
+		t.Fatalf("expected deploying G4 tray status, got %+v", stDeploy)
+	}
+
+	// 3. SendTestNotification triggers NotifySender & sets toast
+	mu.Lock()
+	notices = nil
+	mu.Unlock()
+	svc.SendTestNotification()
+	mu.Lock()
+	if len(notices) != 1 || notices[0].title != "Colab Tools 提醒测试" || !strings.Contains(notices[0].body, "通知正常") {
+		t.Fatalf("unexpected test notification: %+v", notices)
+	}
+	mu.Unlock()
+	svc.mu.RLock()
+	toast := svc.ToastMessage
+	svc.mu.RUnlock()
+	if !strings.Contains(toast, "已发送测试通知") {
+		t.Fatalf("expected test notification toast, got %q", toast)
+	}
+
+	// 4. handlePostAllocation sends critical notifications with accurate wording for pure-boot vs auto-deploy
+	pureAcc := acc
+	pureAcc.DeployRecipe = core.RecipeNone
+	pureAcc.EnableLLMModule = false
+	pureAcc.WorkloadKind = core.WorkloadGeneral
+	pureAcc.DriveScriptPath = ""
+	mu.Lock()
+	notices = nil
+	mu.Unlock()
+	svc.handlePostAllocation(pureAcc, "L4")
+	mu.Lock()
+	if len(notices) != 1 || notices[0].title != "抢到 L4 了！" || !strings.Contains(notices[0].body, "已开机就绪") {
+		t.Fatalf("unexpected pure-boot post-alloc notice: %+v", notices)
+	}
+	mu.Unlock()
+}

@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.10"
+const AppVersion = "0.3.11"
 
 type MainSection int
 
@@ -111,28 +112,23 @@ func NewService(skipBootstrap bool) *Service {
 		v = vault.New(nil)
 	}
 	s := &Service{
-		Settings:       core.DefaultAppSettings(),
-		Runtime:        map[string]core.AccountRuntimeState{},
-		Insights:       core.NewAllocationInsights(),
-		CLIInstalled:   true,
-		OnboardingStep: 1,
+		Settings:           core.DefaultAppSettings(),
+		Runtime:            map[string]core.AccountRuntimeState{},
+		Insights:           core.NewAllocationInsights(),
+		CLIInstalled:       true,
+		OnboardingStep:     1,
 		queueCancels:       map[string]queueHandle{},
 		refreshing:         map[string]bool{},
 		sshTunnels:         map[string]*exec.Cmd{},
 		sshADCPaths:        map[string]string{},
 		deployWatchCancels: map[string]deployWatchHandle{},
-		OSRunner:       r,
-		Engine:         colab.NewEngine(r, v),
-		Vault:          v,
-		persistChanges: !skipBootstrap,
-		configPath:     core.DefaultConfigPath(),
-		insightsPath:   core.DefaultInsightsPath(),
-		stopLoops:      make(chan struct{}),
-		NotifySender: func(title, body string) {
-			if mygo.App.IsReady() && mygo.NotificationsSupported() {
-				mygo.NewNotification(mygo.NotificationOptions{Title: title, Body: body}).Show()
-			}
-		},
+		OSRunner:           r,
+		Engine:             colab.NewEngine(r, v),
+		Vault:              v,
+		persistChanges:     !skipBootstrap,
+		configPath:         core.DefaultConfigPath(),
+		insightsPath:       core.DefaultInsightsPath(),
+		stopLoops:          make(chan struct{}),
 		ClipboardWriter: func(text string) {
 			if mygo.App.IsReady() {
 				mygo.Clipboard.WriteText(text)
@@ -143,6 +139,36 @@ func NewService(skipBootstrap bool) *Service {
 				_ = mygo.Shell.OpenExternal(u)
 			}
 		},
+	}
+
+	s.NotifySender = func(title, body string) {
+		if skipBootstrap {
+			return
+		}
+		if runtime.GOOS == "darwin" && mygo.App.IsReady() {
+			mygo.App.Dock.Bounce(false)
+		}
+		var showErr error
+		supported := mygo.App.IsReady() && mygo.NotificationsSupported()
+		if supported {
+			n := mygo.NewNotification(mygo.NotificationOptions{
+				Title:  title,
+				Body:   body,
+				Silent: false,
+			})
+			n.OnClick(func() {
+				s.mu.RLock()
+				openFn := s.OnOpenMainWin
+				s.mu.RUnlock()
+				if openFn != nil {
+					openFn(SectionHome, false)
+				}
+			})
+			showErr = n.Show()
+		}
+		if runtime.GOOS == "darwin" && (!supported || showErr != nil) {
+			go sendMacOSAppleScriptNotification(title, body)
+		}
 	}
 
 	if !skipBootstrap {
@@ -335,6 +361,97 @@ func (s *Service) SendNotification(title, body string, critical bool) {
 	if sender != nil {
 		sender(title, body)
 	}
+}
+
+// SendTestNotification triggers a critical desktop alert so users can verify popup and sound delivery.
+func (s *Service) SendTestNotification() {
+	s.SendNotification(
+		"Colab Tools 提醒测试",
+		"通知正常！抢到卡、装好 ComfyUI 或没抢到时都会这样弹窗响铃通知你。",
+		true,
+	)
+	s.ShowToast("已发送测试通知，请留意屏幕右上角弹窗与提示音")
+}
+
+func sanitizeNotificationText(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return strings.TrimSpace(s)
+}
+
+func sendMacOSAppleScriptNotification(title, body string) {
+	script := "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv) sound name \"Glass\"\nend run"
+	cmd := exec.Command("osascript", "-e", script, "--", sanitizeNotificationText(title), sanitizeNotificationText(body))
+	_ = cmd.Run()
+}
+
+// TrayStatusSnapshot summarizes live account phases for the menu bar tray title and tooltip.
+type TrayStatusSnapshot struct {
+	StatusBarMode  string
+	RunningCount   int
+	TotalBalance   float64
+	Queuing        bool
+	QueueAttempt   int
+	QueueMax       int
+	TargetsSummary string
+	Deploying      bool
+	Starting       bool
+	HardwareLabel  string
+	FocusHasError  bool
+	FocusErrorText string
+}
+
+// TrayLiveStatus returns a lock-safe point-in-time snapshot of all accounts for tray updates.
+func (s *Service) TrayLiveStatus() TrayStatusSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	st := TrayStatusSnapshot{
+		StatusBarMode: string(s.Settings.StatusBarMode),
+	}
+	selectedID := s.Settings.SelectedAccountID
+	if selectedID == "" && len(s.Settings.Accounts) > 0 {
+		selectedID = s.Settings.Accounts[0].ID
+	}
+
+	for _, acc := range s.Settings.Accounts {
+		rt := s.Runtime[acc.ID]
+		st.TotalBalance += rt.CUBalance
+		if rt.Phase.IsRunning() {
+			st.RunningCount++
+		}
+		if !st.Queuing && rt.Phase.IsQueuing() {
+			st.Queuing = true
+			st.QueueAttempt = max(1, rt.Phase.QueueAttempt)
+			st.QueueMax = max(1, rt.Phase.QueueMax)
+			st.TargetsSummary = rt.Phase.TargetsSummary
+		}
+		hwLabel := ""
+		if rt.GPUName != "" || rt.ActiveHardware != "" {
+			hwLabel = rt.ShortGPUName()
+		}
+		if !st.Deploying && rt.DeployRunning {
+			st.Deploying = true
+			if hwLabel != "" {
+				st.HardwareLabel = hwLabel
+			}
+		}
+		if !st.Starting && rt.Phase.Kind == core.PhaseStarting {
+			st.Starting = true
+			if st.HardwareLabel == "" && hwLabel != "" {
+				st.HardwareLabel = hwLabel
+			}
+		}
+		if acc.ID == selectedID && !rt.Phase.IsRunning() && rt.LastError != "" {
+			st.FocusHasError = true
+			st.FocusErrorText = rt.LastErrorTitle
+			if st.FocusErrorText == "" {
+				st.FocusErrorText = rt.LastError
+			}
+		}
+	}
+	return st
 }
 
 // Snapshot helpers for thread-safe UI reads
@@ -1095,7 +1212,11 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	if shouldAutoOpenComfy {
 		s.cancelDeployWatcher(acc.ID)
 		go func() {
-			s.SendNotification("ComfyUI 已准备好", fmt.Sprintf("%s 的 %s 已启动，正在通过本机加密通道打开画布", acc.DisplayName, acc.H3Variant.DisplayName()), false)
+			variantLabel := acc.H3Variant.DisplayName()
+			if acc.DeployRecipe == core.RecipeComfyUIGeneral {
+				variantLabel = acc.DeployRecipe.DisplayName()
+			}
+			s.SendNotification("ComfyUI 已装好，正在打开", fmt.Sprintf("%s 的 %s 已启动，正在通过本机加密通道打开画布", acc.DisplayName, variantLabel), true)
 			s.OpenComfyUI(acc.ID)
 		}()
 	}
@@ -1432,22 +1553,32 @@ func (s *Service) handleProvisionFailure(acc core.AccountProfile, outcome core.P
 		return
 	}
 	title := "本次申请未成功，可直接重试"
+	notifyTitle := "开机未成功"
 	action := "retry"
 	switch outcome.Kind {
 	case core.OutcomeRateLimited:
 		title = "Google 提示请求偏频繁，先冷静等一会儿"
+		notifyTitle = "请求偏频繁，先冷静等一下"
 		action = "clear_cooldown"
 	case core.OutcomePrecondition412:
 		title = "已有运行中机器，达到同时开机上限"
+		notifyTitle = "开机未成功：已有旧机在运行"
 		action = "stop_existing"
 	case core.OutcomeAuthError:
 		title = "Google 账号需要重新授权"
+		notifyTitle = "开机未成功：Google 授权已过期"
 		action = "reauth"
 	case core.OutcomeUnsupportedTier400:
 		title = "当前账号暂不支持所选显卡"
+		notifyTitle = "开机未成功：暂不支持所选显卡"
 		action = "retry"
-	case core.OutcomeCapacity503, core.OutcomeBudgetExhausted:
+	case core.OutcomeBudgetExhausted:
+		title = "没抢到卡，排队已结束"
+		notifyTitle = "没抢到卡，排队已结束"
+		action = "retry"
+	case core.OutcomeCapacity503:
 		title = "热门显卡暂时没货"
+		notifyTitle = "没抢到卡，热门显卡暂时没货"
 		action = "retry"
 	}
 
@@ -1478,9 +1609,11 @@ func (s *Service) handleProvisionFailure(acc core.AccountProfile, outcome core.P
 	}
 
 	s.ShowToast(outcome.Message)
-	if outcome.Kind == core.OutcomeRateLimited {
-		s.SendNotification("Colab Tools 保护暂停", outcome.Message, true)
+	notifyBody := outcome.Message
+	if strings.TrimSpace(notifyBody) == "" {
+		notifyBody = "请打开主控制台查看详细原因"
 	}
+	s.SendNotification(notifyTitle, notifyBody, true)
 }
 
 // ClearCooldown lets the user manually clear a cooldown lock or error banner once they have switched cards or fixed the cause.
@@ -1534,7 +1667,18 @@ func (s *Service) ResetAccountToRecommendedDefaults(accountID string) {
 
 func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string) {
 	estRate := core.EstimatedHourlyCU(hardware)
-	s.SendNotification("Colab 实例已就绪", fmt.Sprintf("%s 已分配 %s（约 %.2f CU/h）", acc.DisplayName, hardware, estRate), false)
+	hwTitle := strings.TrimSpace(hardware)
+	if hwTitle == "" {
+		hwTitle = "云端显卡"
+	}
+	willAutoDeploy := acc.DeployRecipe.IsVideoComfy() ||
+		acc.EnableLLMModule ||
+		(acc.WorkloadKind != core.WorkloadGeneral && strings.TrimSpace(acc.DriveScriptPath) != "")
+	notifyBody := fmt.Sprintf("%s 已开机就绪（约 %.2f CU/h），可以开始使用", acc.DisplayName, estRate)
+	if willAutoDeploy {
+		notifyBody = fmt.Sprintf("%s 已开机（约 %.2f CU/h），正在自动装好环境，完成后会自动打开", acc.DisplayName, estRate)
+	}
+	s.SendNotification(fmt.Sprintf("抢到 %s 了！", hwTitle), notifyBody, true)
 	// Always settle transitional PhaseStarting / PhaseQueuing via authoritative server fetch
 	if !s.refreshAccount(acc.ID, true, true, true) {
 		usage, sessions, err := s.Engine.FetchUsageAndSessions(context.Background(), acc)

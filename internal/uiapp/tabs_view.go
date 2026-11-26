@@ -323,7 +323,7 @@ func (m *MainUI) renderIntegrationsPanel(c *ui.Context, pal Palette, acc core.Ac
 	SectionCard(c, pal, "编程工具接入（开机后自动安全同步，不改你原本的官方订阅）", "", func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "勾选你平时用的工具，大模型开机后自动写入待机渠道（写前 0600 备份、不存明文密钥）。").FontSize(12).TextColor(pal.TextMuted).Grow(1)
-			SmallActionButton(c, pal, "↻ 重新检测", nil, false, func() {
+			neutralPrecisionButton(c, pal, nil, "refresh", "重新检测", false, func() {
 				m.Svc.RefreshClientDetection()
 				m.Svc.ShowToast("已完成本机编程工具探测")
 			})
@@ -544,14 +544,14 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 
 			ui.Column(c).FillWidth().Gap(8).Padding(6, 0).Children(func() {
 				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-					ui.Box(c).Width(10).Height(10).Radius(5).Background(AccountTagColor(pal, accCopy.ColorTag))
+					DrawPrecisionLED(c, AccountTagColor(pal, accCopy.ColorTag), 13)
 					ui.Column(c).Grow(1).Gap(2).Children(func() {
 						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 							ui.Text(c, accCopy.DisplayName).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
-							Badge(c, pal, accCopy.Tier.DisplayName(), nil)
+							recessedStatusPill(c, pal, nil, accCopy.Tier.DisplayName())
 							if isSel {
-								s := pal.Sky
-								Badge(c, pal, "当前使用", &s)
+								e := pal.Emerald
+								recessedStatusPill(c, pal, &e, "当前使用")
 							}
 						})
 						email := accCopy.Email
@@ -727,15 +727,10 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				ui.Text(c, "界面外观").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 				ui.Text(c, "默认跟随系统深浅色自动切换").FontSize(12).TextColor(pal.TextMuted)
 			})
-			ui.Row(c).Gap(6).Children(func() {
+			ui.Row(c).Padding(3).Radius(9).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Gap(2).Shrink(0).Children(func() {
 				for _, o := range [][2]string{{"system", "跟随系统"}, {"dark", "深色"}, {"light", "浅色"}} {
 					k, lbl := o[0], o[1]
-					var tint *ui.Color
-					if m.Svc.Settings.ThemePreference == k {
-						t := pal.Amber
-						tint = &t
-					}
-					SmallActionButton(c, pal, lbl, tint, false, func() {
+					segmentedOptionPill(c, pal, lbl, m.Svc.Settings.ThemePreference == k, func() {
 						m.Svc.UpdateSettings(func(s *core.AppSettings) { s.ThemePreference = k })
 					})
 				}
@@ -749,7 +744,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				ui.Text(c, "顶部菜单栏状态显示").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 				ui.Text(c, "控制顶部菜单栏图标旁是否显示运行卡数与点数（macOS）").FontSize(12).TextColor(pal.TextMuted)
 			})
-			ui.Row(c).Gap(6).Children(func() {
+			ui.Row(c).Padding(3).Radius(9).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Gap(2).Shrink(0).Children(func() {
 				cur := m.Svc.Settings.StatusBarMode
 				if cur == "" {
 					cur = core.StatusBarCompact
@@ -763,12 +758,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 					{core.StatusBarDetailed, "详细"},
 				} {
 					k, lbl := o.mode, o.lbl
-					var tint *ui.Color
-					if cur == k {
-						t := pal.Amber
-						tint = &t
-					}
-					SmallActionButton(c, pal, lbl, tint, false, func() {
+					segmentedOptionPill(c, pal, lbl, cur == k, func() {
 						m.Svc.UpdateSettings(func(s *core.AppSettings) { s.StatusBarMode = k })
 					})
 				}
@@ -778,10 +768,13 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
 		notif := m.Svc.Settings.EnableNotifications
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "桌面通知提醒").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
-				ui.Text(c, "开机就绪、队列跑完与自动关机时发通知提醒").FontSize(12).TextColor(pal.TextMuted)
+				ui.Text(c, "抢到卡、装好 ComfyUI、未抢到卡或即将自动关机时弹窗响铃提醒").FontSize(12).TextColor(pal.TextMuted)
+			})
+			SmallActionButton(c, pal, "测试通知", nil, false, func() {
+				go m.Svc.SendTestNotification()
 			})
 			if ui.Switch(c, &notif).Clicked() || notif != m.Svc.Settings.EnableNotifications {
 				m.Svc.UpdateSettings(func(s *core.AppSettings) { s.EnableNotifications = notif })
@@ -813,12 +806,12 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 			})
 			if m.Svc.CLIInstalled {
 				e := pal.Emerald
-				Badge(c, pal, "正常", &e)
+				recessedStatusPill(c, pal, &e, "正常")
 			} else {
 				a := pal.Amber
-				Badge(c, pal, "需安装", &a)
+				recessedStatusPill(c, pal, &a, "需安装")
 			}
-			SmallActionButton(c, pal, "↻ 重新体检", nil, m.Svc.IsCheckingEnv, func() {
+			neutralPrecisionButton(c, pal, nil, "refresh", "重新体检", m.Svc.IsCheckingEnv, func() {
 				go m.Svc.RefreshEnvironmentCheck()
 			})
 			SmallActionButton(c, pal, "开箱向导", nil, false, func() {
@@ -832,11 +825,13 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 		rt := m.Svc.StateFor(acc.ID)
 		SectionCard(c, pal, "高级选项与一键重置", "平时不用动，折腾自定义脚本或排障时再展开", func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
-				SmallActionButton(c, pal, "恢复小白推荐默认", &pal.Emerald, false, func() {
+				e := pal.Emerald
+				neutralPrecisionButton(c, pal, &e, "", "恢复小白推荐默认", false, func() {
 					m.Svc.ResetAccountToRecommendedDefaults(acc.ID)
 				})
 				if (rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(time.Now())) || rt.LastError != "" {
-					SmallActionButton(c, pal, "解除冷静等待 / 清空报错", &pal.Amber, false, func() {
+					a := pal.Amber
+					neutralPrecisionButton(c, pal, &a, "", "解除冷静等待 / 清空报错", false, func() {
 						m.Svc.ClearCooldown(acc.ID)
 					})
 				}
@@ -905,13 +900,15 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 	SectionCard(c, pal, "", "", func() {
 		ui.Row(c).FillWidth().Gap(14).AlignItems(ui.Center).Children(func() {
 			if appIconBitmap != nil {
-				ui.Image(c, appIconBitmap).Width(48).Height(48).Radius(12).Clip()
+				ui.Image(c, appIconBitmap).Width(48).Height(48).Radius(12).Clip().Border(1, pal.SubtleBorder)
 			}
-			ui.Column(c).Grow(1).Gap(3).Children(func() {
+			ui.Column(c).Grow(1).Gap(4).Children(func() {
 				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, "Colab Tools").FontSize(16).Bold().TextColor(pal.TextPrimary)
-					Badge(c, pal, "v"+app.AppVersion, &pal.Amber)
-					Badge(c, pal, "macOS & Windows", &pal.Sky)
+					a := pal.Amber
+					recessedStatusPill(c, pal, &a, "v"+app.AppVersion)
+					s := pal.Sky
+					recessedStatusPill(c, pal, &s, "macOS & Windows")
 				})
 				ui.Text(c, "全调用 Google 官方 google-colab-cli · 纯 Go 零依赖跨平台桌面控制台").FontSize(12).TextColor(pal.TextMuted)
 			})
@@ -929,5 +926,101 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				m.Svc.OpenColabPayPage()
 			})
 		})
+	})
+}
+
+func recessedStatusPill(c *ui.Context, pal Palette, dotCol *ui.Color, label string) {
+	ui.Row(c).
+		Padding(4, 9).
+		Radius(7).
+		Background(pal.RecessedBg).
+		Border(1, pal.RecessedBorder).
+		InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).
+		Gap(5).
+		AlignItems(ui.Center).
+		Shrink(0).
+		Children(func() {
+			if dotCol != nil {
+				DrawPrecisionLED(c, *dotCol, 9)
+			}
+			ui.Text(c, label).FontSize(11.5).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+		})
+}
+
+func neutralPrecisionButton(c *ui.Context, pal Palette, dotCol *ui.Color, iconName, label string, disabled bool, onClick func()) {
+	el := ui.Row(c).
+		Padding(6, 12).
+		Radius(8).
+		Gap(6).
+		AlignItems(ui.Center).
+		Justify(ui.Center).
+		Shrink(0)
+
+	fg := pal.TextPrimary
+	if disabled {
+		fg = pal.TextFaint
+		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
+	} else {
+		top := pal.CardTop
+		bot := pal.RecessedBg
+		if el.Hovered() {
+			top = top.Mix(ui.RGB(255, 255, 255), 0.06)
+			bot = bot.Mix(pal.CardTop, 0.35)
+		}
+		el.LinearGradient(ui.LinearGradient{From: top, To: bot, Angle: 180}).
+			Border(1, pal.SubtleBorder).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			Shadow(0, 1, 3, 0, pal.CardShadow).
+			Cursor(ui.CursorPointer)
+		if onClick != nil {
+			el.OnClick(onClick)
+		}
+	}
+
+	el.Children(func() {
+		if dotCol != nil && !disabled {
+			DrawPrecisionLED(c, *dotCol, 10)
+		}
+		if iconName != "" {
+			icCol := pal.TextMuted
+			if disabled {
+				icCol = pal.TextFaint
+			}
+			ToolbarIcon(c, iconName, 13, icCol)
+		}
+		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
+	})
+}
+
+func segmentedOptionPill(c *ui.Context, pal Palette, label string, active bool, onClick func()) {
+	el := ui.Row(c).
+		Padding(5, 11).
+		Radius(6.5).
+		Gap(5).
+		AlignItems(ui.Center).
+		Justify(ui.Center).
+		Shrink(0)
+
+	fg := pal.TextMuted
+	weight := 500
+	if active {
+		fg = pal.TextPrimary
+		weight = 600
+		el.Background(pal.CardTop).
+			Border(1, pal.SubtleBorder).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			Shadow(0, 1, 2, 0, pal.CardShadow)
+	} else if el.Hovered() {
+		fg = pal.TextPrimary
+		el.Background(WithAlpha(pal.CardTop, 0.45))
+	}
+	if onClick != nil {
+		el.Cursor(ui.CursorPointer).OnClick(onClick)
+	}
+	el.Children(func() {
+		if active {
+			DrawPrecisionLED(c, pal.Amber, 8)
+		}
+		ui.Text(c, label).FontSize(12).FontWeight(weight).TextColor(fg).MaxLines(1)
 	})
 }
