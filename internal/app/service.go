@@ -25,7 +25,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.14"
+const AppVersion = "0.3.15"
 
 // tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
 type tunnelStderrBuffer struct {
@@ -1123,6 +1123,13 @@ func (s *Service) refreshAccount(accountID string, force, silent, settleBusy boo
 	s.mu.Unlock()
 	if closedRec != nil {
 		s.recordHistory(*closedRec)
+		if closedRec.ShutdownReason == core.ShutdownExternalOrLost || closedRec.ShutdownReason == core.ShutdownCapReached {
+			hwLbl := strings.TrimSpace(closedRec.Hardware)
+			if hwLbl == "" {
+				hwLbl = "云端机器"
+			}
+			s.SendNotification("云端机器已被 Google 回收停机", fmt.Sprintf("%s 的 %s 已停止运行（非本软件关机），可在「记录」查看详情", acc.DisplayName, hwLbl), true)
+		}
 	}
 	s.notifyUI()
 
@@ -1391,6 +1398,8 @@ func (s *Service) applyServerSnapshotLocked(
 		if settleBusy || !rt.Phase.IsBusy() {
 			rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
 		}
+		rt.LastUnexpectedStopMsg = ""
+		rt.QueueStartedAt = time.Time{}
 		rt.ActiveEndpoint = primary.Endpoint
 		rt.ActiveHardware = primary.Hardware
 		s.Runtime[accountID] = rt
@@ -1400,6 +1409,19 @@ func (s *Service) applyServerSnapshotLocked(
 	if prevEndpoint != "" {
 		rec := buildClosedSessionRecordLocked(acc, &rt, prevEndpoint, prevHardware, prevGPUName, prevUptime, usage, shutdownHint, now)
 		closedRec = &rec
+		if shutdownHint == "" {
+			hwLbl := strings.TrimSpace(rec.Hardware)
+			if hwLbl == "" {
+				hwLbl = "云端显卡"
+			}
+			if rec.ShutdownReason == core.ShutdownCapReached {
+				rt.LastUnexpectedStopMsg = fmt.Sprintf("刚才的 %s 在 %s 达到单次运行时长上限自动停机，可在「记录」查看账单", hwLbl, now.Format("15:04"))
+			} else {
+				rt.LastUnexpectedStopMsg = fmt.Sprintf("刚才的 %s 在 %s 被 Google 服务端回收停机（非本软件关机），点右侧可立即重开", hwLbl, now.Format("15:04"))
+			}
+		} else {
+			rt.LastUnexpectedStopMsg = ""
+		}
 	}
 
 	if settleBusy || (!rt.Phase.IsBusy() && !rt.Phase.IsQueuing()) {
@@ -1410,6 +1432,8 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.GPUName = ""
 	rt.VRAMUsedMB = 0
 	rt.VRAMTotalMB = 0
+	rt.RAMUsedMB = 0
+	rt.RAMTotalMB = 0
 	rt.GPUUtilPercent = 0
 	rt.SessionUptimeSec = 0
 	rt.PublicURL = ""
@@ -1453,6 +1477,10 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	}
 	rt.VRAMUsedMB = tel.VRAMUsedMB
 	rt.VRAMTotalMB = tel.VRAMTotalMB
+	if tel.RAMTotalMB > 0 {
+		rt.RAMUsedMB = tel.RAMUsedMB
+		rt.RAMTotalMB = tel.RAMTotalMB
+	}
 	if tel.GPUUtil != nil {
 		rt.GPUUtilPercent = *tel.GPUUtil
 		rt.AppendTelemetrySample(*tel.GPUUtil, rt.VRAMRatio())
@@ -2023,6 +2051,10 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 		h.targetsSummary = lastTargetsSummary
 		s.queueCancels[acc.ID] = h
 		cur := s.Runtime[acc.ID]
+		if cur.QueueStartedAt.IsZero() {
+			cur.QueueStartedAt = startedAt
+		}
+		cur.LastUnexpectedStopMsg = ""
 		cur.QueueInFlight = true
 		cur.Phase = core.InstancePhase{
 			Kind:            core.PhaseQueuing,
@@ -2400,6 +2432,16 @@ func (s *Service) ClearAccountError(accountID string) {
 	rt.LastErrorAction = ""
 	rt.LastErrorRaw = ""
 	rt.LastAllocHadShortage = false
+	rt.LastUnexpectedStopMsg = ""
+	s.Runtime[accountID] = rt
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
+func (s *Service) ClearUnexpectedStopNotice(accountID string) {
+	s.mu.Lock()
+	rt := s.Runtime[accountID]
+	rt.LastUnexpectedStopMsg = ""
 	s.Runtime[accountID] = rt
 	s.mu.Unlock()
 	s.notifyUI()
@@ -2862,6 +2904,13 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 	s.mu.Unlock()
 	if closedRec != nil {
 		s.recordHistory(*closedRec)
+		if closedRec.ShutdownReason == core.ShutdownExternalOrLost || closedRec.ShutdownReason == core.ShutdownCapReached {
+			hwLbl := strings.TrimSpace(closedRec.Hardware)
+			if hwLbl == "" {
+				hwLbl = "云端机器"
+			}
+			s.SendNotification("云端机器已被 Google 回收停机", fmt.Sprintf("%s 的 %s 已停止运行（非本软件关机），可在「记录」查看详情", acc.DisplayName, hwLbl), true)
+		}
 	}
 	s.notifyUI()
 	if isRunning {
@@ -3522,7 +3571,7 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 		acc := &s.Settings.Accounts[i]
 		rt := s.Runtime[acc.ID]
 
-		if rt.Phase.IsQueuing() {
+		if rt.Phase.IsQueuing() || rt.Phase.IsRunning() || rt.Phase.Kind == core.PhaseStarting {
 			needsRepaint = true
 		}
 

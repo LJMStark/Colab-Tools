@@ -100,6 +100,8 @@ func makeDemoService(section app.MainSection, onboarding, idleHome bool) *app.Se
 	rt1.GPUName = "NVIDIA A100-SXM4-80GB"
 	rt1.VRAMUsedMB = 46899
 	rt1.VRAMTotalMB = 81920
+	rt1.RAMUsedMB = 18432
+	rt1.RAMTotalMB = 85504
 	rt1.GPUUtilPercent = 86
 	rt1.GPUUtilHistory = []float64{42, 68, 84, 92, 88, 76, 85, 91, 89, 82, 88, 86, 84}
 	rt1.SessionUptimeSec = 1*3600 + 18*60
@@ -558,6 +560,30 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if !openTester.HasText("连接中…") {
 		t.Fatalf("expected 连接中… on MainUI when ComfyOpening=true: %q", openTester.Texts())
 	}
+
+	// 7. Top Power Hero Strip: clear offline/online power indicator + HH:MM:SS stopwatch + machine/RAM + available time + Google reclaim banner
+	offSvc := makeDemoService(app.SectionHome, false, true)
+	offAccID := offSvc.Settings.SelectedAccountID
+	offRT := offSvc.Runtime[offAccID]
+	offRT.LastUnexpectedStopMsg = "刚才的 L4 在 20:48 被 Google 服务端回收停机（非本软件关机），点右侧可立即重开"
+	offSvc.Runtime[offAccID] = offRT
+	offUI := uiapp.NewMainUI(offSvc)
+	offUI.ForceTheme = "dark"
+	offTester := ui.NewTester(offUI.View, 1160, 820)
+	if !offTester.HasText("已关机") || !offTester.HasText("点击开机") || !offTester.HasText("00:00:00") || !offTester.HasText("未分配机器") || !offTester.HasText("预计可用时间") || !offTester.HasText("上次云端机器已被 Google 自动回收停机") {
+		t.Fatalf("missing offline power hero strip or reclaim banner elements: %q", offTester.Texts())
+	}
+	if offTester.HasText("待机就绪") || offTester.HasText("已配齐") {
+		t.Fatalf("offline dashboard must not show misleading 待机就绪/已配齐 labels: %q", offTester.Texts())
+	}
+
+	runHeroSvc := makeDemoService(app.SectionHome, false, false)
+	runHeroUI := uiapp.NewMainUI(runHeroSvc)
+	runHeroUI.ForceTheme = "dark"
+	runHeroTester := ui.NewTester(runHeroUI.View, 1160, 820)
+	if !runHeroTester.HasText("已开机") || !runHeroTester.HasText("01:18:00") || !runHeroTester.HasText("本轮可用时间") || !runHeroTester.HasText("内存 18.0/84 GB") {
+		t.Fatalf("missing running power hero strip stopwatch/RAM/available-time elements: %q", runHeroTester.Texts())
+	}
 	openPop := uiapp.NewPopoverUI(openSvc)
 	openPop.ForceTheme = "dark"
 	openPopTester := ui.NewTester(openPop.View, 420, 620)
@@ -784,5 +810,20 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		promptUI.PreviewMode = true
 		promptUI.ForceTheme = "dark"
 		renderPNG(t, promptUI.View, 1160, 760, filepath.Join(qaDir, "qa-drive-auth-modal-dark.png"))
+
+		reclaimSvc := makeDemoService(app.SectionHome, false, true)
+		rAccID := reclaimSvc.Settings.SelectedAccountID
+		rRT := reclaimSvc.Runtime[rAccID]
+		rRT.LastUnexpectedStopMsg = "刚才的 L4 在 20:48 被 Google 服务端回收停机（非本软件关机），点右侧可立即重开"
+		reclaimSvc.Runtime[rAccID] = rRT
+		reclaimUI := uiapp.NewMainUI(reclaimSvc)
+		reclaimUI.PreviewMode = true
+		reclaimUI.ForceTheme = "dark"
+		renderPNG(t, reclaimUI.View, 1160, 860, filepath.Join(qaDir, "qa-power-strip-offline-dark.png"))
+
+		runHeroQA := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, false))
+		runHeroQA.PreviewMode = true
+		runHeroQA.ForceTheme = "dark"
+		renderPNG(t, runHeroQA.View, 1160, 860, filepath.Join(qaDir, "qa-power-strip-running-dark.png"))
 	}
 }

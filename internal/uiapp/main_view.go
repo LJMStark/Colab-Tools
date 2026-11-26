@@ -518,13 +518,13 @@ func (m *MainUI) topRightPill(pal Palette) (ui.Color, string) {
 	}
 	running := m.Svc.RunningAccountCount()
 	if running >= 2 {
-		return pal.Emerald, fmt.Sprintf("%d 运行中", running)
+		return pal.Emerald, fmt.Sprintf("%d 台已开机", running)
 	}
 	if running == 1 {
 		for _, a := range m.Svc.AccountsSnapshot() {
 			rt := m.Svc.StateFor(a.ID)
 			if rt.Phase.IsRunning() {
-				return pal.Emerald, fmt.Sprintf("运行中 · %s", rt.ShortGPUName())
+				return pal.Emerald, fmt.Sprintf("已开机 · %s", rt.ShortGPUName())
 			}
 		}
 	}
@@ -536,8 +536,11 @@ func (m *MainUI) topRightPill(pal Palette) (ui.Color, string) {
 			}
 			return pal.Amber, fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
 		}
+		if rt.Phase.Kind == core.PhaseStarting {
+			return pal.Amber, "正在开机"
+		}
 	}
-	return pal.TextFaint, fmt.Sprintf("v%s", app.AppVersion)
+	return pal.TextFaint, "已关机"
 }
 
 func drawBannerSemanticBar(p *ui.Painter, r ui.Rect, col ui.Color) {
@@ -806,7 +809,34 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 				})
 			})
 		}
+	} else if !rt.Phase.IsRunning() && !rt.Phase.IsQueuing() && rt.LastUnexpectedStopMsg != "" {
+		ui.Row(c).FillWidth().Padding(11, 14, 11, 18).Radius(14).
+			Background(WithAlpha(pal.Amber, 0.11)).
+			Border(1, WithAlpha(pal.Amber, 0.32)).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			DrawOver(func(p *ui.Painter, r ui.Rect) {
+				drawBannerSemanticBar(p, r, pal.Amber)
+			}).
+			AlignItems(ui.Center).Gap(10).Children(func() {
+			DrawPrecisionLED(c, pal.Amber, 12)
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Text(c, "上次云端机器已被 Google 自动回收停机").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+				ui.Text(c, rt.LastUnexpectedStopMsg).FontSize(12).TextColor(pal.TextMuted).MaxLines(2).Ellipsis("…")
+			})
+			SmallActionButton(c, pal, "重新开机", &pal.Amber, !m.Svc.CLIInstalled, func() {
+				m.Svc.DeployNow(acc.ID)
+			})
+			SmallActionButton(c, pal, "查看记录", nil, false, func() {
+				m.Svc.SetSection(app.SectionHistory)
+			})
+			SmallActionButton(c, pal, "✕", nil, false, func() {
+				m.Svc.ClearUnexpectedStopNotice(acc.ID)
+			})
+		})
 	}
+
+	// Primary Top Power & Live Stopwatch Control Strip: [Left: Machine + Memory] [Center: Clickable Power + Stopwatch] [Right: Available Time]
+	m.renderPowerHeroStrip(c, pal, acc, rt)
 
 	// Unified 4x2 Precision Bento Dashboard (both Idle and Active) + Bottom Live Session Table
 	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(14).Children(func() {
@@ -824,11 +854,267 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 	m.renderLiveAccountsTable(c, pal, acc)
 }
 
+func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
+	isRunning := rt.Phase.IsRunning()
+	isQueuing := rt.Phase.IsQueuing()
+	isStarting := rt.Phase.Kind == core.PhaseStarting
+	isStopping := rt.Phase.Kind == core.PhaseStopping
+	offlineBilling := !isRunning && rt.CURatePerHour > 0
+	isCooling := rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(time.Now())
+
+	targets := core.EffectiveQueueTargets(acc)
+	targetsSummary := core.QueueTargetsSummary(targets)
+
+	// Compute right-side available time
+	remCapSec := rt.RemainingCapSeconds(acc.Tier)
+	hrs, basis, hasEst := rt.EstimatedHoursRemaining(acc)
+
+	card := PrecisionCard(c, pal, 16, 14, func() {
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(16).Children(func() {
+			// LEFT: Allocated machine + VRAM & RAM info
+			ui.Column(c).Grow(1).MinWidth(220).Gap(4).Children(func() {
+				leftLED := pal.TextFaint
+				leftTitle := "云端机器与内存"
+				if isRunning {
+					leftLED = pal.Emerald
+				} else if isQueuing || isStarting {
+					leftLED = pal.Amber
+					leftTitle = "正在申请机器"
+				}
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					DrawPrecisionLED(c, leftLED, 10)
+					ui.Text(c, leftTitle).FontSize(12).FontWeight(500).TextColor(pal.TextMuted)
+				})
+
+				if isRunning {
+					shape := "Standard RAM"
+					if core.EffectiveUseHighMem(acc) && !rt.SessionUsedStandardRAM {
+						shape = "High-RAM"
+					}
+					ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, rt.ShortGPUName()).FontSize(21).Bold().TextColor(pal.TextPrimary).MaxLines(1)
+						e := pal.Emerald
+						Badge(c, pal, shape, &e)
+					})
+					memLine := fmt.Sprintf("显存 — · %s", shape)
+					if rt.VRAMTotalMB > 0 && rt.RAMTotalMB > 0 {
+						memLine = fmt.Sprintf("显存 %.1f/%.1f GB · 内存 %.1f/%.0f GB",
+							float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0,
+							float64(rt.RAMUsedMB)/1024.0, float64(rt.RAMTotalMB)/1024.0)
+					} else if rt.VRAMTotalMB > 0 {
+						memLine = fmt.Sprintf("显存 %.1f/%.1f GB · %s",
+							float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0, shape)
+					} else if rt.RAMTotalMB > 0 {
+						memLine = fmt.Sprintf("内存 %.1f/%.0f GB · 显存同步中",
+							float64(rt.RAMUsedMB)/1024.0, float64(rt.RAMTotalMB)/1024.0)
+					}
+					ui.Text(c, memLine).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+				} else if isQueuing || isStarting {
+					tgt := rt.Phase.TargetsSummary
+					if tgt == "" {
+						tgt = targetsSummary
+					}
+					ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, tgt).FontSize(19).Bold().TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
+						a := pal.Amber
+						if rt.Phase.QueuePersistent {
+							Badge(c, pal, fmt.Sprintf("守候 第%d轮", max(1, rt.Phase.QueueAttempt)), &a)
+						} else if isQueuing {
+							Badge(c, pal, fmt.Sprintf("第 %d/%d 轮", max(1, rt.Phase.QueueAttempt), max(1, rt.Phase.QueueMax)), &a)
+						}
+					})
+					sub := "正在向官方申请显卡与内存…"
+					if rt.Phase.Detail != "" {
+						sub = rt.Phase.Detail
+					}
+					ui.Text(c, sub).FontSize(12).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+				} else {
+					ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, "未分配机器").FontSize(19).Bold().TextColor(pal.TextMuted).MaxLines(1)
+						Badge(c, pal, "已停机", nil)
+					})
+					ui.Textf(c, "开机优先 %s · 显存/内存待开机", targetsSummary).FontSize(12).TextColor(pal.TextFaint).MaxLines(1).Ellipsis("…")
+				}
+			})
+
+			// CENTER: Unmistakable Power Status & Live Stopwatch Button (click when offline to start)
+			centerBg := pal.SubtleBg
+			centerBorder := WithAlpha(pal.Amber, 0.44)
+			iconBg := WithAlpha(pal.TextFaint, 0.14)
+			iconCol := pal.TextMuted
+			stateLbl := "已关机"
+			stateCol := pal.TextPrimary
+			subBadge := "点击开机"
+			subBadgeCol := pal.Amber
+			watchText := "00:00:00"
+			watchCol := pal.TextFaint
+			clickable := !isCooling && m.Svc.CLIInstalled
+			var onCenterClick func()
+
+			if isRunning {
+				centerBg = WithAlpha(pal.Emerald, 0.13)
+				centerBorder = WithAlpha(pal.Emerald, 0.50)
+				iconBg = WithAlpha(pal.Emerald, 0.22)
+				iconCol = pal.Emerald
+				stateLbl = "已开机"
+				stateCol = pal.Emerald
+				subBadge = "计时中"
+				subBadgeCol = pal.Emerald
+				watchText = core.FormatStopwatch(rt.SessionUptimeSec)
+				watchCol = pal.TextPrimary
+				clickable = false
+			} else if isQueuing || isStarting {
+				centerBg = WithAlpha(pal.Amber, 0.13)
+				centerBorder = WithAlpha(pal.Amber, 0.48)
+				iconBg = WithAlpha(pal.Amber, 0.22)
+				iconCol = pal.Amber
+				if rt.Phase.QueuePersistent {
+					stateLbl = "守候中"
+				} else if isQueuing {
+					stateLbl = "抢卡中"
+				} else {
+					stateLbl = "开机中"
+				}
+				stateCol = pal.Amber
+				subBadge = "等待中"
+				subBadgeCol = pal.Amber
+				waitSec := 0
+				if !rt.QueueStartedAt.IsZero() {
+					waitSec = max(0, int(time.Since(rt.QueueStartedAt).Seconds()))
+				}
+				watchText = core.FormatStopwatch(waitSec)
+				watchCol = pal.TextPrimary
+				clickable = isQueuing
+				if isQueuing {
+					subBadge = "点此取消"
+					onCenterClick = func() { m.Svc.CancelQueue(acc.ID) }
+				}
+			} else if isStopping {
+				centerBg = WithAlpha(pal.Coral, 0.12)
+				centerBorder = WithAlpha(pal.Coral, 0.42)
+				iconBg = WithAlpha(pal.Coral, 0.20)
+				iconCol = pal.Coral
+				stateLbl = "关机中"
+				stateCol = pal.Coral
+				subBadge = "释放中"
+				subBadgeCol = pal.Coral
+				watchText = core.FormatStopwatch(rt.SessionUptimeSec)
+				watchCol = pal.TextMuted
+				clickable = false
+			} else {
+				if !clickable {
+					centerBorder = pal.SubtleBorder
+					subBadge = "暂不可用"
+					subBadgeCol = pal.TextFaint
+				} else {
+					onCenterClick = func() { m.Svc.DeployNow(acc.ID) }
+				}
+			}
+
+			powerEl := ui.Row(c).Width(256).Padding(10, 14).Radius(13).
+				Background(centerBg).Border(1.2, centerBorder).
+				AlignItems(ui.Center).Gap(12)
+			if clickable && onCenterClick != nil {
+				powerEl.Cursor(ui.CursorPointer).OnClick(onCenterClick)
+			}
+			powerEl.Children(func() {
+				// Crisp circular power emblem
+				ui.Row(c).Width(38).Height(38).Radius(19).Background(iconBg).Border(1, WithAlpha(iconCol, 0.45)).
+					AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+					ui.Text(c, "⏻").FontSize(18).Bold().TextColor(iconCol)
+				})
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
+						ui.Text(c, stateLbl).FontSize(15).Bold().TextColor(stateCol).MaxLines(1)
+						ui.Spacer(c)
+						ui.Text(c, subBadge).FontSize(11).FontWeight(600).TextColor(subBadgeCol).MaxLines(1)
+					})
+					ui.Text(c, watchText).FontSize(20).Bold().FontFeatures("tnum").TextColor(watchCol).MaxLines(1)
+				})
+			})
+
+			// RIGHT: Available time (remaining session cap + estimated balance runtime)
+			ui.Column(c).Grow(1).MinWidth(220).AlignItems(ui.End).Gap(4).Children(func() {
+				rightLED := pal.TextFaint
+				rightTitle := "预计可用时间"
+				if isRunning {
+					rightTitle = "本轮可用时间"
+					rightLED = pal.Emerald
+					if remCapSec < 2*3600 {
+						rightLED = pal.Amber
+					}
+				}
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, rightTitle).FontSize(12).FontWeight(500).TextColor(pal.TextMuted)
+					DrawPrecisionLED(c, rightLED, 10)
+				})
+
+				if isRunning {
+					remCol := pal.TextPrimary
+					if remCapSec < 2*3600 {
+						remCol = pal.Amber
+					}
+					ui.Row(c).Gap(5).AlignItems(ui.End).Children(func() {
+						ui.Text(c, core.FormatDuration(remCapSec)).FontSize(21).Bold().FontFeatures("tnum").TextColor(remCol).MaxLines(1)
+						ui.Text(c, "剩余").FontSize(12).TextColor(pal.TextMuted).Padding(0, 0, 2, 0)
+					})
+					detail := fmt.Sprintf("单次上限 %dh", acc.Tier.MaxSessionHours())
+					if hasEst {
+						detail = fmt.Sprintf("余额可跑约 %.0fh · 上限 %dh", hrs, acc.Tier.MaxSessionHours())
+					}
+					if acc.AutoShutdownEnabled && !rt.ActivitySignal.IsBusy() {
+						effMins := core.EffectiveIdleTimeoutMinutes(acc, rt)
+						remIdle := max(0, (rt.RemainingIdleSeconds(effMins)+59)/60)
+						detail = fmt.Sprintf("余额可跑 %.0fh · 空闲停卡 %dm", hrs, remIdle)
+						if !hasEst {
+							detail = fmt.Sprintf("空闲停卡倒计时 %d 分钟", remIdle)
+						}
+					}
+					ui.Text(c, detail).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+				} else {
+					if hasEst {
+						ui.Row(c).Gap(4).AlignItems(ui.End).Children(func() {
+							ui.Textf(c, "%.0f", hrs).FontSize(21).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
+							ui.Text(c, "小时").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 2, 0)
+						})
+					} else if acc.Tier == core.TierFree {
+						ui.Text(c, "免费池 · 12h").FontSize(19).Bold().TextColor(pal.TextPrimary).MaxLines(1)
+					} else {
+						ui.Text(c, "—").FontSize(21).Bold().TextColor(pal.TextMuted)
+					}
+					subRight := fmt.Sprintf("当前未扣点 · 0.00 CU/h（按 %s 估）", basis)
+					if !hasEst {
+						subRight = "当前未扣点 · 0.00 CU/h"
+					}
+					subRightCol := pal.TextFaint
+					if offlineBilling {
+						subRight = fmt.Sprintf("有其他会话计费 · %.2f CU/h", rt.CURatePerHour)
+						subRightCol = pal.Amber
+					}
+					ui.Text(c, subRight).FontSize(12).FontFeatures("tnum").TextColor(subRightCol).MaxLines(1).Ellipsis("…")
+				}
+			})
+		})
+	})
+	if isRunning {
+		card.Draw(func(p *ui.Painter, r ui.Rect) {
+			p.FillRadialGradient(r, ui.RadialGradient{
+				Center: ui.Point{X: 0.5, Y: 0.5},
+				Radius: max(r.W, r.H) * 0.48,
+				Stops: []ui.GradientStop{
+					{Color: WithAlpha(pal.Emerald, 0.07), At: 0.0},
+					{Color: WithAlpha(pal.Emerald, 0.0), At: 1.0},
+				},
+			}, 16)
+		})
+	}
+}
+
 func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
-	statusWord := "已待机"
+	statusWord := "已关机"
 	statusTint := pal.TextMuted
-	sub := "剩余 CU"
+	sub := "未扣点"
 	switch rt.Phase.Kind {
 	case core.PhaseRunning:
 		if rt.DeployRunning {
@@ -1078,7 +1364,7 @@ func (m *MainUI) bentoGPU(c *ui.Context, pal Palette, acc core.AccountProfile, r
 	}
 	estRate := core.EstimatedHourlyCU(primaryChip)
 
-	badge := "待机就绪"
+	badge := "未开机"
 	var bTint *ui.Color
 	if rt.Phase.IsRunning() {
 		badge = rt.ShortGPUName()
@@ -1167,11 +1453,11 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 			} else {
 				TileHeader(c, pal, pal.Sky, "大模型代理", ctxBadge, nil)
 				ui.Row(c).AlignItems(ui.End).Gap(5).Children(func() {
-					ui.Text(c, "已就绪").FontSize(25).Bold().TextColor(pal.TextPrimary)
-					ui.Textf(c, ":%d", acc.RemoteServicePort).FontSize(13).FontFeatures("tnum").TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+					ui.Text(c, "待开机").FontSize(25).Bold().TextColor(pal.TextMuted)
+					ui.Textf(c, ":%d", acc.RemoteServicePort).FontSize(13).FontFeatures("tnum").TextColor(pal.TextFaint).Padding(0, 0, 4, 0)
 				})
 				ui.Box(c).Height(4)
-				DrawHorizonBar(c, pal, 0.85, WithAlpha(pal.Sky, 0.85), 8)
+				DrawHorizonBar(c, pal, 0.0, WithAlpha(pal.Sky, 0.50), 8)
 				ui.Spacer(c)
 				ui.Text(c, "开机自动同步编程工具").FontSize(12).TextColor(pal.TextMuted).MaxLines(1)
 			}
@@ -1242,14 +1528,14 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 				} else {
 					subNote := "本机加密通道"
 					if acc.AutoOpenComfyUI {
-						subNote = "自动开 ComfyUI"
+						subNote = "开机自动开 ComfyUI"
 					}
-					ui.Text(c, "已配齐").FontSize(25).Bold().TextColor(pal.TextPrimary)
-					ui.Text(c, subNote).FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+					ui.Text(c, "待开机").FontSize(25).Bold().TextColor(pal.TextMuted)
+					ui.Text(c, subNote).FontSize(12).FontWeight(500).TextColor(pal.TextFaint).Padding(0, 0, 4, 0)
 				}
 			})
 
-			prog := 0.85
+			prog := 0.0
 			barCol := WithAlpha(pal.Violet, 0.85)
 			if rt.Phase.IsRunning() {
 				barCol = pal.Violet
@@ -1483,7 +1769,7 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 		})
 
 		ui.Spacer(c)
-		foot := "已关闭，需要自己手动停卡"
+		foot := "已关软件停卡 · Google 仍回收久闲机"
 		if acc.AutoShutdownEnabled {
 			if rt.Phase.IsRunning() {
 				foot = fmt.Sprintf("当前空闲已计时 %s", core.FormatDuration(rt.IdleSeconds))

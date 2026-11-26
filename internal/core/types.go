@@ -1378,6 +1378,8 @@ type AccountRuntimeState struct {
 	GPUName          string
 	VRAMUsedMB       int
 	VRAMTotalMB      int
+	RAMUsedMB        int
+	RAMTotalMB       int
 	GPUUtilPercent   int
 	CPUUtilPercent   int
 	CUDAProcessCount int
@@ -1453,6 +1455,8 @@ type AccountRuntimeState struct {
 	SessionModelDowngraded    bool
 	SessionUsedStandardRAM    bool
 	LastAllocHadShortage      bool
+	QueueStartedAt            time.Time
+	LastUnexpectedStopMsg     string
 }
 
 func NewAccountRuntimeState() AccountRuntimeState {
@@ -1735,6 +1739,17 @@ func FormatDuration(seconds int) string {
 		return fmt.Sprintf("%dh %dm", h, m)
 	}
 	return fmt.Sprintf("%dm", m)
+}
+
+// FormatStopwatch renders elapsed seconds as HH:MM:SS for the live power indicator stopwatch.
+func FormatStopwatch(seconds int) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	h := seconds / 3600
+	m := (seconds % 3600) / 60
+	s := seconds % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 func FormatTokens(n int) string {

@@ -41,6 +41,8 @@ type RemoteTelemetry struct {
 	GPUName          string
 	VRAMUsedMB       int
 	VRAMTotalMB      int
+	RAMUsedMB        int
+	RAMTotalMB       int
 	GPUUtil          *int
 	CPUUtil          *int
 	CUDAProcessCount int
@@ -324,6 +326,22 @@ def http_get(url, timeout=2.0):
 print("NV=" + sh("nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || true"))
 print("CUDA_PROCS=" + sh("nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c '[0-9]' || true"))
 print("CPU=" + read_cpu())
+def read_mem():
+    try:
+        info = {}
+        for ln in pathlib.Path("/proc/meminfo").read_text().splitlines():
+            p = ln.split()
+            if len(p) >= 2:
+                info[p[0].rstrip(":")] = int(p[1])
+        tot = info.get("MemTotal", 0)
+        avail = info.get("MemAvailable", info.get("MemFree", 0))
+        if tot > 0:
+            used = max(0, tot - avail)
+            return f"{used // 1024},{tot // 1024}"
+    except Exception:
+        pass
+    return ""
+print("MEM=" + read_mem())
 print("URL=" + sh("cat /tmp/public_url.txt 2>/dev/null || true"))
 print("UPTIME=" + sh("awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0"))
 status_p = pathlib.Path("/tmp/colab-tools-status.json")
@@ -419,6 +437,12 @@ else:
 				if c, err := strconv.Atoi(s); err == nil {
 					t.CPUUtil = &c
 				}
+			}
+		case strings.HasPrefix(raw, "MEM="):
+			parts := strings.Split(strings.TrimPrefix(raw, "MEM="), ",")
+			if len(parts) >= 2 {
+				t.RAMUsedMB, _ = strconv.Atoi(strings.TrimSpace(parts[0]))
+				t.RAMTotalMB, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
 			}
 		case strings.HasPrefix(raw, "URL="):
 			u := strings.TrimSpace(strings.TrimPrefix(raw, "URL="))
