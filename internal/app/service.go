@@ -21,7 +21,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.8"
+const AppVersion = "0.3.9"
 
 type MainSection int
 

@@ -3,6 +3,12 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.9] - 2026-11-26
+
+### Changed
+- **Redesigned Light-Bezel App Icon (`assets/AppIcon.png`)**: Replaced the legacy dark robot icon with a refined Dieter Rams–inspired anodized light-silver metallic dial icon featuring an interlocking amber-orange & graphite infinity ring with an integrated minimal play triangle — honoring Google Colab's infinity motif while reflecting one-click video model deployment and precision compute control at every icon size (`1024 × 1024`, macOS HIG padding & crisp transparent corners).
+- **Updated Official Showcase Previews**: Re-exported all desktop console and onboarding screenshots with the new app icon.
+
 ## [0.3.8] - 2026-11-26
 
 ### Added
