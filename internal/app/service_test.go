@@ -428,3 +428,99 @@ func TestFailureNotificationsTestNotificationAndTrayLiveStatus(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestDeployTruthfulnessAndOpenComfyUIGuards(t *testing.T) {
+	t.Parallel()
+	telStdout := strings.Join([]string{
+		"NV=NVIDIA L4, 0, 23034, 0",
+		"CUDA_PROCS=0",
+		"CPU=1",
+		"UPTIME=3720",
+		"STATUS_AGE=10",
+		`STATUS_JSON={"kind":"video","name":"H3 原版 (31B)","port":8188,"metric_label":"部署中断","metric_value":"失败","metric_unit":"请检查","metric_ratio":0.0,"busy":false,"detail":"安装必需节点失败"}`,
+		"HEALTH=",
+		"DEPLOY_ALIVE=0",
+		"OUT_VIDEOS=0",
+	}, "\n")
+	fr := &fakeRunner{
+		onRun: func(name string, args []string) runner.Result {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, "exec") {
+				return runner.Result{ExitCode: 0, Stdout: telStdout}
+			}
+			return runner.Result{ExitCode: 0}
+		},
+		onShell: func(cmd string) runner.Result {
+			if strings.Contains(cmd, "exec") {
+				return runner.Result{ExitCode: 0, Stdout: telStdout}
+			}
+			return runner.Result{ExitCode: 0}
+		},
+	}
+	svc := NewService(true)
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+	acc := core.NewDefaultAccountProfile("VideoUser", "video@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.H3Variant = core.H3VariantOriginal
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	var mu sync.Mutex
+	var notices []string
+	svc.NotifySender = func(title, body string) {
+		mu.Lock()
+		notices = append(notices, title+":"+body)
+		mu.Unlock()
+	}
+
+	// 1. Bare running L4 machine (uninstalled) -> OpenComfyUI refuses immediately with clear Chinese hint, never tries SSH tunnel
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-l4-bare"
+	rt.ActiveHardware = "L4"
+	rt.GPUName = "NVIDIA L4"
+	rt.VRAMTotalMB = 23034
+	rt.ServerHealthy = false
+	rt.DeployRunning = false
+	svc.Runtime[acc.ID] = rt
+
+	svc.OpenComfyUI(acc.ID)
+	if !strings.Contains(svc.ToastMessage, "尚未安装 ComfyUI") {
+		t.Fatalf("expected bare-machine OpenComfyUI hint, got %q", svc.ToastMessage)
+	}
+	if hasWarn, warn := rt.HasVRAMWarningForRecipe(acc); !hasWarn || !strings.Contains(warn, "轻量 GGUF") {
+		t.Fatalf("expected L4+31B VRAM warning, got (%v, %q)", hasWarn, warn)
+	}
+
+	// 2. Actively deploying -> OpenComfyUI reports live percentage instead of opening tunnel
+	rt.DeployRunning = true
+	rt.WorkloadMetricValue = "35%"
+	rt.WorkloadMetricUnit = "装环境"
+	svc.Runtime[acc.ID] = rt
+	svc.OpenComfyUI(acc.ID)
+	if !strings.Contains(svc.ToastMessage, "正在自动部署中") || !strings.Contains(svc.ToastMessage, "35%") {
+		t.Fatalf("expected deploying OpenComfyUI progress hint, got %q", svc.ToastMessage)
+	}
+
+	// 3. Remote status.json reports deploy failure -> ServerHealthy MUST remain false, DeployFailed becomes true, notified once
+	svc.fetchAndApplyTelemetry(acc, "ep-l4-bare")
+	after := svc.StateFor(acc.ID)
+	if after.ServerHealthy {
+		t.Fatalf("STATUS_JSON with deploy failure must NOT mark ServerHealthy=true")
+	}
+	if !after.DeployFailed || after.DeployRunning || !strings.Contains(after.DeployError, "安装必需节点失败") {
+		t.Fatalf("expected DeployFailed with detail, got %+v", after)
+	}
+	// Polling a second time must not duplicate the failure notification
+	svc.fetchAndApplyTelemetry(acc, "ep-l4-bare")
+	mu.Lock()
+	if len(notices) != 1 || !strings.Contains(notices[0], "云端部署中断") {
+		t.Fatalf("expected exactly 1 deploy-failure notification, got %+v", notices)
+	}
+	mu.Unlock()
+
+	svc.OpenComfyUI(acc.ID)
+	if !strings.Contains(svc.ToastMessage, "部署中断") {
+		t.Fatalf("expected deploy-failed OpenComfyUI hint, got %q", svc.ToastMessage)
+	}
+}

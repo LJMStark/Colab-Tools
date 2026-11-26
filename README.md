@@ -86,8 +86,8 @@ Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大
 
 ### Option 1: Download Prebuilt App (Recommended)
 1. Grab the archive for your OS from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest):
-   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.11-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
-   - **Windows (x64)**: `Colab-Tools-v0.3.11-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
+   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.12-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
+   - **Windows (x64)**: `Colab-Tools-v0.3.12-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
 2. Finish the 3-step setup wizard, then on the **Home** tab simply click **Start & Run** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
 
 > **Signature notes:** Community builds are self-signed. On macOS, right-click → **Open** (or `xattr -cr "/Applications/Colab Tools.app"`). On Windows SmartScreen, click **More info → Run anyway**.

@@ -22,7 +22,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.11"
+const AppVersion = "0.3.12"
 
 type MainSection int
 
@@ -1037,6 +1037,12 @@ func (s *Service) applyServerSnapshotLocked(
 			rt.DisplayUIURL = ""
 			rt.ServerHealthy = false
 			rt.DeployRunning = false
+			rt.DeployFailed = false
+			rt.DeployError = ""
+			rt.DeployStartingUntil = time.Time{}
+			rt.DeployNotifiedFailEndpoint = ""
+			rt.DeployLogTail = ""
+			rt.DeployLogLoading = false
 			rt.RenderedVideoCount = 0
 			rt.SawQueueBusyThisRun = false
 			rt.AutoOpenedEndpoint = ""
@@ -1061,6 +1067,12 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.DisplayUIURL = ""
 	rt.ServerHealthy = false
 	rt.DeployRunning = false
+	rt.DeployFailed = false
+	rt.DeployError = ""
+	rt.DeployStartingUntil = time.Time{}
+	rt.DeployNotifiedFailEndpoint = ""
+	rt.DeployLogTail = ""
+	rt.DeployLogLoading = false
 	rt.RenderedVideoCount = 0
 	rt.SawQueueBusyThisRun = false
 	rt.AutoOpenedEndpoint = ""
@@ -1122,12 +1134,53 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		rt.KVQuant = tel.KVQuant
 	}
 	rt.DetectedServicePort = tel.DetectedWebPort
-	rt.DeployRunning = tel.DeployAlive
+	inStartingGrace := !rt.DeployStartingUntil.IsZero() && now.Before(rt.DeployStartingUntil)
+	deployFailed := core.IsDeployFailedStatus(tel.StatusPayload) && !tel.DeployAlive && !tel.Healthy
+
+	if tel.DeployAlive {
+		rt.DeployRunning = true
+		rt.DeployFailed = false
+		rt.DeployError = ""
+		rt.DeployStartingUntil = time.Time{}
+	} else if deployFailed {
+		rt.DeployRunning = false
+		rt.DeployFailed = true
+		rt.DeployStartingUntil = time.Time{}
+	} else if tel.Healthy {
+		rt.DeployRunning = false
+		rt.DeployFailed = false
+		rt.DeployError = ""
+		rt.DeployStartingUntil = time.Time{}
+	} else if inStartingGrace {
+		rt.DeployRunning = true
+	} else {
+		rt.DeployRunning = false
+	}
 	rt.RenderedVideoCount = tel.RenderedVideoCount
 
 	// Evaluate non-LLM signals (active deploy -> status.json with explicit busy -> ComfyUI /queue -> dual low-load fallback)
 	statusFresh := tel.StatusPayload != nil && tel.StatusAgeSeconds != nil && *tel.StatusAgeSeconds <= core.StatusFileMaxAgeSec
-	if statusFresh {
+	shouldNotifyDeployFail := false
+	deployFailDetail := ""
+	if deployFailed {
+		detail := strings.TrimSpace(tel.StatusPayload.Detail)
+		if detail == "" {
+			detail = "云端部署中断，请点「查看日志」排查原因"
+		}
+		rt.WorkloadName = tel.StatusPayload.Name
+		rt.WorkloadMetricLabel = tel.StatusPayload.MetricLabel
+		rt.WorkloadMetricValue = tel.StatusPayload.MetricValue
+		rt.WorkloadMetricUnit = tel.StatusPayload.MetricUnit
+		zero := 0.0
+		rt.WorkloadMetricRatio = &zero
+		rt.WorkloadDetail = detail
+		rt.DeployError = detail
+		if rt.DeployNotifiedFailEndpoint != expectedEndpoint {
+			rt.DeployNotifiedFailEndpoint = expectedEndpoint
+			shouldNotifyDeployFail = true
+			deployFailDetail = detail
+		}
+	} else if statusFresh {
 		if k, ok := tel.StatusPayload.ParsedKind(); ok {
 			rt.DetectedWorkloadKind = &k
 		}
@@ -1152,7 +1205,7 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 
 	if !acc.EnableLLMModule {
 		handled := false
-		if tel.DeployAlive {
+		if rt.DeployRunning {
 			handled = true
 			rt.SignalSource = core.SignalSourceStatusFile
 			rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
@@ -1199,7 +1252,7 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	shouldAutoOpenComfy := acc.DeployRecipe.IsVideoComfy() &&
 		acc.AutoOpenComfyUI &&
 		tel.ComfyQueue != nil &&
-		!tel.DeployAlive &&
+		!rt.DeployRunning &&
 		rt.AutoOpenedEndpoint != expectedEndpoint
 	if shouldAutoOpenComfy {
 		rt.AutoOpenedEndpoint = expectedEndpoint
@@ -1209,6 +1262,10 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	s.mu.Unlock()
 	s.notifyUI()
 
+	if shouldNotifyDeployFail {
+		s.cancelDeployWatcher(acc.ID)
+		s.SendNotification("云端部署中断", fmt.Sprintf("%s 部署未完成：%s", acc.DisplayName, deployFailDetail), true)
+	}
 	if shouldAutoOpenComfy {
 		s.cancelDeployWatcher(acc.ID)
 		go func() {
@@ -1816,36 +1873,109 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 		return
 	}
 
+	// Atomically guard against duplicate concurrent launches & immediately show live deploy progress before Drive mount
+	s.mu.Lock()
+	cur := s.Runtime[acc.ID]
+	if cur.DeployRunning {
+		s.mu.Unlock()
+		s.ShowToast("云端正在自动部署中，可点「查看日志」跟踪实时进度")
+		return
+	}
+	cur.DeployRunning = true
+	cur.DeployFailed = false
+	cur.DeployError = ""
+	cur.DeployNotifiedFailEndpoint = ""
+	cur.DeployStartingUntil = time.Now().Add(95 * time.Second)
+	cur.WorkloadMetricLabel = "正在部署"
+	cur.WorkloadMetricValue = "5%"
+	cur.WorkloadMetricUnit = "准备环境"
+	initRatio := 0.05
+	cur.WorkloadMetricRatio = &initRatio
+	if acc.UseGoogleDrive {
+		cur.WorkloadDetail = "正在检查并挂载 Google Drive…"
+	} else {
+		cur.WorkloadDetail = fmt.Sprintf("正在向云端发送 %s 部署脚本…", acc.H3Variant.DisplayName())
+	}
+	cur.AutoOpenedEndpoint = ""
+	s.Runtime[acc.ID] = cur
+	s.mu.Unlock()
+	s.notifyUI()
+
 	if acc.UseGoogleDrive {
 		s.ShowToast("正在挂载 Google Drive（复用模型并自动存成片）…")
-		if !s.Engine.EnsureDriveMounted(context.Background(), acc) {
-			s.ShowToast("Google Drive 暂未完成授权，先直接云端下载试跑（成片请记得保存）")
+		if mounted, reason := s.Engine.EnsureDriveMountedWithReason(context.Background(), acc); !mounted {
+			if reason == "" {
+				reason = "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
+			}
+			s.mu.Lock()
+			if st, ok := s.Runtime[acc.ID]; ok {
+				st.WorkloadDetail = reason
+				s.Runtime[acc.ID] = st
+			}
+			s.mu.Unlock()
+			s.notifyUI()
+			s.ShowToast(reason)
 		}
 	}
+
+	s.mu.Lock()
+	if st, ok := s.Runtime[acc.ID]; ok {
+		st.WorkloadMetricValue = "8%"
+		st.WorkloadMetricUnit = "推送脚本"
+		r8 := 0.08
+		st.WorkloadMetricRatio = &r8
+		st.WorkloadDetail = fmt.Sprintf("正在向云端推送 %s 自动安装脚本…", acc.H3Variant.DisplayName())
+		s.Runtime[acc.ID] = st
+	}
+	s.mu.Unlock()
+	s.notifyUI()
 
 	scriptBody := templates.H3VideoScript
 	if acc.DeployRecipe == core.RecipeComfyUIGeneral {
 		scriptBody = templates.ComfyUIVideoScript
 	}
 	if err := s.Engine.StartBuiltinDeployScript(context.Background(), acc, scriptBody, envVars); err != nil {
-		s.ShowToast("送出部署脚本失败：" + err.Error())
+		errMsg := strings.TrimSpace(err.Error())
+		if errMsg == "" {
+			errMsg = "未能把部署脚本送到云端机器"
+		}
+		s.mu.Lock()
+		st := s.Runtime[acc.ID]
+		st.DeployRunning = false
+		st.DeployFailed = true
+		st.DeployError = errMsg
+		st.DeployStartingUntil = time.Time{}
+		st.WorkloadMetricLabel = "部署中断"
+		st.WorkloadMetricValue = "失败"
+		st.WorkloadMetricUnit = "未启动"
+		zero := 0.0
+		st.WorkloadMetricRatio = &zero
+		st.WorkloadDetail = errMsg
+		s.Runtime[acc.ID] = st
+		s.mu.Unlock()
+		s.notifyUI()
+		s.ShowToast("送出部署脚本失败：" + errMsg)
+		s.SendNotification("云端部署未能启动", fmt.Sprintf("%s 推送部署脚本失败：%s", acc.DisplayName, errMsg), true)
 		return
 	}
 
 	s.mu.Lock()
-	cur := s.Runtime[acc.ID]
+	cur = s.Runtime[acc.ID]
 	cur.DeployRunning = true
+	cur.DeployFailed = false
+	cur.DeployError = ""
+	cur.DeployStartingUntil = time.Now().Add(20 * time.Second)
 	cur.WorkloadMetricLabel = "正在部署"
 	cur.WorkloadMetricValue = "10%"
 	cur.WorkloadMetricUnit = "准备中"
 	ratio := 0.10
 	cur.WorkloadMetricRatio = &ratio
-	cur.WorkloadDetail = fmt.Sprintf("正在云端自动部署 %s…", acc.H3Variant.DisplayName())
+	cur.WorkloadDetail = fmt.Sprintf("已启动云端部署 %s，正在安装环境…", acc.H3Variant.DisplayName())
 	cur.AutoOpenedEndpoint = ""
 	s.Runtime[acc.ID] = cur
 	s.mu.Unlock()
 	s.notifyUI()
-	s.ShowToast("已自动把部署脚本送到云端，大屏将实时显示拷贝与加载进度")
+	s.ShowToast("已把部署脚本送到云端，可直接在主屏看到实时进度或点「查看日志」")
 
 	// Start a bounded 12s progress watcher (up to 18 minutes) scoped by unique token so old watchers never cancel newer deploys
 	s.cancelDeployWatcher(acc.ID)
@@ -1857,30 +1987,39 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 
 	go func() {
 		defer s.clearDeployWatcherIfToken(acc.ID, watchToken)
+		firstCheck := time.NewTimer(4 * time.Second)
+		defer firstCheck.Stop()
 		tk := time.NewTicker(12 * time.Second)
 		defer tk.Stop()
 		deadline := time.Now().Add(18 * time.Minute)
+		pollOnce := func() bool {
+			latestAcc, ok := s.accountByID(acc.ID)
+			if !ok {
+				return true
+			}
+			rt := s.StateFor(acc.ID)
+			if !rt.Phase.IsRunning() || rt.ActiveEndpoint == "" {
+				return true
+			}
+			s.fetchAndApplyTelemetry(latestAcc, rt.ActiveEndpoint)
+			after := s.StateFor(acc.ID)
+			return !after.DeployRunning && (after.ServerHealthy || after.DeployFailed)
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-s.stopLoops:
 				return
+			case <-firstCheck.C:
+				if pollOnce() {
+					return
+				}
 			case <-tk.C:
 				if time.Now().After(deadline) {
 					return
 				}
-				latestAcc, ok := s.accountByID(acc.ID)
-				if !ok {
-					return
-				}
-				rt := s.StateFor(acc.ID)
-				if !rt.Phase.IsRunning() || rt.ActiveEndpoint == "" {
-					return
-				}
-				s.fetchAndApplyTelemetry(latestAcc, rt.ActiveEndpoint)
-				after := s.StateFor(acc.ID)
-				if !after.DeployRunning && after.ServerHealthy {
+				if pollOnce() {
 					return
 				}
 			}
@@ -2228,6 +2367,23 @@ func (s *Service) OpenComfyUI(accountID string) {
 		s.ShowToast("请先开机并部署后再打开 ComfyUI")
 		return
 	}
+	if rt.DeployRunning {
+		step := strings.TrimSpace(rt.WorkloadMetricValue + " " + rt.WorkloadMetricUnit)
+		if step != "" {
+			s.ShowToast(fmt.Sprintf("ComfyUI 正在自动部署中（%s），装好后会自动打开", step))
+		} else {
+			s.ShowToast("ComfyUI 正在自动部署中，可点「查看日志」看进度")
+		}
+		return
+	}
+	if rt.DeployFailed {
+		s.ShowToast("上次云端部署中断，请先点「查看日志」排查或点「重新部署」")
+		return
+	}
+	if !rt.ServerHealthy {
+		s.ShowToast("云端机器尚未安装 ComfyUI，请先点「立即部署」")
+		return
+	}
 	if rt.IsFreeRuntimeRestricted(acc) {
 		if rt.DisplayUIURL != "" && s.URLOpener != nil {
 			s.URLOpener(rt.DisplayUIURL)
@@ -2265,12 +2421,73 @@ func (s *Service) OpenComfyUI(accountID string) {
 		time.Sleep(350 * time.Millisecond)
 	}
 	if !connected {
-		s.ShowToast(fmt.Sprintf("本机通道 127.0.0.1:%d 暂未连通，请确认 ComfyUI 已就绪后再试", port))
+		s.ShowToast(fmt.Sprintf("本机通道 127.0.0.1:%d 暂未连通，请点「查看日志」核对 8188 端口", port))
 		return
 	}
 	if s.URLOpener != nil {
 		s.URLOpener("http://" + addr)
 	}
+}
+
+// RefreshDeployLog fetches recent remote deploy/ComfyUI logs asynchronously into runtime state for the log viewer overlay.
+func (s *Service) RefreshDeployLog(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.mu.Lock()
+		cur := s.Runtime[accountID]
+		cur.DeployLogLoading = false
+		cur.DeployLogTail = "当前机器未运行。开机并部署后可在这里实时查看云端安装进度与日志。"
+		s.Runtime[accountID] = cur
+		s.mu.Unlock()
+		s.notifyUI()
+		return
+	}
+	s.mu.Lock()
+	cur := s.Runtime[accountID]
+	if cur.DeployLogLoading {
+		s.mu.Unlock()
+		return
+	}
+	cur.DeployLogLoading = true
+	s.Runtime[accountID] = cur
+	s.mu.Unlock()
+	s.notifyUI()
+
+	go func() {
+		text, err := s.Engine.FetchDeployLogTail(context.Background(), acc, 80)
+		s.mu.Lock()
+		st := s.Runtime[accountID]
+		st.DeployLogLoading = false
+		if err != nil {
+			st.DeployLogTail = "拉取云端日志失败：" + err.Error()
+		} else {
+			st.DeployLogTail = text
+		}
+		s.Runtime[accountID] = st
+		s.mu.Unlock()
+		s.notifyUI()
+	}()
+}
+
+// RefreshAccountTelemetryNow immediately triggers a fresh remote telemetry poll for a running account.
+func (s *Service) RefreshAccountTelemetryNow(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() || rt.ActiveEndpoint == "" {
+		go s.RefreshAllAccounts(true, false)
+		return
+	}
+	go func() {
+		s.fetchAndApplyTelemetry(acc, rt.ActiveEndpoint)
+		s.ShowToast("已刷新云端实时状态")
+	}()
 }
 
 func (s *Service) OpenDriveOutputs() {

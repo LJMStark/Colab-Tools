@@ -1307,11 +1307,17 @@ type AccountRuntimeState struct {
 	QueueRunning         int
 	QueuePending         int
 	DetectedServicePort  *int
-	QueueInFlight        bool
-	DeployRunning        bool
-	RenderedVideoCount   int
-	SawQueueBusyThisRun  bool
-	AutoOpenedEndpoint   string
+	QueueInFlight              bool
+	DeployRunning              bool
+	DeployFailed               bool
+	DeployError                string
+	DeployStartingUntil        time.Time
+	DeployNotifiedFailEndpoint string
+	DeployLogTail              string
+	DeployLogLoading           bool
+	RenderedVideoCount         int
+	SawQueueBusyThisRun        bool
+	AutoOpenedEndpoint         string
 
 	ActivitySignal ActivitySignal
 	SignalSource   ActivitySignalSource
@@ -1502,6 +1508,52 @@ func (rt AccountRuntimeState) RemainingIdleSeconds(timeoutMinutes int) int {
 		return 0
 	}
 	return rem
+}
+
+// IsDeployFailedStatus reports whether a remote /tmp/colab-tools-status.json payload explicitly marks a failed deploy.
+func IsDeployFailedStatus(p *WorkloadStatusPayload) bool {
+	if p == nil {
+		return false
+	}
+	label := strings.TrimSpace(p.MetricLabel)
+	val := strings.TrimSpace(p.MetricValue)
+	return label == "部署中断" || val == "失败"
+}
+
+// HasVRAMWarningForRecipe flags when the running GPU clearly has insufficient VRAM for the selected H3 video model.
+func (rt AccountRuntimeState) HasVRAMWarningForRecipe(acc AccountProfile) (bool, string) {
+	if !rt.Phase.IsRunning() || acc.EnableLLMModule || acc.DeployRecipe != RecipeH3Video {
+		return false, ""
+	}
+	isSmallCard := false
+	vramGB := float64(rt.VRAMTotalMB) / 1024.0
+	if rt.VRAMTotalMB > 0 && rt.VRAMTotalMB <= 26000 {
+		isSmallCard = true
+	} else {
+		hw := strings.ToUpper(rt.ShortGPUName() + " " + rt.ActiveHardware)
+		if strings.Contains(hw, "L4") || strings.Contains(hw, "T4") {
+			isSmallCard = true
+			if vramGB <= 0 {
+				if strings.Contains(hw, "T4") {
+					vramGB = 15.0
+				} else {
+					vramGB = 22.5
+				}
+			}
+		}
+	}
+	if !isSmallCard {
+		return false, ""
+	}
+	switch acc.H3Variant {
+	case H3VariantOriginal:
+		return true, fmt.Sprintf("当前是 %s（%.1f GB 显存），跑不动 H3 原版 (31B)。建议改用「H3 Flash 轻量 GGUF」或关机重抢 G4/A100/H100。", rt.ShortGPUName(), vramGB)
+	case H3VariantFlash:
+		if rt.VRAMTotalMB > 0 && rt.VRAMTotalMB <= 17000 {
+			return true, fmt.Sprintf("当前 %s 显存仅 %.1f GB，跑 H3 Flash 极速版易爆显存，建议换「H3 Flash 轻量 GGUF」。", rt.ShortGPUName(), vramGB)
+		}
+	}
+	return false, ""
 }
 
 // InputValidator blocks shell metacharacters and invalid URLs/identifiers across all platforms.

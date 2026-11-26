@@ -276,6 +276,48 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if !popTester.HasText("Colab Tools") || !popTester.HasText("2374.8") {
 		t.Fatalf("missing popover elements: %q", popTester.Texts())
 	}
+
+	// 5. Bare running L4 machine with H3 Original (31B): must show truthful "未部署", VRAM mismatch alert, "立即部署" & deploy log overlay — NEVER fake "启动中"
+	bareSvc := makeDemoService(app.SectionHome, false, false)
+	bareAcc := bareSvc.Settings.Accounts[0]
+	bareAcc.H3Variant = core.H3VariantOriginal
+	bareSvc.Settings.Accounts[0] = bareAcc
+	bareRT := bareSvc.Runtime[bareAcc.ID]
+	bareRT.ActiveHardware = "L4"
+	bareRT.GPUName = "NVIDIA L4"
+	bareRT.VRAMUsedMB = 0
+	bareRT.VRAMTotalMB = 23034
+	bareRT.GPUUtilPercent = 0
+	bareRT.ServerHealthy = false
+	bareRT.DeployRunning = false
+	bareRT.DeployFailed = false
+	bareRT.QueueRunning = 0
+	bareRT.QueuePending = 0
+	bareRT.RenderedVideoCount = 0
+	bareRT.WorkloadDetail = ""
+	bareRT.DeployLogTail = "=== 云端实时状态 ===\n部署进程: 未运行\n端口 :8188: 未监听"
+	bareSvc.Runtime[bareAcc.ID] = bareRT
+
+	bareUI := uiapp.NewMainUI(bareSvc)
+	bareUI.ForceTheme = "dark"
+	bareTester := ui.NewTester(bareUI.View, 1160, 760)
+	if bareTester.HasText("启动中") {
+		t.Fatalf("bare running machine must never show misleading 启动中: %q", bareTester.Texts())
+	}
+	if !bareTester.HasText("未部署") || !bareTester.HasText("立即部署") || !bareTester.HasText("查看日志") || !bareTester.HasText("改用轻量 GGUF") {
+		t.Fatalf("missing truthful bare-machine deploy controls: %q", bareTester.Texts())
+	}
+	if err := bareTester.Click("改用轻量 GGUF"); err != nil {
+		t.Fatalf("click 改用轻量 GGUF failed: %v", err)
+	}
+	if gotAcc, _ := bareSvc.SelectedAccount(); gotAcc.H3Variant != core.H3VariantFlashGGUF {
+		t.Fatalf("expected switched to FlashGGUF, got %q", gotAcc.H3Variant)
+	}
+	bareUI.ShowDeployLog = true
+	logTester := ui.NewTester(bareUI.View, 1160, 760)
+	if !logTester.HasText("云端部署日志与状态核查") || !logTester.HasText("端口 :8188: 未监听") {
+		t.Fatalf("missing deploy log overlay content: %q", logTester.Texts())
+	}
 }
 
 // TestExportOfficialShowcasePreviews exports all Retina @2x previews when COLABTOOLS_EXPORT_DIR is set.
@@ -358,5 +400,33 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		setLight.PreviewMode = true
 		setLight.ForceTheme = "light"
 		renderPNG(t, setLight.View, 1160, 760, filepath.Join(qaDir, "qa-settings-light.png"))
+
+		bareSvc := makeDemoService(app.SectionHome, false, false)
+		bAcc := bareSvc.Settings.Accounts[0]
+		bAcc.H3Variant = core.H3VariantOriginal
+		bareSvc.Settings.Accounts[0] = bAcc
+		bRT := bareSvc.Runtime[bAcc.ID]
+		bRT.ActiveHardware = "L4"
+		bRT.GPUName = "NVIDIA L4"
+		bRT.VRAMUsedMB = 0
+		bRT.VRAMTotalMB = 23034
+		bRT.GPUUtilPercent = 0
+		bRT.CURatePerHour = 2.33
+		bRT.ServerHealthy = false
+		bRT.DeployRunning = false
+		bRT.QueueRunning = 0
+		bRT.QueuePending = 0
+		bRT.RenderedVideoCount = 0
+		bRT.WorkloadDetail = ""
+		bRT.DeployLogTail = "=== 云端实时状态 ===\n部署进程: 未运行\n端口 :8188: 未监听\nComfyUI 目录: 尚未安装\nGoogle Drive: 未挂载\n\n云端机器上目前没有任何部署记录。\n这台机器是刚开机或之前启动的裸机，尚未安装 ComfyUI，点击「立即部署」即可开始自动安装。"
+		bareSvc.Runtime[bAcc.ID] = bRT
+
+		bareUI := uiapp.NewMainUI(bareSvc)
+		bareUI.PreviewMode = true
+		bareUI.ForceTheme = "dark"
+		renderPNG(t, bareUI.View, 1160, 760, filepath.Join(qaDir, "qa-bare-l4-dark.png"))
+
+		bareUI.ShowDeployLog = true
+		renderPNG(t, bareUI.View, 1160, 760, filepath.Join(qaDir, "qa-deploy-log-overlay.png"))
 	}
 }

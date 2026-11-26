@@ -282,8 +282,19 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 				st := "待机中"
 				col := pal.TextMuted
 				if rt.Phase.IsRunning() {
-					st = "运行良好"
-					col = pal.Emerald
+					if rt.DeployRunning {
+						st = "部署中"
+						col = pal.Amber
+					} else if rt.DeployFailed {
+						st = "部署中断"
+						col = pal.Coral
+					} else if !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() && !rt.ServerHealthy {
+						st = "未部署"
+						col = pal.Amber
+					} else {
+						st = "运行良好"
+						col = pal.Emerald
+					}
 				}
 				ui.Text(c, st).FontSize(13).FontWeight(600).TextColor(col).Padding(0, 0, 4, 0)
 			})
@@ -382,9 +393,31 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		ui.Column(c).FillWidth().Gap(7).Children(func() {
 			ui.Row(c).FillWidth().Gap(7).Children(func() {
 				if isVideo {
-					p.popoverQuickBtn(c, pal, "打开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
-						go p.Svc.OpenComfyUI(acc.ID)
-					})
+					if rt.Phase.IsRunning() && !rt.ServerHealthy {
+						if rt.DeployRunning {
+							lbl := "部署中"
+							if rt.WorkloadMetricValue != "" {
+								lbl = "部署 " + rt.WorkloadMetricValue
+							}
+							p.popoverQuickBtn(c, pal, lbl, true, false, func() {
+								if p.OnOpenMain != nil {
+									p.OnOpenMain(app.SectionHome)
+								}
+							})
+						} else if rt.DeployFailed {
+							p.popoverQuickBtn(c, pal, "重新部署", true, false, func() {
+								p.Svc.DeployNow(acc.ID)
+							})
+						} else {
+							p.popoverQuickBtn(c, pal, "立即部署", true, false, func() {
+								p.Svc.DeployNow(acc.ID)
+							})
+						}
+					} else {
+						p.popoverQuickBtn(c, pal, "打开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
+							go p.Svc.OpenComfyUI(acc.ID)
+						})
+					}
 					p.popoverQuickBtn(c, pal, "Drive 成片", false, false, func() {
 						p.Svc.OpenDriveOutputs()
 					})

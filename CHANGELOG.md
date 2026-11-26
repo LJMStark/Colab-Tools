@@ -3,6 +3,21 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.12] - 2026-11-26
+
+### Fixed
+- **彻底消灭裸机假「启动中」状态与健康误判（Truthful Deploy State Machine）**:
+  - 修复机器在线但云端尚未安装 ComfyUI 时，卡 4 误显示「启动中」导致用户干等烧点的问题；现在精准区分 **未部署（裸机）/ 部署进度 XX% / 部署失败 / 已就绪 :8188 / 渲染排队** 5 种真实状态，并同步更新卡 1 与顶部菜单栏弹窗状态词。
+  - 修复遥测解析只要存在 `/tmp/colab-tools-status.json` 就一律误将 `ServerHealthy` 标为 `true` 的缺陷（即使部署已中断）；改为严格依据端口探测与 ComfyUI `/queue` 判定就绪。
+  - 修复 `launchVideoDeployFlow` 在挂载 Google Drive 期间未立即进入进度态、以及推送脚本失败或云端部署中断被静默吞错的问题；将 Drive 挂载超时收敛至 35 秒并给出中文提示，部署中断自动保留错误原因并发送带声弹窗提醒。
+  - 修复点击「开 ComfyUI」在未部署或部署中空等 8 秒隧道并弹出迷惑提示的问题，改为直接提示当前部署进度或引导点「立即部署」。
+
+### Added
+- **主屏一键「立即部署」与「云端部署日志」浮层**:
+  - 机器在线未就绪时，卡 8「视频快捷操作」自动切换为高亮的 **「立即部署 / 重新部署」** 与 **「查看日志 / 刷新进度」** 按钮；点「查看日志」可在居中深色终端浮层内直接读取云端 `/tmp/colab-tools-deploy.log`、`/tmp/comfyui.log` 与 `:8188` 端口监听状态。
+- **小显存显卡模型不匹配预警与一键切轻量版**:
+  - 检测到运行中显卡为 24GB 及以下（如 L4 / T4）但选中了 `H3 原版 (31B)` 时，主屏自动提示显存不足并提供一键 **「改用轻量 GGUF」** 按钮。
+
 ## [0.3.11] - 2026-11-26
 
 ### Changed

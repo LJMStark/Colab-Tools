@@ -447,7 +447,6 @@ else:
 					p := *payload.Port
 					t.DetectedWebPort = &p
 				}
-				t.Healthy = true
 			}
 		case strings.HasPrefix(raw, "COMFY_QUEUE="):
 			if cq, ok := core.ParseComfyQueueJSON(strings.TrimPrefix(raw, "COMFY_QUEUE=")); ok {
@@ -729,17 +728,116 @@ func (e *Engine) StopSession(ctx context.Context, profile core.AccountProfile, s
 }
 
 func (e *Engine) EnsureDriveMounted(ctx context.Context, profile core.AccountProfile) bool {
+	ok, _ := e.EnsureDriveMountedWithReason(ctx, profile)
+	return ok
+}
+
+// EnsureDriveMountedWithReason mounts Google Drive with a bounded wait and returns a plain-Chinese hint on failure.
+func (e *Engine) EnsureDriveMountedWithReason(ctx context.Context, profile core.AccountProfile) (bool, string) {
 	checkPy := "import os\nprint('DRIVE_MOUNTED=1' if os.path.isdir('/content/drive/MyDrive') else 'DRIVE_MOUNTED=0')\n"
 	check := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, checkPy, 20*time.Second)
 	if check.ExitCode == 0 && strings.Contains(check.Stdout, "DRIVE_MOUNTED=1") {
-		return true
+		return true, ""
 	}
-	m := e.RunColab(ctx, profile, []string{"drivemount", "-s", profile.SessionName, "/content/drive"}, "", 90*time.Second)
+	m := e.RunColab(ctx, profile, []string{"drivemount", "-s", profile.SessionName, "/content/drive"}, "", 35*time.Second)
+	combined := m.Stdout + "\n" + m.Stderr
 	if m.ExitCode != 0 {
-		return false
+		if strings.Contains(combined, "Authorization needed") || strings.Contains(combined, "Press Enter") {
+			return false, "Google Drive 需要首次浏览器授权，本次已自动切纯云端继续部署"
+		}
+		if m.TimedOut {
+			return false, "Google Drive 挂载等待超时，已自动切纯云端继续部署"
+		}
+		return false, "Google Drive 暂未挂载成功，先直接云端运行（成片请记得保存）"
 	}
 	verify := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, checkPy, 20*time.Second)
-	return verify.ExitCode == 0 && strings.Contains(verify.Stdout, "DRIVE_MOUNTED=1")
+	if verify.ExitCode == 0 && strings.Contains(verify.Stdout, "DRIVE_MOUNTED=1") {
+		return true, ""
+	}
+	return false, "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
+}
+
+// FetchDeployLogTail retrieves recent lines of remote deploy & ComfyUI logs plus live process/port summary.
+func (e *Engine) FetchDeployLogTail(ctx context.Context, profile core.AccountProfile, lines int) (string, error) {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return "", errors.New("会话名不合法")
+	}
+	if lines <= 0 {
+		lines = 60
+	}
+	if lines > 200 {
+		lines = 200
+	}
+	port := profile.RemoteServicePort
+	if port <= 0 {
+		port = 8188
+	}
+	py := fmt.Sprintf(`import pathlib, subprocess, json
+lines = %d
+port = %d
+out = []
+status_p = pathlib.Path("/tmp/colab-tools-status.json")
+pid_p = pathlib.Path("/tmp/colab-tools-deploy.pid")
+deploy_log = pathlib.Path("/tmp/colab-tools-deploy.log")
+comfy_log = pathlib.Path("/tmp/comfyui.log")
+
+alive = False
+dpid = ""
+if pid_p.exists():
+    dpid = pid_p.read_text(errors="ignore").strip()
+    if dpid and pathlib.Path(f"/proc/{dpid}/cmdline").exists():
+        cmd = pathlib.Path(f"/proc/{dpid}/cmdline").read_bytes().decode("utf-8", errors="ignore")
+        if "colab-tools-deploy.sh" in cmd:
+            alive = True
+
+p_check = subprocess.run(["bash", "-c", f"ss -tlnp 2>/dev/null | grep -E ':{port}\\b' || true"], text=True, capture_output=True).stdout.strip()
+drive_ok = pathlib.Path("/content/drive/MyDrive").is_dir()
+comfy_dir = pathlib.Path("/content/ComfyUI").is_dir()
+
+out.append("=== 云端实时状态 ===")
+out.append(f"部署进程: {'运行中 (PID ' + dpid + ')' if alive else '未运行'}")
+out.append(f"端口 :{port}: {'已监听' if p_check else '未监听'}")
+out.append(f"ComfyUI 目录: {'已存在 (/content/ComfyUI)' if comfy_dir else '尚未安装'}")
+out.append(f"Google Drive: {'已挂载' if drive_ok else '未挂载'}")
+if status_p.exists():
+    raw = status_p.read_text(errors="ignore").strip()
+    try:
+        obj = json.loads(raw)
+        out.append(f"阶段状态: {obj.get('metric_label','')} {obj.get('metric_value','')} {obj.get('metric_unit','')} — {obj.get('detail','')}")
+    except Exception:
+        out.append(f"阶段状态: {raw[:200]}")
+
+if not deploy_log.exists() and not comfy_log.exists() and not status_p.exists():
+    out.append("")
+    out.append("云端机器上目前没有任何部署记录。")
+    out.append("这台机器是刚开机或之前启动的裸机，尚未安装 ComfyUI，点击「立即部署」即可开始自动安装。")
+else:
+    if deploy_log.exists():
+        text = deploy_log.read_text(errors="ignore").splitlines()
+        out.append("")
+        out.append(f"=== 部署日志 /tmp/colab-tools-deploy.log（最后 {min(len(text), lines)} 行） ===")
+        out.extend(text[-lines:] if text else ["(空文件)"])
+    if comfy_log.exists():
+        ctext = comfy_log.read_text(errors="ignore").splitlines()
+        out.append("")
+        out.append(f"=== ComfyUI 日志 /tmp/comfyui.log（最后 {min(len(ctext), 30)} 行） ===")
+        out.extend(ctext[-30:] if ctext else ["(空文件)"])
+
+print("\n".join(out))
+`, lines, port)
+
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 25*time.Second)
+	if r.ExitCode != 0 {
+		msg := strings.TrimSpace(r.Stderr)
+		if msg == "" {
+			msg = strings.TrimSpace(r.Stdout)
+		}
+		if msg == "" {
+			msg = "无法连接云端会话读取日志，请稍后重试"
+		}
+		return "", errors.New(msg)
+	}
+	return strings.TrimSpace(runner.StripCR(r.Stdout)), nil
 }
 
 func (e *Engine) RunDriveStartScript(ctx context.Context, profile core.AccountProfile) (bool, string, string) {

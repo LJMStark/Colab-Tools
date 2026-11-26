@@ -49,6 +49,12 @@ tmp.replace(dst)
 PY
 }
 
+on_err() {
+  local line="$1"
+  write_status "部署中断" "失败" "第 ${line} 行" "0.0" "false" "请点「查看日志」排查 /tmp/colab-tools-deploy.log" ""
+}
+trap 'on_err $LINENO' ERR
+
 DRIVE_AVAILABLE=0
 if [ "$USE_GOOGLE_DRIVE" = "1" ] && [ -d "/content/drive/MyDrive" ]; then
   DRIVE_AVAILABLE=1

@@ -86,8 +86,8 @@
 
 ### 方式一：直接下载安装包（推荐）
 1. 去 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 按你的电脑下载：
-   - **macOS (Apple Silicon)**：下载 `Colab-Tools-v0.3.11-macOS-arm64.zip`，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
-   - **Windows (64 位)**：下载 `Colab-Tools-v0.3.11-Windows-amd64.zip`，解压后直接双击 **`Colab Tools.exe`**。
+   - **macOS (Apple Silicon)**：下载 `Colab-Tools-v0.3.12-macOS-arm64.zip`，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
+   - **Windows (64 位)**：下载 `Colab-Tools-v0.3.12-Windows-amd64.zip`，解压后直接双击 **`Colab Tools.exe`**。
 2. 跟着 3 步开箱引导绑好 Google 账号，回到「**主页**」默认已经选好 **H3 Flash 极速版 + 智能挑卡 + Drive 存片 + 跑完自动关机**，直接点 **「▶ 一键开机并运行」** 就行。
 
 > **系统弹窗提示**：开源工具使用自签发布。macOS 第一次打开如遇提示，请右键应用点「打开」（或终端执行 `xattr -cr "/Applications/Colab Tools.app"`）；Windows 若弹出 SmartScreen，点「更多信息 → 仍要运行」即可。

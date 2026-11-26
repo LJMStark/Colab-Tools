@@ -26,6 +26,7 @@ type MainUI struct {
 	AgreedRemoteScript   bool
 	ShowInstallLogs      bool
 	ShowHomeOptions      bool // Centered overlay inspector for recipe, GPU strategy & options
+	ShowDeployLog        bool // Centered overlay showing remote deploy & ComfyUI logs
 	ShowErrorRaw         bool // Toggle raw CLI snippet in error banner
 	ShowAdvancedSettings bool // Collapsible advanced parameters in Settings (collapsed by default)
 	EditingTierAccountID string
@@ -149,6 +150,9 @@ func (m *MainUI) View(c *ui.Context) {
 	if m.ShowHomeOptions {
 		m.renderHomeOptionsOverlay(c, pal)
 	}
+	if m.ShowDeployLog {
+		m.renderDeployLogOverlay(c, pal)
+	}
 
 	// Floating bottom-right toast banner (non-blocking PassThrough so clicks underneath always work)
 	if toast := m.Svc.ToastMessage; toast != "" {
@@ -207,6 +211,97 @@ func (m *MainUI) renderHomeOptionsOverlay(c *ui.Context, pal Palette) {
 				}).Width(780).MaxHeight(676).Gap(12).
 					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.42))
 				_ = card
+			})
+	})
+}
+
+func (m *MainUI) openDeployLogOverlay(accountID string) {
+	m.ShowHomeOptions = false
+	m.ShowDeployLog = true
+	m.Svc.RefreshDeployLog(accountID)
+}
+
+func (m *MainUI) renderDeployLogOverlay(c *ui.Context, pal Palette) {
+	acc, hasAcc := m.Svc.SelectedAccount()
+	if !hasAcc {
+		return
+	}
+	rt := m.Svc.StateFor(acc.ID)
+
+	ui.Overlay(c, func() {
+		ui.Box(c).Absolute().Top(0).Left(0).Right(0).Bottom(0).
+			Background(ui.RGBA(0, 0, 0, 0.48)).
+			OnClick(func() {
+				m.ShowDeployLog = false
+			})
+
+		ui.Column(c).Absolute().Top(0).Left(0).Right(0).Bottom(0).
+			PassThrough().
+			Padding(16, 24).
+			AlignItems(ui.Center).
+			Justify(ui.Center).
+			Children(func() {
+				PrecisionCard(c, pal, 20, 18, func() {
+					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+						led := pal.Sky
+						if rt.DeployRunning {
+							led = pal.Amber
+						} else if rt.DeployFailed {
+							led = pal.Coral
+						} else if rt.ServerHealthy {
+							led = pal.Emerald
+						}
+						DrawPrecisionLED(c, led, 12)
+						ui.Column(c).Grow(1).Gap(2).Children(func() {
+							ui.Text(c, "云端部署日志与状态核查").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
+							sub := fmt.Sprintf("会话 %s · %s", acc.SessionName, rt.ShortGPUName())
+							if rt.DeployRunning && rt.WorkloadMetricValue != "" {
+								sub += fmt.Sprintf(" · %s %s", rt.WorkloadMetricValue, rt.WorkloadMetricUnit)
+							} else if rt.DeployFailed {
+								sub += " · 上次部署中断"
+							} else if rt.ServerHealthy {
+								sub += " · ComfyUI 已就绪"
+							} else if rt.Phase.IsRunning() {
+								sub += " · 裸机未部署"
+							}
+							ui.Text(c, sub).FontSize(12).TextColor(pal.TextMuted).MaxLines(1)
+						})
+						refreshLbl := "刷新日志"
+						if rt.DeployLogLoading {
+							refreshLbl = "读取中…"
+						}
+						SmallActionButton(c, pal, refreshLbl, nil, rt.DeployLogLoading, func() {
+							m.Svc.RefreshDeployLog(acc.ID)
+						})
+						if rt.Phase.IsRunning() && acc.DeployRecipe.IsVideoComfy() && !rt.DeployRunning {
+							depLbl := "立即部署"
+							if rt.DeployFailed || rt.ServerHealthy {
+								depLbl = "重新部署"
+							}
+							SmallActionButton(c, pal, depLbl, &pal.Amber, false, func() {
+								m.Svc.DeployNow(acc.ID)
+							})
+						}
+						SmallActionButton(c, pal, "完成", nil, false, func() {
+							m.ShowDeployLog = false
+						})
+					})
+
+					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+
+					logText := rt.DeployLogTail
+					if rt.DeployLogLoading && logText == "" {
+						logText = "正在连接云端机器读取 /tmp/colab-tools-deploy.log 与 /tmp/comfyui.log…"
+					} else if logText == "" {
+						logText = "点击右上角「刷新日志」拉取云端实时安装记录与端口状态。"
+					}
+					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(480).Children(func() {
+						ui.Column(c).FillWidth().Padding(12, 14).Radius(10).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).Children(func() {
+							ui.Text(c, logText).FontSize(11.5).Font("monospace").TextColor(pal.TextPrimary)
+						})
+					})
+				}).Width(780).MaxHeight(620).Gap(12).
+					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.45))
 			})
 	})
 }
@@ -523,6 +618,57 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 				ui.Text(c, "原始反馈："+rt.LastErrorRaw).FontSize(11.5).Font("monospace").TextColor(pal.TextMuted)
 			}
 		})
+	} else if rt.Phase.IsRunning() && rt.DeployFailed {
+		errDetail := rt.DeployError
+		if errDetail == "" {
+			errDetail = "请查看云端日志定位具体失败原因后重试。"
+		}
+		ui.Row(c).FillWidth().Padding(11, 14, 11, 18).Radius(14).
+			Background(WithAlpha(pal.Coral, 0.11)).
+			Border(1, WithAlpha(pal.Coral, 0.32)).
+			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+			DrawOver(func(p *ui.Painter, r ui.Rect) {
+				drawBannerSemanticBar(p, r, pal.Coral)
+			}).
+			AlignItems(ui.Center).Gap(10).Children(func() {
+			DrawPrecisionLED(c, pal.Coral, 12)
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Text(c, "云端自动部署中断").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+				ui.Text(c, errDetail).FontSize(12).TextColor(pal.TextMuted).MaxLines(2).Ellipsis("…")
+			})
+			SmallActionButton(c, pal, "查看日志", nil, false, func() {
+				m.openDeployLogOverlay(acc.ID)
+			})
+			SmallActionButton(c, pal, "重新部署", &pal.Amber, false, func() {
+				m.Svc.DeployNow(acc.ID)
+			})
+		})
+	} else if rt.Phase.IsRunning() && !rt.ServerHealthy && !rt.DeployRunning {
+		if hasWarn, warnMsg := rt.HasVRAMWarningForRecipe(acc); hasWarn {
+			ui.Row(c).FillWidth().Padding(11, 14, 11, 18).Radius(14).
+				Background(WithAlpha(pal.Amber, 0.11)).
+				Border(1, WithAlpha(pal.Amber, 0.30)).
+				InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+				DrawOver(func(p *ui.Painter, r ui.Rect) {
+					drawBannerSemanticBar(p, r, pal.Amber)
+				}).
+				AlignItems(ui.Center).Gap(10).Children(func() {
+				DrawPrecisionLED(c, pal.Amber, 12)
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					ui.Text(c, "当前显卡显存与所选视频模型不匹配").FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+					ui.Text(c, warnMsg).FontSize(12).TextColor(pal.TextMuted)
+				})
+				SmallActionButton(c, pal, "改用轻量 GGUF", &pal.Amber, false, func() {
+					cp := acc
+					cp.H3Variant = core.H3VariantFlashGGUF
+					m.Svc.UpdateAccount(cp)
+					m.Svc.ShowToast("已切为 H3 Flash 轻量 (GGUF)，点「立即部署」即可开始安装")
+				})
+				SmallActionButton(c, pal, "调整方案", nil, false, func() {
+					m.ShowHomeOptions = true
+				})
+			})
+		}
 	}
 
 	// Unified 4x2 Precision Bento Dashboard (both Idle and Active) + Bottom Live Session Table
@@ -548,12 +694,22 @@ func (m *MainUI) bentoHealthCU(c *ui.Context, pal Palette, acc core.AccountProfi
 	sub := "剩余 CU"
 	switch rt.Phase.Kind {
 	case core.PhaseRunning:
-		if rt.ActivitySignal.IsBusy() {
+		if rt.DeployRunning {
+			statusWord = "部署中"
+			statusTint = pal.Amber
+		} else if rt.DeployFailed {
+			statusWord = "部署中断"
+			statusTint = pal.Coral
+		} else if !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() && !rt.ServerHealthy {
+			statusWord = "待部署"
+			statusTint = pal.Amber
+		} else if rt.ActivitySignal.IsBusy() {
 			statusWord = "推理中"
+			statusTint = pal.Emerald
 		} else {
 			statusWord = "很好"
+			statusTint = pal.Emerald
 		}
-		statusTint = pal.Emerald
 		sub = core.FormatDuration(rt.SessionUptimeSec)
 	case core.PhaseQueuing:
 		statusWord = fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
@@ -885,8 +1041,14 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 				bTint = nil
 				if rt.DeployRunning {
 					title = "部署进度"
+					badge = "安装中"
 					a := pal.Amber
 					bTint = &a
+				} else if rt.DeployFailed {
+					title = "部署中断"
+					badge = "失败"
+					rCol := pal.Coral
+					bTint = &rCol
 				} else if rt.RenderedVideoCount > 0 {
 					badge = fmt.Sprintf("已出 %d 条", rt.RenderedVideoCount)
 					e := pal.Emerald
@@ -894,15 +1056,28 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 				} else if rt.ServerHealthy {
 					e := pal.Emerald
 					bTint = &e
+				} else {
+					badge = "未部署"
+					a := pal.Amber
+					bTint = &a
 				}
 			}
 			TileHeader(c, pal, pal.Violet, title, badge, bTint)
 
 			ui.Row(c).AlignItems(ui.End).Gap(6).Children(func() {
 				if rt.Phase.IsRunning() {
-					if rt.DeployRunning && rt.WorkloadMetricValue != "" {
-						ui.Text(c, rt.WorkloadMetricValue).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-						ui.Text(c, rt.WorkloadMetricUnit).FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+					if rt.DeployRunning {
+						val := rt.WorkloadMetricValue
+						unit := rt.WorkloadMetricUnit
+						if val == "" {
+							val = "准备中"
+						}
+						ui.Text(c, val).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+						if unit != "" {
+							ui.Text(c, unit).FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+						}
+					} else if rt.DeployFailed {
+						ui.Text(c, "部署失败").FontSize(25).Bold().TextColor(pal.Coral)
 					} else if rt.QueueRunning > 0 || rt.QueuePending > 0 {
 						ui.Textf(c, "渲染 %d", rt.QueueRunning).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
 						ui.Textf(c, "排队 %d", rt.QueuePending).FontSize(13).FontWeight(500).TextColor(pal.Amber).Padding(0, 0, 4, 0)
@@ -910,7 +1085,8 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 						ui.Text(c, "已就绪").FontSize(25).Bold().TextColor(pal.Emerald)
 						ui.Text(c, ":8188").FontSize(13).FontFeatures("tnum").TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 					} else {
-						ui.Text(c, "启动中").FontSize(25).Bold().TextColor(pal.TextPrimary)
+						ui.Text(c, "未部署").FontSize(25).Bold().TextColor(pal.Amber)
+						ui.Text(c, "裸机").FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
 					}
 				} else {
 					subNote := "本机加密通道"
@@ -927,11 +1103,22 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 			if rt.Phase.IsRunning() {
 				barCol = pal.Violet
 				prog = 0.0
-				if rt.WorkloadMetricRatio != nil {
+				if rt.DeployRunning {
+					barCol = pal.Amber
+					if rt.WorkloadMetricRatio != nil {
+						prog = *rt.WorkloadMetricRatio
+					} else {
+						prog = 0.08
+					}
+				} else if rt.DeployFailed {
+					barCol = pal.Coral
+					prog = 0.0
+				} else if rt.WorkloadMetricRatio != nil && rt.ServerHealthy {
 					prog = *rt.WorkloadMetricRatio
 				} else if rt.QueueRunning > 0 {
 					prog = 0.72
 				} else if rt.ServerHealthy {
+					barCol = pal.Emerald
 					prog = 1.0
 				}
 			}
@@ -943,7 +1130,13 @@ func (m *MainUI) bentoWorkload(c *ui.Context, pal Palette, acc core.AccountProfi
 				foot = "开机自动装好 · 成片直存 Drive"
 			}
 			if rt.Phase.IsRunning() {
-				if rt.WorkloadDetail != "" {
+				if rt.DeployFailed && rt.DeployError != "" {
+					foot = rt.DeployError
+				} else if rt.DeployRunning && rt.WorkloadDetail != "" {
+					foot = rt.WorkloadDetail
+				} else if !rt.ServerHealthy && !rt.DeployRunning {
+					foot = "未装 ComfyUI · 点下方「立即部署」"
+				} else if rt.WorkloadDetail != "" {
 					foot = rt.WorkloadDetail
 				} else if acc.UseGoogleDrive {
 					foot = "成片实时存 Drive · 断线不白跑"
@@ -1194,7 +1387,19 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 	if isVideo {
 		badge := "本机加密"
 		var bTint *ui.Color
-		if rt.SSHTunnelActive {
+		if rt.Phase.IsRunning() && rt.DeployRunning {
+			badge = "部署中"
+			t := pal.Amber
+			bTint = &t
+		} else if rt.Phase.IsRunning() && rt.DeployFailed {
+			badge = "部署中断"
+			t := pal.Coral
+			bTint = &t
+		} else if rt.Phase.IsRunning() && !rt.ServerHealthy {
+			badge = "待部署"
+			t := pal.Amber
+			bTint = &t
+		} else if rt.SSHTunnelActive {
 			badge = "通道在线"
 			t := pal.Emerald
 			bTint = &t
@@ -1206,27 +1411,68 @@ func (m *MainUI) bentoQuickIntegrations(c *ui.Context, pal Palette, acc core.Acc
 		BentoCard(c, pal, 176, func() {
 			TileHeader(c, pal, pal.Sky, "视频快捷操作", badge, bTint)
 			ui.Column(c).FillWidth().Gap(7).Children(func() {
-				ui.Row(c).FillWidth().Gap(7).Children(func() {
-					m.quickCardBtn(c, pal, "开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
-						go m.Svc.OpenComfyUI(acc.ID)
+				if rt.Phase.IsRunning() && !rt.ServerHealthy {
+					ui.Row(c).FillWidth().Gap(7).Children(func() {
+						if rt.DeployRunning {
+							m.quickCardBtn(c, pal, "查看日志", true, false, func() {
+								m.openDeployLogOverlay(acc.ID)
+							})
+							m.quickCardBtn(c, pal, "刷新进度", false, false, func() {
+								m.Svc.RefreshAccountTelemetryNow(acc.ID)
+							})
+						} else if rt.DeployFailed {
+							m.quickCardBtn(c, pal, "重新部署", true, false, func() {
+								m.Svc.DeployNow(acc.ID)
+							})
+							m.quickCardBtn(c, pal, "查看日志", false, false, func() {
+								m.openDeployLogOverlay(acc.ID)
+							})
+						} else {
+							m.quickCardBtn(c, pal, "立即部署", true, false, func() {
+								m.Svc.DeployNow(acc.ID)
+							})
+							m.quickCardBtn(c, pal, "查看日志", false, false, func() {
+								m.openDeployLogOverlay(acc.ID)
+							})
+						}
 					})
-					m.quickCardBtn(c, pal, "更多玩法", m.ShowHomeOptions, false, func() {
-						m.ShowHomeOptions = true
+					ui.Row(c).FillWidth().Gap(7).Children(func() {
+						m.quickCardBtn(c, pal, "更多玩法", m.ShowHomeOptions, false, func() {
+							m.ShowHomeOptions = true
+						})
+						m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
+							m.Svc.OpenDriveOutputs()
+						})
 					})
-				})
-				ui.Row(c).FillWidth().Gap(7).Children(func() {
-					tunLabel := "本机通道"
-					if rt.SSHTunnelActive {
-						tunLabel = "断通道"
-					}
-					tunDisabled := (!rt.Phase.IsRunning() && !rt.SSHTunnelActive) || rt.IsFreeRuntimeRestricted(acc)
-					m.quickCardBtn(c, pal, tunLabel, rt.SSHTunnelActive, tunDisabled, func() {
-						m.Svc.ToggleSSHTunnel(acc.ID)
+				} else {
+					ui.Row(c).FillWidth().Gap(7).Children(func() {
+						m.quickCardBtn(c, pal, "开 ComfyUI", rt.Phase.IsRunning() && rt.ServerHealthy, !rt.Phase.IsRunning(), func() {
+							go m.Svc.OpenComfyUI(acc.ID)
+						})
+						if rt.Phase.IsRunning() {
+							m.quickCardBtn(c, pal, "部署日志", m.ShowDeployLog, false, func() {
+								m.openDeployLogOverlay(acc.ID)
+							})
+						} else {
+							m.quickCardBtn(c, pal, "更多玩法", m.ShowHomeOptions, false, func() {
+								m.ShowHomeOptions = true
+							})
+						}
 					})
-					m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
-						m.Svc.OpenDriveOutputs()
+					ui.Row(c).FillWidth().Gap(7).Children(func() {
+						tunLabel := "本机通道"
+						if rt.SSHTunnelActive {
+							tunLabel = "断通道"
+						}
+						tunDisabled := (!rt.Phase.IsRunning() && !rt.SSHTunnelActive) || rt.IsFreeRuntimeRestricted(acc)
+						m.quickCardBtn(c, pal, tunLabel, rt.SSHTunnelActive, tunDisabled, func() {
+							m.Svc.ToggleSSHTunnel(acc.ID)
+						})
+						m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
+							m.Svc.OpenDriveOutputs()
+						})
 					})
-				})
+				}
 			})
 			ui.Spacer(c)
 		})
