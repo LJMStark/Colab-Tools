@@ -33,38 +33,8 @@ jobs:
           go vet ./...
           go test -v -race ./...
 
-      - name: Build & verify macOS + Windows bundles (zero CGO)
+      - name: Build & verify macOS bundle (zero CGO)
         run: |
           chmod +x scripts/package.sh
-          ./scripts/package.sh --all --zip
+          ./scripts/package.sh --mac --zip
           ls -lh build/Colab-Tools-*.zip
-
-  windows:
-    runs-on: windows-latest
-    env:
-      GOTOOLCHAIN: auto
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "stable"
-          cache: true
-
-      - name: Verify Go toolchain
-        run: go version
-
-      - name: Vet and run Windows native unit tests
-        run: |
-          go vet ./...
-          go test -v ./...
-
-      - name: Build Windows portable executable (zero CGO)
-        shell: pwsh
-        run: |
-          $env:GOFLAGS = "-trimpath"
-          go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
-          $exe = Get-ChildItem -Path build/win -Recurse -Filter "*.exe" | Select-Object -First 1
-          if (-not $exe) { throw "No Windows executable produced" }
-          Write-Host "Built: $($exe.FullName) ($($exe.Length) bytes)"

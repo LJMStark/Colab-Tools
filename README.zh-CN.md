@@ -4,7 +4,7 @@
 
 # Colab Tools
 
-**帮你自动抢卡、一键部署 H3 视频模型、跑完自动关机省点的跨平台桌面工具（macOS & Windows）**
+**帮你自动抢卡、一键部署 H3 视频模型、跑完自动关机省点的 macOS 桌面工具**
 
 不用敲命令、不用自己传脚本 · 默认选 H3 原版或 Flash 极速版就能跑 · 不用盯屏：菜单栏实时显示抢卡进度，抢到或没抢到都会弹窗响铃通知 · 聪明配合 Google Drive 不掉盘不白跑 · 也能一键切大模型代理给编程工具用
 
@@ -12,7 +12,7 @@
 
 [![CI](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml/badge.svg)](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/LJMStark/Colab-Tools?color=f59e0b&logo=github)](https://github.com/LJMStark/Colab-Tools/releases/latest)
-[![Platforms](https://img.shields.io/badge/macOS%20%7C%20Windows-arm64%20%2F%20amd64-111827)](https://github.com/LJMStark/Colab-Tools/releases/latest)
+[![Platform](https://img.shields.io/badge/macOS-arm64-111827?logo=apple&logoColor=white)](https://github.com/LJMStark/Colab-Tools/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27%20%2B%20MyGo-00ADD8?logo=go&logoColor=white)](https://github.com/egoist/mygo)
 [![Colab CLI](https://img.shields.io/badge/google--colab--cli-0.8.x-4285F4)](https://github.com/googlecolab/google-colab-cli)
 [![License](https://img.shields.io/badge/License-MIT-10b981)](LICENSE)
@@ -39,7 +39,7 @@
   <tr>
     <td align="center" width="50%">
       <img src="docs/images/preview-onboarding.png" alt="开箱体检与一键装官方 CLI" width="420" /><br />
-      <sub><b>开箱体检一键装好环境</b> · 第一次打开自动检查电脑环境，缺官方 CLI 点一下就能装，Windows 自动打通 WSL2</sub>
+      <sub><b>开箱体检一键装好环境</b> · 第一次打开自动检查电脑环境，缺官方 CLI 点一下就能装</sub>
     </td>
     <td align="center" width="50%">
       <img src="docs/images/preview-dashboard.png" alt="顶部菜单栏与系统托盘伴侣" width="320" /><br />
@@ -63,8 +63,8 @@
    - **Colab Tools 怎么帮**：启动脚本直接内置在软件里，开机自动送上去装。界面里默认摆好 **「H3 原版（31B 画质最好）」** 和 **「H3 Flash 极速版（13.7B 速度快省点）」** 两档，其他版本（比如 24G 显存就能跑的 GGUF、自己贴 HuggingFace 链接、或者只用你网盘里现成的模型）也能随时切换。不管选哪一版，**21.5 GB 的通用底座只存一份复用，换版本不用重新下**。
 3. **直接拿软链接挂 Google Drive 读几十 GB 大模型，慢到卡死还动不动掉盘**
    - **Colab Tools 怎么帮**：聪明分工——有 Google Drive 时，开机先把 Drive 里存好的底座和预编译加速包顺序拷到云端本地高速盘来跑（顺畅不掉盘），没有的话直接云端高速下载并可顺手存一份回 Drive；**每生成完一条视频立刻自动写进 Drive 的 `outputs` 文件夹**，哪怕 24 小时到期或意外断线也一条不丢。不想绑 Drive 也能直接纯云端试跑。
-4. **Colab 网页一关就断连，原生代理开 ComfyUI 动不动黑屏；Windows 还不好装官方 CLI**
-   - **Colab Tools 怎么帮**：装好 ComfyUI 后，默认自动通过**本机加密通道（`127.0.0.1:8188`）**帮你弹出浏览器直接用——不暴露公网网址更安全，也不会黑屏断流（想用手机或另一台电脑看进度时，也能手动打开 `cloudflared` 临时链接）。而且纯 Go 零依赖打包（zip 仅约 8.5 MB），**Windows 和 macOS 都能直接双击运行**，Windows 端自动无缝桥接 WSL2 官方 CLI。
+4. **Colab 网页一关就断连，原生代理开 ComfyUI 动不动黑屏**
+   - **Colab Tools 怎么帮**：装好 ComfyUI 后，默认自动通过**本机加密通道（`127.0.0.1:8188`）**帮你弹出浏览器直接用——不暴露公网网址更安全，也不会黑屏断流（想用手机或另一台电脑看进度时，也能手动打开 `cloudflared` 临时链接）。而且纯 Go 零依赖打包（zip 仅约 9 MB，无 Electron），在 **macOS** 上轻量顺滑。
 
 ---
 
@@ -78,21 +78,19 @@
 
 ## 下载与使用
 
+> **平台说明**：目前专注打磨 **macOS** 体验，Windows 版本已暂时下架，待 macOS 全面稳定后再单独适配发布。
+
 ### 准备条件
-- **系统支持**：macOS 14.0+（Apple Silicon 预编译包，Intel Mac 可源码编译）或 **Windows 10/11（64 位）**
-- **官方 Google Colab CLI**（**第一次打开 Colab Tools 会自动检查并带你一键装好**，不用提前折腾）：
-  - **macOS**：`uv tool install google-colab-cli`
-  - **Windows**：目前官方 CLI 还在适配原生 Windows，Colab Tools 会自动帮你检测并桥接 **WSL2** 里的官方 CLI（装好 WSL2 后按界面提示点一下即可；如果以后装了原生 `colab.exe` 也会自动优先用原生的）。
+- **系统支持**：macOS 14.0+（提供 Apple Silicon 预编译包，Intel Mac 可从源码编译）
+- **官方 Google Colab CLI**（`uv tool install google-colab-cli`，**第一次打开 Colab Tools 会自动检查并带你一键装好**，不用提前折腾）
 
 ### 方式一：直接下载安装包（推荐）
-1. 去 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 按你的电脑下载：
-   - **macOS (Apple Silicon)**：下载 `Colab-Tools-v0.3.12-macOS-arm64.zip`，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
-   - **Windows (64 位)**：下载 `Colab-Tools-v0.3.12-Windows-amd64.zip`，解压后直接双击 **`Colab Tools.exe`**。
+1. 去 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 **`Colab-Tools-v0.3.12-macOS-arm64.zip`**，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
 2. 跟着 3 步开箱引导绑好 Google 账号，回到「**主页**」默认已经选好 **H3 Flash 极速版 + 智能挑卡 + Drive 存片 + 跑完自动关机**，直接点 **「▶ 一键开机并运行」** 就行。
 
-> **系统弹窗提示**：开源工具使用自签发布。macOS 第一次打开如遇提示，请右键应用点「打开」（或终端执行 `xattr -cr "/Applications/Colab Tools.app"`）；Windows 若弹出 SmartScreen，点「更多信息 → 仍要运行」即可。
+> **系统弹窗提示**：开源工具使用自签发布。首次打开如遇提示，请右键应用点「打开」（或在终端执行 `xattr -cr "/Applications/Colab Tools.app"`）。
 
-### 方式二：自己从源码编译（纯 Go，无需 Xcode / MSVC）
+### 方式二：自己从源码编译（纯 Go，无需 Xcode）
 ```bash
 git clone https://github.com/LJMStark/Colab-Tools.git
 cd Colab-Tools
@@ -100,18 +98,9 @@ cd Colab-Tools
 # 跑全量测试（含并发检测）
 GOTOOLCHAIN=auto go test -race ./...
 
-# macOS：一键打 macOS + Windows 双端 zip 并安装到 /Applications
+# 打包 macOS .app + zip 并安装到 /Applications
 chmod +x scripts/package.sh
-./scripts/package.sh --all --zip --install
-```
-
-Windows PowerShell 编译：
-```powershell
-$env:GOTOOLCHAIN = "auto"
-$env:CGO_ENABLED = "0"
-$env:GOFLAGS = "-trimpath"
-go test ./...
-go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
+./scripts/package.sh --mac --zip --install
 ```
 
 ---
@@ -119,7 +108,7 @@ go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
 ## 安全与合规承诺
 
 - **全部走 Google 官方 `google-colab-cli`**：开机、停机、查点数、SSH 加密通道（`colab ssh --proxy-mode`）和打开网页都调用官方命令，不碰任何私密接口。
-- **凭证绝不明文落盘**：多账号授权与密钥都加密存在系统凭据库（macOS 钥匙串 / Windows 凭据管理器），用完的临时文件随机覆写清零删除。
+- **凭证绝不明文落盘**：多账号授权与密钥都加密存在 macOS 钥匙串，用完的临时文件随机覆写清零删除。
 - **克制排队不触发风控**：缺货排队自带低频随机间隔（最多 5 轮 / 40 分钟），遇到限流（429）或超额（412）立刻停手冷却 15 分钟。请遵守 [Google Colab 官方服务条款](https://research.google.com/colaboratory/faq.html)，切勿用多账号绕过免费配额。详情见 [SECURITY.md](SECURITY.md)。
 
 ---

@@ -4,7 +4,7 @@
 
 # Colab Tools
 
-**One-click H3 video model deployment, polite GPU queueing, and auto-shutdown money saver for Google Colab (macOS & Windows).**
+**One-click H3 video model deployment, polite GPU queueing, and auto-shutdown money saver for Google Colab on macOS.**
 
 No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (or any custom weight) and click Start · Smart Google Drive copy & real-time output backup · No babysitting: live queue progress in the menu bar, plus sound & popup notifications when allocated, ready, or stopped · Also switches cleanly to LLM proxy mode for coding tools.
 
@@ -12,7 +12,7 @@ No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (
 
 [![CI](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml/badge.svg)](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/LJMStark/Colab-Tools?color=f59e0b&logo=github)](https://github.com/LJMStark/Colab-Tools/releases/latest)
-[![Platforms](https://img.shields.io/badge/macOS%20%7C%20Windows-arm64%20%2F%20amd64-111827)](https://github.com/LJMStark/Colab-Tools/releases/latest)
+[![Platform](https://img.shields.io/badge/macOS-arm64-111827?logo=apple&logoColor=white)](https://github.com/LJMStark/Colab-Tools/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27%20%2B%20MyGo-00ADD8?logo=go&logoColor=white)](https://github.com/egoist/mygo)
 [![Colab CLI](https://img.shields.io/badge/google--colab--cli-0.8.x-4285F4)](https://github.com/googlecolab/google-colab-cli)
 [![License](https://img.shields.io/badge/License-MIT-10b981)](LICENSE)
@@ -39,7 +39,7 @@ No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (
   <tr>
     <td align="center" width="50%">
       <img src="docs/images/preview-onboarding.png" alt="First-Launch Environment Doctor" width="420" /><br />
-      <sub><b>Guided Setup</b> · Checks and installs official <code>google-colab-cli</code> in one click; automatically bridges WSL2 on Windows</sub>
+      <sub><b>Guided Setup</b> · Checks and installs official <code>google-colab-cli</code> in one click</sub>
     </td>
     <td align="center" width="50%">
       <img src="docs/images/preview-dashboard.png" alt="Quiet System-Tray Companion HUD" width="320" /><br />
@@ -63,8 +63,8 @@ Renting A100 / G4 / H100 GPUs through Google Colab is great value for running vi
    - **How Colab Tools helps**: Deployment scripts are built straight into the app and sent to the cloud VM automatically. Pick **H3 Original (31B)** or **H3 Flash (13.7B fast)** out of the box — or expand **More Versions** for 24GB-friendly GGUF, any HuggingFace repo, or models already in your Drive. All variants share the exact same 21.5 GB base weights (text encoder + audio/video VAE).
 3. **Symlinking 20GB+ weights straight from Google Drive FUSE causes stalls and disconnects**
    - **How Colab Tools helps**: When Google Drive is enabled, Colab Tools sequentially copies existing base weights and prebuilt acceleration `.whl` wheels onto the VM's fast local NVMe SSD (`rsync -ahW`) before running, downloads missing weights at datacenter speed (`hf_xet` / `hf_transfer`, with optional base backup back to Drive), and **writes every finished video clip straight to Drive `outputs/`** so a 24h timeout or disconnect never wipes your work. You can also turn Drive off for quick cloud-only trials.
-4. **Colab tabs drop connections, native port proxy breaks ComfyUI WebSockets, and Windows lacks native CLI support**
-   - **How Colab Tools helps**: Once ComfyUI starts, Colab Tools opens it in your browser through a **local encrypted SSH tunnel (`127.0.0.1:8188`)** using official `colab ssh --proxy-mode` — no public URL exposed and no WebSocket black screens (an optional `cloudflared` link toggle is included if you want to monitor from another device). Built in pure Go with GPU-rendered UI (`~8.5 MB` zipped, zero Electron), it runs natively on **macOS** and **Windows** (automatically bridging WSL2 on Windows until native Windows CLI lands).
+4. **Colab tabs drop connections and native port proxy breaks ComfyUI WebSockets**
+   - **How Colab Tools helps**: Once ComfyUI starts, Colab Tools opens it in your browser through a **local encrypted SSH tunnel (`127.0.0.1:8188`)** using official `colab ssh --proxy-mode` — no public URL exposed and no WebSocket black screens (an optional `cloudflared` link toggle is included if you want to monitor from another device). Built in pure Go with GPU-rendered UI (`~9 MB` zipped, zero Electron), fast and lightweight on **macOS**.
 
 ---
 
@@ -78,19 +78,17 @@ Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大
 
 ## Download & Install
 
+> **Platform focus:** Colab Tools currently focuses on **macOS**. Windows builds have been temporarily unlisted until the macOS experience is fully polished.
+
 ### Prerequisites
-- **macOS 14.0+** (`arm64` prebuilt; Intel builds from source) or **Windows 10/11 (`x64`)**
-- **Official Google Colab CLI** (**checked & installable right inside the first-launch wizard**):
-  - **macOS**: `uv tool install google-colab-cli`
-  - **Windows**: Colab Tools prefers native `colab.exe` if present and automatically bridges `google-colab-cli` inside **WSL2** otherwise.
+- **macOS 14.0+** (`arm64` Apple Silicon prebuilt; Intel Mac builds from source)
+- **Official Google Colab CLI** (`uv tool install google-colab-cli`, **checked & installable right inside the first-launch wizard**)
 
 ### Option 1: Download Prebuilt App (Recommended)
-1. Grab the archive for your OS from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest):
-   - **macOS (Apple Silicon)**: `Colab-Tools-v0.3.12-macOS-arm64.zip` → unzip and drag **`Colab Tools.app`** to `/Applications`.
-   - **Windows (x64)**: `Colab-Tools-v0.3.12-Windows-amd64.zip` → unzip and run **`Colab Tools.exe`**.
+1. Download `Colab-Tools-v0.3.12-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest), unzip it, and drag **`Colab Tools.app`** to `/Applications`.
 2. Finish the 3-step setup wizard, then on the **Home** tab simply click **Start & Run** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
 
-> **Signature notes:** Community builds are self-signed. On macOS, right-click → **Open** (or `xattr -cr "/Applications/Colab Tools.app"`). On Windows SmartScreen, click **More info → Run anyway**.
+> **Signature note:** Community builds are self-signed. On first launch, right-click → **Open** (or run `xattr -cr "/Applications/Colab Tools.app"`).
 
 ### Option 2: Build from Source (Pure Go, Zero CGO)
 ```bash
@@ -98,16 +96,7 @@ git clone https://github.com/LJMStark/Colab-Tools.git
 cd Colab-Tools
 GOTOOLCHAIN=auto go test -race ./...
 chmod +x scripts/package.sh
-./scripts/package.sh --all --zip --install
-```
-
-Windows PowerShell:
-```powershell
-$env:GOTOOLCHAIN = "auto"
-$env:CGO_ENABLED = "0"
-$env:GOFLAGS = "-trimpath"
-go test ./...
-go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
+./scripts/package.sh --mac --zip --install
 ```
 
 ---
@@ -115,7 +104,7 @@ go tool mygo build -platform windows/amd64 -skip-installer -o build/win .
 ## Security & Official Policy Compliance
 
 - **Strictly Official CLI Execution**: Runtime start/stop, quota checks, SSH tunnels (`colab ssh --proxy-mode`), and browser links all call official `google-colab-cli` commands.
-- **System Credential Vault**: Multi-account OAuth2 credentials and keys stay encrypted in macOS Keychain / Windows Credential Manager, using `0600` shredded ephemeral files during execution.
+- **System Credential Vault**: Multi-account OAuth2 credentials and keys stay encrypted in macOS Keychain, using `0600` shredded ephemeral files during execution.
 - **Polite Queue Guardrails**: Low-frequency Equal Jitter retries (max 5 rounds / 40 min) with immediate 15-minute cooldown on `429` rate limits or `412` assignment caps. Please follow the [Google Colab FAQ & Terms of Service](https://research.google.com/colaboratory/faq.html). See [SECURITY.md](SECURITY.md) for full details.
 
 ---
