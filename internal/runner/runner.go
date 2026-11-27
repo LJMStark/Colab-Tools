@@ -331,12 +331,45 @@ func runStreamingProcessGroup(parentCtx context.Context, name string, args []str
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 0, 64*1024), 512*1024)
-		for sc.Scan() {
-			line := strings.TrimSpace(strings.ReplaceAll(sc.Text(), "\r", ""))
+		const maxLineBytes = 64 * 1024
+		br := bufio.NewReaderSize(pr, 64*1024)
+		var lineBuf []byte
+		truncated := false
+		flushLine := func() {
+			if len(lineBuf) == 0 {
+				truncated = false
+				return
+			}
+			text := string(lineBuf)
+			if truncated {
+				text += "…[truncated]"
+			}
+			lineBuf = lineBuf[:0]
+			truncated = false
+			line := strings.TrimSpace(strings.ReplaceAll(text, "\r", ""))
 			if line != "" && onLine != nil {
 				onLine(line)
+			}
+		}
+		for {
+			chunk, isPrefix, err := br.ReadLine()
+			if len(chunk) > 0 {
+				if !truncated {
+					remain := maxLineBytes - len(lineBuf)
+					if len(chunk) <= remain {
+						lineBuf = append(lineBuf, chunk...)
+					} else {
+						lineBuf = append(lineBuf, chunk[:remain]...)
+						truncated = true
+					}
+				}
+			}
+			if !isPrefix {
+				flushLine()
+			}
+			if err != nil {
+				flushLine()
+				break
 			}
 		}
 	}()

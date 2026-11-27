@@ -146,16 +146,22 @@ type HistorySummary struct {
 	LastWatchdogDetail  string
 }
 
+const CurrentHistorySchemaVersion = 1
+
 type historyFilePayload struct {
-	Records []HistoryRecord `json:"records"`
+	SchemaVersion int             `json:"schemaVersion,omitempty"`
+	Records       []HistoryRecord `json:"records"`
 }
 
 // HistoryStore persists local session consumption and allocation attempt records with thread safety.
 type HistoryStore struct {
-	mu         sync.Mutex
-	path       string
-	memoryOnly bool
-	records    []HistoryRecord
+	mu              sync.Mutex
+	path            string
+	memoryOnly      bool
+	records         []HistoryRecord
+	corruptReadOnly bool
+	loadErr         error
+	backupPath      string
 }
 
 func HistoryFilePath() string {
@@ -183,16 +189,42 @@ func LoadHistoryStore(path string) *HistoryStore {
 	}
 	var payload historyFilePayload
 	if err := json.Unmarshal(raw, &payload); err == nil && payload.Records != nil {
+		if payload.SchemaVersion > CurrentHistorySchemaVersion {
+			backupPath := fmt.Sprintf("%s.future-v%d.%d", path, payload.SchemaVersion, time.Now().Unix())
+			_ = os.WriteFile(backupPath, raw, 0o600)
+			store.corruptReadOnly = true
+			store.backupPath = backupPath
+			store.loadErr = fmt.Errorf("历史账单版本 (v%d) 高于当前客户端支持版本，已备份并设为只读保护", payload.SchemaVersion)
+		}
 		store.records = payload.Records
 	} else {
 		var list []HistoryRecord
 		if err := json.Unmarshal(raw, &list); err != nil {
+			backupPath := fmt.Sprintf("%s.corrupt.%d", path, time.Now().Unix())
+			_ = os.WriteFile(backupPath, raw, 0o600)
+			store.corruptReadOnly = true
+			store.backupPath = backupPath
+			store.loadErr = fmt.Errorf("历史账单文件损坏，已备份至 %s 并启用只读保护防止覆写", filepath.Base(backupPath))
 			return store
 		}
 		store.records = list
 	}
 	store.sanitizeAndPruneLocked(time.Now())
 	return store
+}
+
+// LoadError returns any parse/corruption error encountered while loading the history file along with the backup path.
+func (s *HistoryStore) LoadError() (error, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadErr, s.backupPath
+}
+
+// IsCorruptReadOnly reports whether disk writes are blocked to prevent overwriting a corrupt history file.
+func (s *HistoryStore) IsCorruptReadOnly() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.corruptReadOnly
 }
 
 func cloneRecord(rec HistoryRecord) HistoryRecord {
@@ -237,6 +269,12 @@ func (s *HistoryStore) saveLocked() error {
 	if s.memoryOnly || s.path == "" {
 		return nil
 	}
+	if s.corruptReadOnly {
+		if s.loadErr != nil {
+			return s.loadErr
+		}
+		return fmt.Errorf("历史账单处于只读保护状态，拒绝覆写原文件")
+	}
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -245,7 +283,10 @@ func (s *HistoryStore) saveLocked() error {
 	if recs == nil {
 		recs = []HistoryRecord{}
 	}
-	data, err := json.MarshalIndent(historyFilePayload{Records: recs}, "", "  ")
+	data, err := json.MarshalIndent(historyFilePayload{
+		SchemaVersion: CurrentHistorySchemaVersion,
+		Records:       recs,
+	}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -260,7 +301,7 @@ func (s *HistoryStore) saveLocked() error {
 	return nil
 }
 
-func (s *HistoryStore) AddRecord(rec HistoryRecord) {
+func (s *HistoryStore) AddRecord(rec HistoryRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -277,10 +318,21 @@ func (s *HistoryStore) AddRecord(rec HistoryRecord) {
 	if rec.ConsumedCU < 0 {
 		rec.ConsumedCU = 0
 	}
-	// Prepend so records with identical StartedAt keep newest-first order.
-	s.records = append([]HistoryRecord{cloneRecord(rec)}, s.records...)
+	// Idempotent upsert by deterministic ID so ledger-to-history recovery never creates duplicates.
+	replaced := false
+	for i := range s.records {
+		if s.records[i].ID == rec.ID {
+			s.records[i] = cloneRecord(rec)
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		// Prepend so records with identical StartedAt keep newest-first order.
+		s.records = append([]HistoryRecord{cloneRecord(rec)}, s.records...)
+	}
 	s.sanitizeAndPruneLocked(now)
-	_ = s.saveLocked()
+	return s.saveLocked()
 }
 
 func (s *HistoryStore) Query(filter HistoryFilter, now time.Time) ([]HistoryRecord, HistorySummary) {
@@ -486,10 +538,16 @@ func (s *HistoryStore) ExportCSV(filter HistoryFilter, now time.Time) string {
 	return buf.String()
 }
 
-func (s *HistoryStore) Clear() {
+func (s *HistoryStore) Clear() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.corruptReadOnly {
+		if s.loadErr != nil {
+			return s.loadErr
+		}
+		return fmt.Errorf("历史账单处于只读保护状态，拒绝清空原文件")
+	}
 	s.records = []HistoryRecord{}
-	_ = s.saveLocked()
+	return s.saveLocked()
 }

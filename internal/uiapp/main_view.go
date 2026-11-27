@@ -220,12 +220,12 @@ func (m *MainUI) renderHomeOptionsOverlay(c *ui.Context, pal Palette) {
 
 					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
-					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(592).Children(func() {
+					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(508).Children(func() {
 						ui.Column(c).FillWidth().Gap(12).Padding(2, 4, 4, 0).Children(func() {
 							m.renderHomeOptionsDrawer(c, pal, acc, rt)
 						})
 					})
-				}).Width(780).MaxHeight(676).Gap(12).
+				}).Width(780).MaxHeight(596).Gap(12).
 					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.42))
 				_ = card
 			})
@@ -319,8 +319,18 @@ func (m *MainUI) renderDeployLogOverlay(c *ui.Context, pal Palette) {
 								go m.Svc.OpenCloudTerminal(acc.ID)
 							})
 							SmallActionButton(c, pal, "Drive 目录", nil, false, func() {
-								m.Svc.OpenDriveOutputs()
+								m.Svc.OpenDriveOutputs(acc.ID)
 							})
+							if rt.Phase.IsRunning() && acc.UseGoogleDrive && rt.DriveMountedKnown && !rt.DriveActuallyMounted {
+								SmallActionButton(c, pal, "重挂 Drive", &pal.Coral, false, func() {
+									go m.Svc.RemountDriveNow(acc.ID)
+								})
+							}
+							if rt.Phase.IsRunning() && (rt.CloudflaredActive || strings.Contains(rt.DisplayUIURL, "trycloudflare.com")) {
+								SmallActionButton(c, pal, "关公网通道", &pal.Coral, false, func() {
+									go m.Svc.StopCloudflaredTunnel(acc.ID)
+								})
+							}
 						})
 						ui.Text(c, "Drive 标准目录：workflows/（工作流自动双向同步）· models/<checkpoints|loras|vae|diffusion_models>/（零拷贝直挂）· outputs/（成片直出）").
 							FontSize(11.5).TextColor(pal.TextMuted)
@@ -334,12 +344,12 @@ func (m *MainUI) renderDeployLogOverlay(c *ui.Context, pal Palette) {
 					} else if logText == "" {
 						logText = "点击右上角「刷新日志」拉取云端实时安装记录与端口状态。"
 					}
-					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(420).Children(func() {
+					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(356).Children(func() {
 						ui.Column(c).FillWidth().Padding(12, 14).Radius(10).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).Children(func() {
 							ui.Text(c, logText).FontSize(11.5).Font("monospace").TextColor(pal.TextPrimary)
 						})
 					})
-				}).Width(820).MaxHeight(648).Gap(12).
+				}).Width(820).MaxHeight(596).Gap(12).
 					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.45))
 			})
 	})
@@ -361,11 +371,15 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 			Children(func() {
 				PrecisionCard(c, pal, 20, 22, func() {
 					led := pal.Amber
+					dangerPrimary := false
 					switch prompt.Kind {
 					case core.PromptComfyHelp:
 						led = pal.Sky
-					case core.PromptConfirmStop:
+					case core.PromptConfirmStop, core.PromptConfirmStopAll, core.PromptConfirmRemoveAccount, core.PromptConfirmQuit:
 						led = pal.Coral
+						dangerPrimary = true
+					case core.PromptTempOutputGuard:
+						led = pal.Amber
 					}
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 						DrawPrecisionLED(c, led, 13)
@@ -376,10 +390,14 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 
 					ui.Column(c).FillWidth().Gap(10).Children(func() {
 						ui.Text(c, prompt.Message).FontSize(13.5).TextColor(pal.TextPrimary)
-						if prompt.URL != "" && prompt.Kind == core.PromptDriveAuth {
+						if prompt.URL != "" && (prompt.Kind == core.PromptDriveAuth || (prompt.Kind == core.PromptComfyHelp && prompt.PrimaryAction != "open_colab")) {
+							urlBtnLabel := "浏览器没弹出？点此重新打开授权页"
+							if prompt.Kind == core.PromptComfyHelp {
+								urlBtnLabel = "直接打开 Colab 官方网页"
+							}
 							ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-								SmallActionButton(c, pal, "浏览器没弹出？点此重新打开授权页", &pal.Sky, false, func() {
-									m.Svc.ResolveActionPrompt("open_url")
+								SmallActionButton(c, pal, urlBtnLabel, &pal.Sky, false, func() {
+									m.Svc.ResolveActionPromptByID(prompt.ID, "open_url")
 								})
 							})
 						}
@@ -390,18 +408,18 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 						if prompt.CancelLabel != "" {
 							SmallActionButton(c, pal, prompt.CancelLabel, nil, false, func() {
-								m.Svc.ResolveActionPrompt("cancel")
+								m.Svc.ResolveActionPromptByID(prompt.ID, "cancel")
 							})
 						}
 						ui.Spacer(c)
 						if prompt.SecondaryLabel != "" {
 							PillButton(c, pal, prompt.SecondaryLabel, false, false, func() {
-								m.Svc.ResolveActionPrompt("secondary")
+								m.Svc.ResolveActionPromptByID(prompt.ID, "secondary")
 							})
 						}
 						if prompt.PrimaryLabel != "" {
-							actionModalPrimaryButton(c, pal, prompt.PrimaryLabel, prompt.Kind == core.PromptConfirmStop, func() {
-								m.Svc.ResolveActionPrompt("primary")
+							actionModalPrimaryButton(c, pal, prompt.PrimaryLabel, dangerPrimary, func() {
+								m.Svc.ResolveActionPromptByID(prompt.ID, "primary")
 							})
 						}
 					})
@@ -775,8 +793,8 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 				}
 				switch rt.LastErrorAction {
 				case "stop_existing":
-					SmallActionButton(c, pal, "停掉旧机器", &pal.Coral, false, func() {
-						go m.Svc.StopAllManagedSessions()
+					SmallActionButton(c, pal, "停掉本号旧机器", &pal.Coral, false, func() {
+						go m.Svc.StopAccountManagedSessions(acc.ID)
 					})
 				case "reauth":
 					SmallActionButton(c, pal, "去重新授权", &pal.Amber, false, func() {
@@ -1467,6 +1485,8 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 			title := "视频画布与产出"
 			badge := "纯云端"
 			var bTint *ui.Color
+			driveFallbackTemp := rt.Phase.IsRunning() && acc.UseGoogleDrive && rt.DriveMountedKnown && !rt.DriveActuallyMounted
+			publicTunnelOpen := rt.Phase.IsRunning() && (rt.CloudflaredActive || strings.Contains(rt.DisplayUIURL, "trycloudflare.com"))
 			if acc.UseGoogleDrive {
 				badge = "Drive 存片"
 				e := pal.Emerald
@@ -1484,6 +1504,18 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 					badge = "失败"
 					rCol := pal.Coral
 					bTint = &rCol
+				} else if driveFallbackTemp {
+					rCol := pal.Coral
+					bTint = &rCol
+					if rt.RenderedVideoCount > 0 {
+						badge = fmt.Sprintf("临时盘·%d条", rt.RenderedVideoCount)
+					} else {
+						badge = "临时盘(关机清)"
+					}
+				} else if publicTunnelOpen {
+					a := pal.Amber
+					bTint = &a
+					badge = "公网无密"
 				} else if rt.RenderedVideoCount > 0 {
 					badge = fmt.Sprintf("已出 %d 条", rt.RenderedVideoCount)
 					e := pal.Emerald
@@ -1491,7 +1523,7 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 				} else if rt.ServerHealthy {
 					e := pal.Emerald
 					bTint = &e
-					if acc.UseGoogleDrive {
+					if acc.UseGoogleDrive && (!rt.DriveMountedKnown || rt.DriveActuallyMounted) {
 						badge = "Drive 存片"
 					} else {
 						badge = "已就绪"
@@ -1574,9 +1606,19 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 					m.quickCardBtn(c, pal, comfyLabel, !rt.ComfyOpening, rt.ComfyOpening, func() {
 						go m.Svc.OpenComfyUI(acc.ID)
 					})
-					m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
-						m.Svc.OpenDriveOutputs()
-					})
+					if driveFallbackTemp {
+						m.quickCardBtn(c, pal, "重挂 Drive", true, false, func() {
+							go m.Svc.RemountDriveNow(acc.ID)
+						})
+					} else if publicTunnelOpen {
+						m.quickCardBtn(c, pal, "关公网通道", true, false, func() {
+							go m.Svc.StopCloudflaredTunnel(acc.ID)
+						})
+					} else {
+						m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
+							m.Svc.OpenDriveOutputs(acc.ID)
+						})
+					}
 					m.quickCardCompactBtn(c, pal, "后台", m.ShowDeployLog, false, func() {
 						m.openDeployLogOverlay(acc.ID)
 					})
@@ -1604,7 +1646,7 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 				} else {
 					m.quickCardBtn(c, pal, "开 ComfyUI", false, true, nil)
 					m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
-						m.Svc.OpenDriveOutputs()
+						m.Svc.OpenDriveOutputs(acc.ID)
 					})
 				}
 			})
@@ -1848,7 +1890,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 				ui.Textf(c, "账号与活跃会话 (%d)", len(accounts)).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
 				if m.Svc.TotalManagedRunningSessionCount() >= 2 {
 					SmallActionButton(c, pal, "⏻ 全部关机止损", &pal.Coral, false, func() {
-						go m.Svc.StopAllManagedSessions()
+						m.Svc.RequestConfirmStopAll()
 					})
 				}
 			})
@@ -1964,7 +2006,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 				ui.Row(c).Width(colAct).Justify(ui.End).AlignItems(ui.Center).Gap(6).Children(func() {
 					if rt.Phase.IsRunning() {
 						SmallActionButton(c, pal, "关机", &pal.Coral, false, func() {
-							go m.Svc.StopAccountSession(accCopy.ID, "", "")
+							m.Svc.RequestConfirmStop(accCopy.ID)
 						})
 					} else if rt.Phase.IsQueuing() {
 						SmallActionButton(c, pal, "取消", &pal.Coral, false, func() {
@@ -1997,7 +2039,7 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 					ui.Row(c).Width(colAct).Justify(ui.End).Children(func() {
 						if !sessCopy.IsOrphan {
 							SmallActionButton(c, pal, "停止", &pal.Coral, false, func() {
-								go m.Svc.StopAccountSession(accCopy.ID, sessCopy.Name, "")
+								m.Svc.RequestConfirmStopSession(accCopy.ID, sessCopy.Name)
 							})
 						}
 					})

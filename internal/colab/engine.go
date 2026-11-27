@@ -60,7 +60,13 @@ type RemoteTelemetry struct {
 	DetectedWebPort    *int
 	DeployAlive        bool
 	RenderedVideoCount int
+	DriveMounted       *bool
+	EffectiveOutputDir string
+	TempOutputVideos   *int
+	CloudflaredActive  bool
 }
+
+var ErrSessionParseFailed = errors.New("colab sessions 输出格式异常，已保留上次状态防止误判离线")
 
 type ProbeAttemptRecord struct {
 	Hardware  string
@@ -210,25 +216,73 @@ func ParseUsage(stdout string) (*UsageSnapshot, bool) {
 	return &UsageSnapshot{Balance: *bal, RatePerHour: *rate, ActiveAssignments: *active}, true
 }
 
-func ParseSessions(stdout string) []core.ColabSessionItem {
+func isExplicitEmptySessionsLine(lower string) bool {
+	return strings.Contains(lower, "no active sessions") ||
+		strings.Contains(lower, "no sessions") ||
+		strings.Contains(lower, "0 active")
+}
+
+func isSessionHeaderOrDecorLine(lower string) bool {
+	if lower == "" {
+		return true
+	}
+	if strings.HasPrefix(lower, "active sessions:") ||
+		strings.HasPrefix(lower, "sessions:") ||
+		strings.HasPrefix(lower, "hint:") ||
+		strings.HasPrefix(lower, "tip:") ||
+		(strings.HasPrefix(lower, "[colab] pruned ") && !strings.Contains(lower, "|")) {
+		return true
+	}
+	return strings.Trim(lower, "-=_ ") == ""
+}
+
+// ParseSessionsStrict parses `colab sessions` output and returns ErrSessionParseFailed if any
+// unrecognized/malformed non-header line appears (preventing partial/truncated output from being treated as offline).
+func ParseSessionsStrict(stdout string) ([]core.ColabSessionItem, error) {
 	var items []core.ColabSessionItem
+	unrecognized := 0
+	firstUnrecognized := ""
+
 	for _, raw := range strings.Split(runner.StripCR(stdout), "\n") {
 		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if isExplicitEmptySessionsLine(lower) || isSessionHeaderOrDecorLine(lower) {
+			continue
+		}
 		if !strings.HasPrefix(line, "[") || !strings.Contains(line, "| Hardware:") {
+			unrecognized++
+			if firstUnrecognized == "" {
+				firstUnrecognized = line
+			}
 			continue
 		}
 		closeIdx := strings.Index(line, "]")
 		if closeIdx <= 1 {
+			unrecognized++
+			if firstUnrecognized == "" {
+				firstUnrecognized = line
+			}
 			continue
 		}
 		name := line[1:closeIdx]
 		rest := strings.TrimSpace(line[closeIdx+1:])
 		parts := strings.Split(rest, "|")
 		if len(parts) < 2 {
+			unrecognized++
+			if firstUnrecognized == "" {
+				firstUnrecognized = line
+			}
 			continue
 		}
 		endpoint := strings.TrimSpace(parts[0])
 		if endpoint == "" {
+			unrecognized++
+			if firstUnrecognized == "" {
+				firstUnrecognized = line
+			}
 			continue
 		}
 		hw := ""
@@ -246,6 +300,10 @@ func ParseSessions(stdout string) []core.ColabSessionItem {
 			}
 		}
 		if hw == "" {
+			unrecognized++
+			if firstUnrecognized == "" {
+				firstUnrecognized = line
+			}
 			continue
 		}
 		items = append(items, core.ColabSessionItem{
@@ -257,6 +315,17 @@ func ParseSessions(stdout string) []core.ColabSessionItem {
 			IsOrphan: name == "?",
 		})
 	}
+	if unrecognized > 0 {
+		if len(firstUnrecognized) > 120 {
+			firstUnrecognized = firstUnrecognized[:120] + "…"
+		}
+		return nil, fmt.Errorf("%w（%s）", ErrSessionParseFailed, firstUnrecognized)
+	}
+	return items, nil
+}
+
+func ParseSessions(stdout string) []core.ColabSessionItem {
+	items, _ := ParseSessionsStrict(stdout)
 	return items
 }
 
@@ -292,7 +361,11 @@ func (e *Engine) FetchUsageAndSessions(ctx context.Context, profile core.Account
 		}
 		return usage, nil, errors.New(errTxt)
 	}
-	return usage, ParseSessions(s.Stdout), nil
+	sessions, parseErr := ParseSessionsStrict(s.Stdout)
+	if parseErr != nil {
+		return usage, nil, parseErr
+	}
+	return usage, sessions, nil
 }
 
 func (e *Engine) FetchRemoteTelemetry(ctx context.Context, profile core.AccountProfile) *RemoteTelemetry {
@@ -384,16 +457,65 @@ if pid_p.exists():
     except Exception:
         pass
 print("DEPLOY_ALIVE=" + ("1" if deploy_alive else "0"))
-out_count = 0
-for odir in [%q, "/content/drive/MyDrive/ColabTools/outputs", "/content/output"]:
-    op = pathlib.Path(odir)
-    if op.is_dir():
+drive_mounted = pathlib.Path("/content/drive/MyDrive").is_dir()
+print("DRIVE_MOUNTED=" + ("1" if drive_mounted else "0"))
+def has_cloudflared():
+    cf_pid_p = pathlib.Path("/tmp/colab-tools-cloudflared.pid")
+    if cf_pid_p.exists():
         try:
-            out_count = sum(1 for f in op.iterdir() if f.is_file() and f.suffix.lower() in (".mp4", ".webm", ".mov", ".mkv", ".gif"))
-            if out_count > 0:
-                break
+            cfpid = int(cf_pid_p.read_text().strip())
+            cf_cmd = pathlib.Path(f"/proc/{cfpid}/cmdline")
+            if cf_cmd.exists() and "cloudflared" in cf_cmd.read_bytes().decode("utf-8", errors="ignore"):
+                return True
         except Exception:
             pass
+    try:
+        for proc_d in pathlib.Path("/proc").iterdir():
+            if not proc_d.name.isdigit():
+                continue
+            try:
+                cmd = (proc_d / "cmdline").read_bytes().decode("utf-8", errors="ignore")
+                if "cloudflared" in cmd and "tunnel" in cmd and "127.0.0.1:" in cmd:
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+print("CLOUDFLARED_ACTIVE=" + ("1" if has_cloudflared() else "0"))
+video_exts = (".mp4", ".webm", ".mov", ".mkv", ".gif")
+def count_videos_recursive(root_p):
+    if not root_p.is_dir():
+        return 0
+    cnt = 0
+    err = False
+    def on_err(_e):
+        nonlocal err
+        err = True
+    for dp, dns, fns in os.walk(root_p, onerror=on_err):
+        dns[:] = [d for d in dns if not d.startswith(".")]
+        for fn in fns:
+            if fn.lower().endswith(video_exts):
+                cnt += 1
+    return -1 if (err and cnt == 0) else cnt
+temp_out_cnt = count_videos_recursive(pathlib.Path("/content/output"))
+print(f"TEMP_OUT_VIDEOS={temp_out_cnt}")
+out_count = 0
+eff_out_dir = ""
+cand_dirs = [%q, "/content/drive/MyDrive/ColabTools/outputs", "/content/output"] if drive_mounted else ["/content/output"]
+for odir in cand_dirs:
+    if not odir:
+        continue
+    op = pathlib.Path(odir)
+    if op.is_dir():
+        if not eff_out_dir:
+            eff_out_dir = odir
+        c_num = count_videos_recursive(op)
+        if c_num > 0:
+            out_count = c_num
+            eff_out_dir = odir
+            break
+print("EFFECTIVE_OUT_DIR=" + eff_out_dir)
 print(f"OUT_VIDEOS={out_count}")
 meta_p = pathlib.Path("/tmp/llama-server.meta")
 if meta_p.exists():
@@ -453,6 +575,17 @@ else:
 			t.Healthy = strings.Contains(raw, "ok")
 		case strings.HasPrefix(raw, "DEPLOY_ALIVE="):
 			t.DeployAlive = strings.TrimSpace(strings.TrimPrefix(raw, "DEPLOY_ALIVE=")) == "1"
+		case strings.HasPrefix(raw, "DRIVE_MOUNTED="):
+			val := strings.TrimSpace(strings.TrimPrefix(raw, "DRIVE_MOUNTED=")) == "1"
+			t.DriveMounted = &val
+		case strings.HasPrefix(raw, "CLOUDFLARED_ACTIVE="):
+			t.CloudflaredActive = strings.TrimSpace(strings.TrimPrefix(raw, "CLOUDFLARED_ACTIVE=")) == "1"
+		case strings.HasPrefix(raw, "EFFECTIVE_OUT_DIR="):
+			t.EffectiveOutputDir = strings.TrimSpace(strings.TrimPrefix(raw, "EFFECTIVE_OUT_DIR="))
+		case strings.HasPrefix(raw, "TEMP_OUT_VIDEOS="):
+			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "TEMP_OUT_VIDEOS="))); err == nil {
+				t.TempOutputVideos = &v
+			}
 		case strings.HasPrefix(raw, "OUT_VIDEOS="):
 			t.RenderedVideoCount, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "OUT_VIDEOS=")))
 		case strings.HasPrefix(raw, "UPTIME="):
@@ -1035,6 +1168,86 @@ else:
 	return "", errors.New(errMsg)
 }
 
+// StopCloudflaredTunnel terminates any running cloudflared quick tunnel started on the remote Colab VM and verifies exit.
+func (e *Engine) StopCloudflaredTunnel(ctx context.Context, profile core.AccountProfile) error {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return errors.New("会话名不合法")
+	}
+	py := `import os, pathlib, signal, time
+pid_path = pathlib.Path("/tmp/colab-tools-cloudflared.pid")
+log_path = pathlib.Path("/tmp/colab-tools-cloudflared.log")
+pub_path = pathlib.Path("/tmp/public_url.txt")
+
+def find_cf_pids():
+    found = set()
+    if pid_path.exists():
+        try:
+            p = int(pid_path.read_text().strip())
+            cmd_p = pathlib.Path(f"/proc/{p}/cmdline")
+            if cmd_p.exists() and "cloudflared" in cmd_p.read_bytes().decode("utf-8", errors="ignore"):
+                found.add(p)
+        except Exception:
+            pass
+    try:
+        for d in pathlib.Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().decode("utf-8", errors="ignore")
+                if "cloudflared" in cmd and "tunnel" in cmd and "127.0.0.1:" in cmd:
+                    found.add(int(d.name))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return sorted(found)
+
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    pids = find_cf_pids()
+    if not pids:
+        break
+    for pid in pids:
+        try:
+            os.killpg(pid, sig)
+        except Exception:
+            try:
+                os.kill(pid, sig)
+            except Exception:
+                pass
+    deadline = time.time() + (2.5 if sig == signal.SIGTERM else 1.0)
+    while time.time() < deadline and find_cf_pids():
+        time.sleep(0.2)
+
+remaining = find_cf_pids()
+if remaining:
+    print(f"CLOUDFLARED_STILL_ALIVE={remaining}")
+    raise SystemExit(1)
+
+pid_path.unlink(missing_ok=True)
+log_path.unlink(missing_ok=True)
+if pub_path.exists():
+    try:
+        if "trycloudflare.com" in pub_path.read_text(errors="ignore"):
+            pub_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+print("CLOUDFLARED_STOPPED=1")
+`
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 20*time.Second)
+	out := strings.TrimSpace(runner.StripCR(r.Stdout))
+	if r.ExitCode != 0 || !strings.Contains(out, "CLOUDFLARED_STOPPED=1") {
+		msg := strings.TrimSpace(r.Stderr)
+		if msg == "" {
+			msg = out
+		}
+		if msg == "" {
+			msg = "关闭云端临时公网通道失败，未能确认进程退出"
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
 // EnsureDriveMountedInteractive 以交互管道运行 `colab drivemount`，遇到 Google Drive 浏览器授权提示时通过回调弹窗引导用户一步完成授权。
 func (e *Engine) EnsureDriveMountedInteractive(ctx context.Context, profile core.AccountProfile, onAuthRequired func(authURL string) (proceed bool)) (bool, string) {
 	if !core.IsValidSessionName(profile.SessionName) {
@@ -1399,6 +1612,9 @@ func (e *Engine) FlushWorkspaceToDrive(ctx context.Context, profile core.Account
 		snapFlag = "1"
 	}
 	py := fmt.Sprintf(`import os, pathlib, subprocess
+if not pathlib.Path("/content/drive/MyDrive").is_dir():
+    print("FLUSH_NO_DRIVE=1")
+    raise SystemExit(2)
 p = pathlib.Path("/tmp/colab-tools-flush.py")
 if not p.is_file():
     print("FLUSH_SKIP=1")
@@ -1410,11 +1626,18 @@ if r.stdout:
     print(r.stdout.strip())
 raise SystemExit(r.returncode)
 `, snapFlag)
-	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 12*time.Second)
-	if r.ExitCode != 0 {
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 25*time.Second)
+	out := strings.TrimSpace(runner.StripCR(r.Stdout))
+	if strings.Contains(out, "FLUSH_SKIP=1") {
+		return errors.New("云端未发现工作流同步脚本，无法确认最新工作流已同步")
+	}
+	if strings.Contains(out, "FLUSH_NO_DRIVE=1") {
+		return errors.New("Google Drive 未挂载，工作流未能同步到 Drive")
+	}
+	if r.ExitCode != 0 || !strings.Contains(out, "FLUSH_OK") {
 		msg := strings.TrimSpace(r.Stderr)
 		if msg == "" {
-			msg = strings.TrimSpace(r.Stdout)
+			msg = out
 		}
 		if msg == "" {
 			msg = "云端工作流同步失败"

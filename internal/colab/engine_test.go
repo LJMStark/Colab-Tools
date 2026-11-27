@@ -336,3 +336,79 @@ exit 0
 		t.Fatalf("expected interactive drive mount skip, got ok=%v reason=%q", ok2, reason2)
 	}
 }
+
+func TestParseSessionsStrictFlushValidationAndTelemetryDriveState(t *testing.T) {
+	// 1. ParseSessionsStrict accepts empty / known empty hints / valid lines, rejects unknown garbage
+	if items, err := colab.ParseSessionsStrict(""); err != nil || len(items) != 0 {
+		t.Fatalf("empty output must parse cleanly, got items=%v err=%v", items, err)
+	}
+	if items, err := colab.ParseSessionsStrict("No active sessions.\n"); err != nil || len(items) != 0 {
+		t.Fatalf("known empty hint must parse cleanly, got items=%v err=%v", items, err)
+	}
+	if items, err := colab.ParseSessionsStrict("[colab-tools] ep-1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"); err != nil || len(items) != 1 || items[0].Hardware != "A100" {
+		t.Fatalf("valid session line failed: items=%+v err=%v", items, err)
+	}
+	for _, bad := range []string{
+		"<html><body>502 Bad Gateway</body></html>",
+		"[colab-tools] truncated without hardware field",
+		"Unexpected CLI v2 JSON format: {\"sessions\":[]}",
+		"Active sessions:\n[colab-tools] truncated without hardware",
+		"[extra] ep-2 | Hardware: L4 | Shape: Standard | Variant: GPU\n[colab-tools] ep-1 | truncated",
+	} {
+		if _, err := colab.ParseSessionsStrict(bad); err == nil {
+			t.Fatalf("expected ErrSessionParseFailed for %q, got nil", bad)
+		}
+	}
+
+	// 2. FlushWorkspaceToDrive must reject FLUSH_SKIP=1 and FLUSH_NO_DRIVE=1 and accept FLUSH_OK
+	acc := core.NewDefaultAccountProfile("Flush", "flush@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	for _, tc := range []struct {
+		name    string
+		stdout  string
+		wantErr bool
+	}{
+		{"ok", "FLUSH_OK workflows=2 snapshot_nodes=1\n", false},
+		{"skip", "FLUSH_SKIP=1\n", true},
+		{"no_drive", "FLUSH_NO_DRIVE=1\n", true},
+		{"empty", "\n", true},
+	} {
+		mr := &mockRunner{
+			onShell: func(_ string) runner.Result {
+				return runner.Result{ExitCode: 0, Stdout: tc.stdout}
+			},
+		}
+		eng := colab.NewEngine(mr, vault.New(vault.NewMemoryBackend()))
+		err := eng.FlushWorkspaceToDrive(context.Background(), acc)
+		if tc.wantErr && err == nil {
+			t.Fatalf("case %s: expected error for stdout=%q", tc.name, tc.stdout)
+		}
+		if !tc.wantErr && err != nil {
+			t.Fatalf("case %s: expected nil error, got %v", tc.name, err)
+		}
+	}
+
+	// 3. FetchRemoteTelemetry parses DRIVE_MOUNTED, EFFECTIVE_OUT_DIR, TEMP_OUT_VIDEOS, CLOUDFLARED_ACTIVE
+	mrTel := &mockRunner{
+		onShell: func(_ string) runner.Result {
+			return runner.Result{
+				ExitCode: 0,
+				Stdout:   "NV=NVIDIA L4, 1200, 23034, 5\nDRIVE_MOUNTED=0\nCLOUDFLARED_ACTIVE=1\nTEMP_OUT_VIDEOS=4\nEFFECTIVE_OUT_DIR=/content/output\nOUT_VIDEOS=3\nHEALTH=ok\n",
+			}
+		},
+	}
+	engTel := colab.NewEngine(mrTel, vault.New(vault.NewMemoryBackend()))
+	tel := engTel.FetchRemoteTelemetry(context.Background(), acc)
+	if tel == nil || tel.DriveMounted == nil || *tel.DriveMounted != false || tel.TempOutputVideos == nil || *tel.TempOutputVideos != 4 || tel.EffectiveOutputDir != "/content/output" || !tel.CloudflaredActive || tel.RenderedVideoCount != 3 {
+		t.Fatalf("unexpected telemetry parsed: %+v", tel)
+	}
+
+	// 4. StopCloudflaredTunnel requires CLOUDFLARED_STOPPED=1 verification
+	mrStopBad := &mockRunner{onShell: func(_ string) runner.Result { return runner.Result{ExitCode: 0, Stdout: ""} }}
+	if err := colab.NewEngine(mrStopBad, vault.New(vault.NewMemoryBackend())).StopCloudflaredTunnel(context.Background(), acc); err == nil {
+		t.Fatal("StopCloudflaredTunnel must fail when CLOUDFLARED_STOPPED=1 is missing")
+	}
+	mrStopOK := &mockRunner{onShell: func(_ string) runner.Result { return runner.Result{ExitCode: 0, Stdout: "CLOUDFLARED_STOPPED=1\n"} }}
+	if err := colab.NewEngine(mrStopOK, vault.New(vault.NewMemoryBackend())).StopCloudflaredTunnel(context.Background(), acc); err != nil {
+		t.Fatalf("StopCloudflaredTunnel failed: %v", err)
+	}
+}

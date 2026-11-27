@@ -426,9 +426,31 @@ def preserve_conflict_pair(rel: str, l_path: pathlib.Path, d_path: pathlib.Path,
         new_state[c_rel] = lh
 
 
+class DriveNotMountedError(RuntimeError):
+    pass
+
+
+def move_to_trash(target: pathlib.Path, root: pathlib.Path, rel: str) -> None:
+    if not target.exists():
+        return
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    base_dir = root / ".trash" / f"{ts}-{os.getpid()}"
+    trash_dst = base_dir / rel
+    idx = 2
+    while trash_dst.exists():
+        trash_dst = (root / ".trash" / f"{ts}-{os.getpid()}-{idx}") / rel
+        idx += 1
+    trash_dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.replace(trash_dst)
+    except OSError:
+        atomic_copy(target, trash_dst)
+        target.unlink(missing_ok=True)
+
+
 def sync_workflows() -> int:
     if not DRIVE_MOUNT_CHECK.is_dir():
-        return 0
+        raise DriveNotMountedError("Google Drive is not mounted")
     LOCAL_WF_DIR.mkdir(parents=True, exist_ok=True)
     DRIVE_WF_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -436,8 +458,8 @@ def sync_workflows() -> int:
         import fcntl
         lock_fh = LOCK_FILE.open("w")
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-    except Exception:
-        lock_fh = None
+    except Exception as exc:
+        raise RuntimeError(f"failed to acquire workflow sync lock: {exc}") from exc
 
     try:
         prev_state = load_state()
@@ -492,7 +514,7 @@ def sync_workflows() -> int:
                     if cur_dh is not None:
                         preserve_conflict_pair(rel, l_path, d_path, new_state)
                     elif cur_lh == lh:
-                        l_path.unlink(missing_ok=True)
+                        move_to_trash(l_path, LOCAL_WF_DIR, rel)
                     elif cur_lh is not None:
                         atomic_copy(l_path, d_path)
                         new_state[rel] = cur_lh
@@ -515,7 +537,7 @@ def sync_workflows() -> int:
                     if cur_lh is not None:
                         preserve_conflict_pair(rel, l_path, d_path, new_state)
                     elif cur_dh == dh:
-                        d_path.unlink(missing_ok=True)
+                        move_to_trash(d_path, DRIVE_WF_DIR, rel)
                     elif cur_dh is not None:
                         atomic_copy(d_path, l_path)
                         new_state[rel] = cur_dh
@@ -656,7 +678,14 @@ def save_custom_nodes_snapshot() -> int:
 
 
 if __name__ == "__main__":
-    wf_n = sync_workflows()
+    if not DRIVE_MOUNT_CHECK.is_dir():
+        print("FLUSH_NO_DRIVE=1")
+        raise SystemExit(2)
+    try:
+        wf_n = sync_workflows()
+    except DriveNotMountedError:
+        print("FLUSH_NO_DRIVE=1")
+        raise SystemExit(2)
     sn_n = save_custom_nodes_snapshot()
     print(f"FLUSH_OK workflows={wf_n} snapshot_nodes={sn_n}")
 PY
@@ -802,6 +831,7 @@ if [ "$ENABLE_CLOUDFLARED" = "1" ]; then
     chmod +x /usr/local/bin/cloudflared
   fi
   nohup cloudflared tunnel --url "http://127.0.0.1:${SERVICE_PORT}" --no-autoupdate > "$CF_LOG_FILE" 2>&1 &
+  echo "$!" > /tmp/colab-tools-cloudflared.pid
   for _ in $(seq 1 20); do
     PUBLIC_URL="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$CF_LOG_FILE" | head -n 1 || true)"
     if [ -n "$PUBLIC_URL" ]; then

@@ -12,11 +12,14 @@ import (
 
 // PopoverUI renders the compact 420pt menu-bar / system-tray companion HUD.
 type PopoverUI struct {
-	Svc          *app.Service
-	ForceTheme   string
-	OverviewMode bool
-	OnOpenMain   func(sec app.MainSection)
-	OnQuit       func()
+	Svc              *app.Service
+	ForceTheme       string
+	OverviewMode     bool
+	OnOpenMain       func(sec app.MainSection)
+	OnOpenOnboarding func()
+	OnRequestStop    func(accountID string)
+	OnRequestStopAll func()
+	OnQuit           func()
 }
 
 func NewPopoverUI(svc *app.Service) *PopoverUI {
@@ -66,24 +69,30 @@ func (p *PopoverUI) View(c *ui.Context) {
 			ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 		}
 
-		ui.Column(c).FillWidth().Grow(1).Padding(14, 16, 12, 16).Gap(10).Children(func() {
-			if len(accounts) == 0 {
-				SectionCard(c, pal, "", "", func() {
-					ui.Column(c).FillWidth().Gap(10).AlignItems(ui.Center).Padding(16, 8).Children(func() {
-						ui.Text(c, "尚未配置 Google Colab 账号").FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
-						PillButton(c, pal, "打开开箱向导", true, false, func() {
-							p.Svc.ReopenOnboarding()
-							if p.OnOpenMain != nil {
-								p.OnOpenMain(app.SectionStatus)
-							}
+		ui.Scroll(c).FillWidth().Grow(1).Children(func() {
+			ui.Column(c).FillWidth().Padding(14, 16, 12, 16).Gap(10).Children(func() {
+				if len(accounts) == 0 {
+					SectionCard(c, pal, "", "", func() {
+						ui.Column(c).FillWidth().Gap(10).AlignItems(ui.Center).Padding(16, 8).Children(func() {
+							ui.Text(c, "尚未配置 Google Colab 账号").FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
+							PillButton(c, pal, "打开开箱向导", true, false, func() {
+								if p.OnOpenOnboarding != nil {
+									p.OnOpenOnboarding()
+								} else {
+									p.Svc.ReopenOnboarding()
+									if p.OnOpenMain != nil {
+										p.OnOpenMain(app.SectionStatus)
+									}
+								}
+							})
 						})
 					})
-				})
-			} else if p.OverviewMode && len(accounts) >= 2 {
-				p.renderMultiOverview(c, pal, accounts)
-			} else if acc, ok := p.Svc.SelectedAccount(); ok {
-				p.renderSingleDetail(c, pal, acc)
-			}
+				} else if p.OverviewMode && len(accounts) >= 2 {
+					p.renderMultiOverview(c, pal, accounts)
+				} else if acc, ok := p.Svc.SelectedAccount(); ok {
+					p.renderSingleDetail(c, pal, acc)
+				}
+			})
 		})
 
 		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
@@ -175,7 +184,11 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 		})
 		if p.Svc.TotalManagedRunningSessionCount() > 0 {
 			SmallActionButton(c, pal, "⏻ 全停止损", &pal.Coral, false, func() {
-				go p.Svc.StopAllManagedSessions()
+				if p.OnRequestStopAll != nil {
+					p.OnRequestStopAll()
+				} else {
+					p.Svc.RequestConfirmStopAll()
+				}
 			})
 		}
 	})
@@ -210,7 +223,15 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 				ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(13.5).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
 				if rt.Phase.IsRunning() {
 					SmallActionButton(c, pal, "停", &pal.Coral, false, func() {
-						go p.Svc.StopAccountSession(acc.ID, "", "")
+						if p.OnRequestStop != nil {
+							p.OnRequestStop(acc.ID)
+						} else {
+							p.Svc.RequestConfirmStop(acc.ID)
+						}
+					})
+				} else if rt.Phase.IsQueuing() {
+					SmallActionButton(c, pal, "取消", &pal.Coral, false, func() {
+						p.Svc.CancelQueue(acc.ID)
 					})
 				} else {
 					SmallActionButton(c, pal, "启", nil, !cliReady, func() {
@@ -306,7 +327,11 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		})
 		if rt.Phase.IsRunning() {
 			SmallActionButton(c, pal, "⏻ 关机止损", &pal.Coral, false, func() {
-				go p.Svc.StopAccountSession(acc.ID, "", "")
+				if p.OnRequestStop != nil {
+					p.OnRequestStop(acc.ID)
+				} else {
+					p.Svc.RequestConfirmStop(acc.ID)
+				}
 			})
 		} else if rt.Phase.IsQueuing() {
 			SmallActionButton(c, pal, "取消排队", &pal.Coral, false, func() {
@@ -450,7 +475,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 						})
 					}
 					p.popoverQuickBtn(c, pal, "Drive 成片", false, false, func() {
-						p.Svc.OpenDriveOutputs()
+						p.Svc.OpenDriveOutputs(acc.ID)
 					})
 				} else {
 					syncLbl := "配置接入"

@@ -70,7 +70,7 @@
 
 ## 除了视频模型，大模型代理照样一键搞定
 
-如果你平时也会把 Colab 的 GPU 拿来跑开源大模型、代理给本机编程工具用，在「部署」页点一下 **「大模型代理」** 就行：
+如果你平时也会把 Colab 的 GPU 拿来跑开源大模型、代理给本机编程工具用，在主页「任务方案」卡片里点一下 **「大模型代理」** 就行：
 - 自动探测并安全同步到 **[CC Switch](https://github.com/farion1231/cc-switch)**、**OpenCode**（`opencode.json`）与 **Codex CLI**（`config.toml`），改前自动备份、不改你原本激活的官方订阅，也不往配置文件里写明文密钥；
 - 一键拉起 **Claude Code**，还自带 **OpenAI (`/v1`) + Anthropic** 双协议安全复制模板，Cherry Studio、Cline、Roo Code、Cursor 都能直接贴。
 

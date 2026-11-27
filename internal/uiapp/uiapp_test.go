@@ -1042,3 +1042,100 @@ func TestConcurrentBackgroundMutationsAndUIRenderNoRace(t *testing.T) {
 	close(stop)
 	<-done
 }
+
+func TestV0320PopoverScrollOnboardingAndMinHeightOverlays(t *testing.T) {
+	// 1. Popover empty state & multi-account scroll with queuing state
+	emptySvc := app.NewService(true)
+	defer emptySvc.Shutdown()
+	emptySvc.Settings.Accounts = nil
+	pEmpty := uiapp.NewPopoverUI(emptySvc)
+	pEmpty.ForceTheme = "dark"
+	if img := ui.Render(pEmpty.View, 420, 620, 1); img == nil {
+		t.Fatal("expected non-nil empty PopoverUI render")
+	}
+
+	multiSvc := makeDemoService(app.SectionHome, false, false)
+	defer multiSvc.Shutdown()
+	for i := 0; i < 4; i++ {
+		extra := core.NewDefaultAccountProfile("Extra", "extra@example.com", core.TierColabPro, core.AuthSystemDefaultOAuth2)
+		multiSvc.Settings.Accounts = append(multiSvc.Settings.Accounts, extra)
+		rt := core.NewAccountRuntimeState()
+		if i == 0 {
+			rt.Phase = core.InstancePhase{Kind: core.PhaseQueuing, QueueAttempt: 2, QueueMax: 5}
+		}
+		multiSvc.Runtime[extra.ID] = rt
+	}
+	pMulti := uiapp.NewPopoverUI(multiSvc)
+	pMulti.OverviewMode = true
+	pMulti.ForceTheme = "dark"
+	popMultiImg := ui.Render(pMulti.View, 420, 620, 1)
+	if popMultiImg == nil {
+		t.Fatal("expected non-nil scrollable multi-account PopoverUI render")
+	}
+
+	// 2. MainUI at minimum window dimensions (980x660) with overlays, temp-disk alert, and all new prompts
+	minSvc := makeDemoService(app.SectionHome, false, false)
+	defer minSvc.Shutdown()
+	accID := minSvc.Settings.SelectedAccountID
+	rt := minSvc.Runtime[accID]
+	rt.DriveMountedKnown = true
+	rt.DriveActuallyMounted = false
+	rt.RenderedVideoCount = 2
+	rt.CloudflaredActive = true
+	rt.DisplayUIURL = "https://demo.trycloudflare.com"
+	minSvc.Runtime[accID] = rt
+
+	m := uiapp.NewMainUI(minSvc)
+	m.ForceTheme = "dark"
+	tempAlertImg := ui.Render(m.View, 980, 660, 1)
+	if tempAlertImg == nil {
+		t.Fatal("expected non-nil MainUI render with temp-disk alert at 980x660")
+	}
+	m.ShowHomeOptions = true
+	homeOptImg := ui.Render(m.View, 980, 660, 1)
+	if homeOptImg == nil {
+		t.Fatal("expected non-nil MainUI render with HomeOptions overlay at 980x660")
+	}
+	m.ShowHomeOptions = false
+	m.ShowDeployLog = true
+	deployLogImg := ui.Render(m.View, 980, 660, 1)
+	if deployLogImg == nil {
+		t.Fatal("expected non-nil MainUI render with DeployLog overlay at 980x660")
+	}
+	m.ShowDeployLog = false
+
+	if qaDir := os.Getenv("COLAB_TOOLS_V0320_QA_DIR"); qaDir != "" {
+		_ = os.MkdirAll(qaDir, 0o755)
+		renderPNG(t, pMulti.View, 420, 620, filepath.Join(qaDir, "v0320-popover-multi-scroll.png"))
+		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0320-home-temp-disk-alert-980x660.png"))
+		m.ShowHomeOptions = true
+		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0320-options-overlay-980x660.png"))
+		m.ShowHomeOptions = false
+		m.ShowDeployLog = true
+		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0320-deploy-log-overlay-980x660.png"))
+		m.ShowDeployLog = false
+	}
+
+	for _, kind := range []core.ActionPromptKind{
+		core.PromptConfirmStopAll,
+		core.PromptConfirmRemoveAccount,
+		core.PromptConfirmQuit,
+		core.PromptTempOutputGuard,
+		core.PromptComfyHelp,
+	} {
+		minSvc.PresentActionPrompt(&core.UserActionPrompt{
+			ID:             string(kind),
+			Kind:           kind,
+			AccountID:      accID,
+			Title:          "Test " + string(kind),
+			Message:        "Test message body for " + string(kind),
+			URL:            "https://colab.research.google.com/",
+			PrimaryLabel:   "确认",
+			SecondaryLabel: "备选",
+			CancelLabel:    "取消",
+		})
+		if img := ui.Render(m.View, 980, 660, 1); img == nil {
+			t.Fatalf("expected non-nil MainUI render for prompt %s at 980x660", kind)
+		}
+	}
+}

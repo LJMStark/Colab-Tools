@@ -70,7 +70,7 @@ Renting A100 / G4 / H100 GPUs through Google Colab is great value for running vi
 
 ## Also Works Great for Self-Hosted LLM Proxies
 
-Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大模型代理 (LLM Proxy)** in the Deploy tab:
+Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大模型代理 (LLM Proxy)** in the Home recipe card:
 - Auto-detects and safely writes standby configs with backups for **[CC Switch](https://github.com/farion1231/cc-switch)**, **OpenCode** (`opencode.json`), and **Codex CLI** (`config.toml`) without touching your active official subscription or storing plaintext keys;
 - One-click terminal launcher for **Claude Code**, plus safe-by-default **OpenAI (`/v1`) & Anthropic** copy templates for Cherry Studio, Cline, Roo Code, and Cursor.
 

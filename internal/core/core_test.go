@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -600,5 +601,62 @@ func TestNextQueueDelayForModeAndPersistentHours(t *testing.T) {
 	}
 	if d, ok := core.NextQueueDelayForMode(10, now.Add(-7*time.Hour-40*time.Minute), now, 0.0, true, 8); !ok || d != 480*time.Second {
 		t.Fatalf("persistent mode within 8h expected 480s, got (%v, %v)", d, ok)
+	}
+}
+
+func TestSettingsSchemaVersionAndActiveLedgerPersistence(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	// Legacy config without schemaVersion loads cleanly and upgrades to CurrentConfigSchemaVersion on save
+	legacyJSON := `{"accounts":[],"backgroundRefreshSeconds":180,"manualRefreshDebounceSeconds":5,"enableNotifications":true,"themePreference":"dark"}`
+	if err := os.WriteFile(cfgPath, []byte(legacyJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded := core.LoadAppSettings(cfgPath)
+	if loaded.SchemaVersion != core.CurrentConfigSchemaVersion {
+		t.Fatalf("expected upgraded schemaVersion=%d, got %d", core.CurrentConfigSchemaVersion, loaded.SchemaVersion)
+	}
+	if err := loaded.Save(cfgPath); err != nil {
+		t.Fatalf("save settings failed: %v", err)
+	}
+	rawSaved, err := os.ReadFile(cfgPath)
+	if err != nil || !strings.Contains(string(rawSaved), `"schemaVersion": 1`) {
+		t.Fatalf("expected persisted schemaVersion=1, got %q err=%v", string(rawSaved), err)
+	}
+
+	// ActiveSessionLedger round-trip and corrupt fallback
+	ledgerPath := filepath.Join(dir, "active_sessions.json")
+	started := time.Now().Add(-25 * time.Minute).UTC().Truncate(time.Second)
+	entries := map[string]core.ActiveSessionLedgerEntry{
+		"acc-1": {
+			AccountID:          "acc-1",
+			AccountName:        "Ultra",
+			SessionName:        "colab-tools",
+			Endpoint:           "m-s-ledger-1",
+			Hardware:           "A100",
+			StartedAt:          started,
+			StartBalance:       400.0,
+			StartBalanceValid:  true,
+			MeasuredSingleRate: 12.0,
+			EstimatedCU:        5.0,
+			LastSampleAt:       started.Add(25 * time.Minute),
+			LastUptimeSec:      1500,
+		},
+	}
+	if err := core.SaveActiveLedger(ledgerPath, entries); err != nil {
+		t.Fatalf("SaveActiveLedger failed: %v", err)
+	}
+	got := core.LoadActiveLedger(ledgerPath)
+	if len(got) != 1 || got["acc-1"].Endpoint != "m-s-ledger-1" || got["acc-1"].EstimatedCU != 5.0 {
+		t.Fatalf("unexpected loaded active ledger: %+v", got)
+	}
+
+	// Corrupt ledger is backed up and returns empty map safely
+	if err := os.WriteFile(ledgerPath, []byte("{broken json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if gotCorrupt := core.LoadActiveLedger(ledgerPath); len(gotCorrupt) != 0 {
+		t.Fatalf("expected empty map on corrupt ledger, got %+v", gotCorrupt)
 	}
 }

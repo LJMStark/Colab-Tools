@@ -83,12 +83,17 @@ func ensureLocalSSHKey() (string, error) {
 	return targetKey, nil
 }
 
-// cleanupStaleColabSSH 仅精确清理匹配 colab.*ssh.*--proxy-mode.*-s <sessionName> 的本机残留进程，绝不误杀用户其他 SSH 隧道。
-func cleanupStaleColabSSH(sessionName string) {
+// cleanupStaleColabSSH 仅精确清理匹配当前账号身份（隔离 --config 或 --auth=oauth2）与会话名的本机残留 SSH 进程，绝不误杀其他账号或其他 SSH 隧道。
+func cleanupStaleColabSSH(profile core.AccountProfile) {
+	sessionName := profile.SessionName
 	if !core.IsValidSessionName(sessionName) {
 		return
 	}
 	pat := regexp.MustCompile(`(?i)\bcolab\b.*\bssh\b.*--proxy-mode.*-s\s+['"]?` + regexp.QuoteMeta(sessionName) + `(['"\s]|$)`)
+	isoCfg := ""
+	if profile.AuthMode == core.AuthIsolatedVaultADC {
+		isoCfg = profile.IsolatedConfigFilePath()
+	}
 	out, err := exec.Command("ps", "-eo", "pid=,args=").Output()
 	if err != nil {
 		return
@@ -110,6 +115,15 @@ func cleanupStaleColabSSH(sessionName string) {
 		argsStr := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
 		if !pat.MatchString(argsStr) {
 			continue
+		}
+		if isoCfg != "" {
+			if !strings.Contains(argsStr, isoCfg) {
+				continue
+			}
+		} else {
+			if !strings.Contains(argsStr, "--auth=oauth2") || strings.Contains(argsStr, "--config") {
+				continue
+			}
 		}
 		if proc, err := os.FindProcess(pid); err == nil && proc != nil {
 			_ = proc.Signal(syscall.SIGTERM)

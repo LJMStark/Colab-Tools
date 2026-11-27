@@ -3,6 +3,34 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.20] - 2026-11-28
+
+### Security & Safety
+- **禁止静默自动拉起无认证 `cloudflared` 公网隧道**：当账号未显式开启 `EnableCloudflared` 时，即使本机 SSH 隧道两次失败或处于免费版受限分支，不再自动暴露无密码公网链接，改为弹窗由用户显式选择重试私连、打开 Colab 官方网页或手动开启临时公网通道；同时在主界面与后台浮层提供「关公网通道」一键关闭按钮。
+- **多账号操作范围收紧与高危停机/退出二次确认**：
+  - `412` 恢复横幅「停掉本号旧机器」改调 `StopAccountManagedSessions`，仅停止当前账号旧会话，不再误杀其他账号；
+  - 移除运行中或排队中账号时强制弹窗选择「先停机再移除」或「仅移除本地配置」，防止失去监控导致计费失控；
+  - 首页会话表、菜单栏 Popover、托盘右键的停机与全部关机止损统一纳入二次确认弹窗；
+  - 退出 App 时若仍有活跃付费 GPU，唤起主窗口弹出「先全部关机再退出 / 保持云端运行，仅退出 / 留在后台继续监控」选项。
+- **停机单飞锁与跨账号 SSH 残留隔离**：`StopAccountSession` 增加按账号+会话单飞防重入保护；`startSSHTunnelInternal` 增加按账号防并发覆盖；`cleanupStaleColabSSH` 结合隔离 `--config` 路径与 `--auth=oauth2` 精确匹配目标账号，防止多账号同名会话互相误杀。
+
+### Fixed
+- **Drive 真实挂载态追踪、临时盘护片延缓关机与真实目录直达**：
+  - 远端遥测探针回传 `DRIVE_MOUNTED`、`EFFECTIVE_OUT_DIR` 与 `CLOUDFLARED_ACTIVE`，未挂载回退 `/content/output` 时主页如实标红提示「临时盘(关机清)」并提供「重挂 Drive」按钮；
+  - 开启 Drive 持久化但回退临时盘且检测到新成片视频时，看门狗到期暂缓静默自动关机并弹出强提醒，防止静默清空成片；
+  - `FlushWorkspaceToDrive` 不再放过 `FLUSH_SKIP=1` 与 `FLUSH_NO_DRIVE=1`，超时放宽至 25 秒；
+  - 「Drive 成片 / Drive 目录」按账号自定义 `DriveOutputDir` 与绑定邮箱 `authuser` 参数精准跳转，避免硬编码 `ColabTools` 与多 Gmail 串号。
+- **计费状态防误判、活跃会话账本续算与配置/历史版本化防覆写**：
+  - `ParseSessionsStrict` 区分合法空会话与 CLI 输出异常/截断，解析失败时保留原状态防止误判离线；
+  - 新增 `~/.config/colab-tools/active_sessions.json` 活跃账本（每 60 秒异步及退出前原子落盘），重启后同 `Endpoint` 自动续算时长与 CU、已离线会话自动补记账单；
+  - `AppSettings` 与 `HistoryStore` 新增 `schemaVersion: 1`；历史文件损坏时自动备份 `.corrupt.<ts>` 并启用只读保护拒绝覆写，且落盘错误不再静默吞掉。
+- **工作流同步回收站与加锁防竞态**：双模板脚本中同步锁获取失败即中止同步不再无锁强跑；双向同步传播删除改移入同侧 `.trash/<timestamp>/` 隔离回收站，防止误删不可恢复。
+- **UI 溢出、Popover 向导与流式读取修复**：
+  - 修复菜单栏 Popover 空状态「打开开箱向导」被 `SetSection` 重置而无法打开引导页的缺陷；为 Popover 内容区增加滚动容器并修正多账号总览排队态误显「启」；
+  - 将「任务方案与显卡选项」与「云端后台与日志」浮层最大高度收敛至 `596px`，适配 `980×660` 最小窗口不裁切；
+  - `runner.go` 流式读取以 `bufio.Reader` 替代 512KiB `bufio.Scanner`，消除超长单行输出阻塞管道风险；
+  - 统一引导页、账号页、设置页与 README 的 macOS 优先及页面导航口径。
+
 ## [0.3.19] - 2026-11-27
 
 ### Fixed

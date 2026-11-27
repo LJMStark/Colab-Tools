@@ -2,12 +2,17 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -26,7 +31,9 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.19"
+const AppVersion = "0.3.20"
+
+var errSSHTunnelStarting = errors.New("本机加密通道正在建立中，请稍候")
 
 // tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
 type tunnelStderrBuffer struct {
@@ -141,6 +148,8 @@ type Service struct {
 	cliInstallToken  string
 
 	refreshing             map[string]bool
+	stoppingSessions       map[string]bool
+	sshStarting            map[string]bool
 	lastManualFetch        time.Time
 	sshTunnels             map[string]*exec.Cmd
 	sshADCPaths            map[string]string
@@ -149,6 +158,7 @@ type Service struct {
 	deployWatchCancels     map[string]deployWatchHandle
 	pendingOAuth           *colab.OAuthSessionTicket
 	actionPrompt           *core.UserActionPrompt
+	pendingQuitCallback    func()
 	driveAuthResultCh      chan bool
 	comfyTunnelWaitTimeout time.Duration
 	comfyRetryPause        time.Duration
@@ -159,11 +169,14 @@ type Service struct {
 	Engine   *colab.Engine
 	Vault    *vault.Vault
 
-	persistChanges bool
-	configPath     string
-	insightsPath   string
-	stopLoops      chan struct{}
-	stopOnce       sync.Once
+	persistChanges   bool
+	configPath       string
+	insightsPath     string
+	activeLedgerPath string
+	ledgerMu         sync.Mutex
+	pendingLedger    map[string]core.ActiveSessionLedgerEntry
+	stopLoops        chan struct{}
+	stopOnce         sync.Once
 
 	OnUIInvalidate  func()
 	OnTrayUpdate    func()
@@ -193,6 +206,8 @@ func NewService(skipBootstrap bool) *Service {
 		OnboardingStep:     1,
 		queueCancels:       map[string]queueHandle{},
 		refreshing:         map[string]bool{},
+		stoppingSessions:   map[string]bool{},
+		sshStarting:        map[string]bool{},
 		sshTunnels:         map[string]*exec.Cmd{},
 		sshADCPaths:        map[string]string{},
 		sshStderrs:         map[string]*tunnelStderrBuffer{},
@@ -206,6 +221,8 @@ func NewService(skipBootstrap bool) *Service {
 		persistChanges:     !skipBootstrap,
 		configPath:         core.DefaultConfigPath(),
 		insightsPath:       core.DefaultInsightsPath(),
+		activeLedgerPath:   core.ActiveLedgerFilePath(),
+		pendingLedger:      map[string]core.ActiveSessionLedgerEntry{},
 		stopLoops:          make(chan struct{}),
 		ClipboardWriter: func(text string) {
 			if mygo.App.IsReady() {
@@ -252,6 +269,7 @@ func NewService(skipBootstrap bool) *Service {
 	if !skipBootstrap {
 		s.Settings = core.LoadAppSettings(s.configPath)
 		s.Insights = core.LoadAllocationInsights(s.insightsPath)
+		s.pendingLedger = core.LoadActiveLedger(s.activeLedgerPath)
 		s.ClientDetection = integrations.DetectInstalledTools()
 		for _, acc := range s.Settings.Accounts {
 			rt := core.NewAccountRuntimeState()
@@ -370,9 +388,95 @@ func (s *Service) StartBackgroundServices() {
 			}
 		}
 	}()
+
+	// Periodic 60s active session ledger persistence (outside Service mutex)
+	go func() {
+		tk := time.NewTicker(60 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-s.stopLoops:
+				return
+			case <-tk.C:
+				s.PersistActiveLedger()
+			}
+		}
+	}()
+}
+
+// PersistActiveLedger snapshots all currently running/stopping sessions and saves them atomically under ledgerMu.
+func (s *Service) PersistActiveLedger() {
+	s.ledgerMu.Lock()
+	defer s.ledgerMu.Unlock()
+
+	s.mu.RLock()
+	if !s.persistChanges || s.activeLedgerPath == "" {
+		s.mu.RUnlock()
+		return
+	}
+	path := s.activeLedgerPath
+	entries := make(map[string]core.ActiveSessionLedgerEntry, len(s.pendingLedger)+len(s.Settings.Accounts))
+	for k, v := range s.pendingLedger {
+		entries[k] = v
+	}
+	now := time.Now()
+	for _, acc := range s.Settings.Accounts {
+		rt := s.Runtime[acc.ID]
+		if rt.ActiveEndpoint == "" || (!rt.Phase.IsRunning() && rt.Phase.Kind != core.PhaseStopping) {
+			continue
+		}
+		hw := core.NormalizeHardwareKey(rt.ActiveHardware)
+		if hw == "" {
+			hw = core.NormalizeHardwareKey(rt.GPUName)
+		}
+		if hw == "" {
+			hw = strings.TrimSpace(rt.ActiveHardware)
+		}
+		startedAt := rt.SessionStartedAt
+		if startedAt.IsZero() {
+			startedAt = now.Add(-time.Duration(max(0, rt.SessionUptimeSec)) * time.Second)
+		}
+		lastSample := rt.SessionLastSampleAt
+		if lastSample.IsZero() {
+			lastSample = now
+		}
+		estCU := rt.SessionEstimatedCU
+		if now.After(lastSample) {
+			rate := rt.SessionMeasuredSingleRate
+			if rate <= 0 {
+				rate = core.EstimatedHourlyCU(hw)
+			}
+			estCU += rate * now.Sub(lastSample).Seconds() / 3600.0
+		}
+		entries[acc.ID] = core.ActiveSessionLedgerEntry{
+			AccountID:          acc.ID,
+			AccountName:        acc.DisplayName,
+			AccountColor:       acc.ColorTag,
+			SessionName:        acc.SessionName,
+			Endpoint:           rt.ActiveEndpoint,
+			Hardware:           hw,
+			HighMem:            core.EffectiveUseHighMem(acc) && !rt.SessionUsedStandardRAM,
+			RecipeLabel:        recipeLabelForSession(acc, rt.SessionModelDowngraded),
+			StartedAt:          startedAt,
+			StartBalance:       rt.SessionStartBalance,
+			StartBalanceValid:  rt.SessionStartBalanceValid,
+			Adopted:            rt.SessionAdopted,
+			MaxAssignments:     rt.SessionMaxAssignments,
+			MeasuredSingleRate: rt.SessionMeasuredSingleRate,
+			EstimatedCU:        estCU,
+			LastSampleAt:       now,
+			LastUptimeSec:      rt.SessionUptimeSec,
+			FallbackUsed:       rt.SessionFallbackUsed,
+			ModelDowngraded:    rt.SessionModelDowngraded,
+			UsedStandardRAM:    rt.SessionUsedStandardRAM,
+		}
+	}
+	s.mu.RUnlock()
+	_ = core.SaveActiveLedger(path, entries)
 }
 
 func (s *Service) Shutdown() {
+	s.PersistActiveLedger()
 	s.stopOnce.Do(func() {
 		close(s.stopLoops)
 	})
@@ -760,6 +864,7 @@ func (s *Service) RemoveAccount(accountID string) {
 	}
 	s.Settings.Accounts = filtered
 	delete(s.Runtime, accountID)
+	delete(s.pendingLedger, accountID)
 	delete(s.Settings.QueueCooldownsByAccount, accountID)
 	if s.Settings.SelectedAccountID == accountID {
 		if len(filtered) > 0 {
@@ -770,7 +875,25 @@ func (s *Service) RemoveAccount(accountID string) {
 	}
 	s.saveSettingsLocked()
 	s.mu.Unlock()
+	s.PersistActiveLedger()
 	s.ShowToast("已移除账号并清理对应系统凭据")
+}
+
+// managedSessionsForAccountLocked returns deduplicated managed (non-orphan) session names for an account.
+func managedSessionsForAccountLocked(acc core.AccountProfile, rt core.AccountRuntimeState) []string {
+	seen := map[string]bool{}
+	var names []string
+	if rt.Phase.IsRunning() || rt.Phase.Kind == core.PhaseStopping {
+		seen[acc.SessionName] = true
+		names = append(names, acc.SessionName)
+	}
+	for _, sess := range rt.Sessions {
+		if !sess.IsOrphan && !seen[sess.Name] {
+			seen[sess.Name] = true
+			names = append(names, sess.Name)
+		}
+	}
+	return names
 }
 
 func (s *Service) TotalManagedRunningSessionCount() int {
@@ -778,17 +901,7 @@ func (s *Service) TotalManagedRunningSessionCount() int {
 	defer s.mu.RUnlock()
 	total := 0
 	for _, acc := range s.Settings.Accounts {
-		rt := s.Runtime[acc.ID]
-		names := map[string]bool{}
-		for _, sess := range rt.Sessions {
-			if !sess.IsOrphan {
-				names[sess.Name] = true
-			}
-		}
-		if rt.Phase.IsRunning() {
-			names[acc.SessionName] = true
-		}
-		total += len(names)
+		total += len(managedSessionsForAccountLocked(acc, s.Runtime[acc.ID]))
 	}
 	return total
 }
@@ -854,6 +967,7 @@ func (s *Service) ResetIdleTimer(accountID string) {
 		rt.IdleSeconds = 0
 		rt.LastActiveAt = time.Now()
 		rt.WarnedForCurrentIdle = false
+		rt.WatchdogDeferredForTempOutputs = false
 		s.Runtime[accountID] = rt
 	}
 	s.mu.Unlock()
@@ -1205,10 +1319,22 @@ func (s *Service) refreshAccount(accountID string, force, silent, settleBusy boo
 		s.mu.Unlock()
 		return false
 	}
+	var ledgerBackup *core.ActiveSessionLedgerEntry
+	if prev, ok := s.pendingLedger[accountID]; ok {
+		cp := prev
+		ledgerBackup = &cp
+	}
 	primaryEndpoint, isRunning, closedRec := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, now, settleBusy, "")
 	s.mu.Unlock()
 	if closedRec != nil {
-		s.recordHistory(*closedRec)
+		if !s.recordHistory(*closedRec) && ledgerBackup != nil && closedRec.Endpoint == ledgerBackup.Endpoint {
+			// Restore pending ledger entry so failed history writes (e.g. corrupt read-only) do not drop billing data
+			s.mu.Lock()
+			if _, exists := s.pendingLedger[accountID]; !exists {
+				s.pendingLedger[accountID] = *ledgerBackup
+			}
+			s.mu.Unlock()
+		}
 		if closedRec.ShutdownReason == core.ShutdownExternalOrLost || closedRec.ShutdownReason == core.ShutdownCapReached {
 			hwLbl := strings.TrimSpace(closedRec.Hardware)
 			if hwLbl == "" {
@@ -1217,6 +1343,7 @@ func (s *Service) refreshAccount(accountID string, force, silent, settleBusy boo
 			s.SendNotification("云端机器已被 Google 回收停机", fmt.Sprintf("%s 的 %s 已停止运行（非本软件关机），可在「记录」查看详情", acc.DisplayName, hwLbl), true)
 		}
 	}
+	s.PersistActiveLedger()
 	s.notifyUI()
 
 	if isRunning {
@@ -1225,10 +1352,14 @@ func (s *Service) refreshAccount(accountID string, force, silent, settleBusy boo
 	return true
 }
 
-func (s *Service) recordHistory(rec core.HistoryRecord) {
+func (s *Service) recordHistory(rec core.HistoryRecord) bool {
 	if s.History != nil {
-		s.History.AddRecord(rec)
+		if err := s.History.AddRecord(rec); err != nil {
+			s.ShowToast("保存账单记录失败：" + err.Error())
+			return false
+		}
 	}
+	return true
 }
 
 func mapShutdownReason(reason string) core.ShutdownReason {
@@ -1250,6 +1381,44 @@ func recipeLabelForSession(acc core.AccountProfile, downgraded bool) string {
 		return acc.H3Variant.DisplayName()
 	}
 	return acc.DeployRecipe.DisplayName()
+}
+
+func deterministicSessionRecordID(accountID, endpoint string, startedAt time.Time) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d", accountID, endpoint, startedAt.UTC().Unix())))
+	return "sess-" + hex.EncodeToString(sum[:8])
+}
+
+func computeSessionBilling(
+	tier core.SubscriptionTier,
+	hw string,
+	durSec int,
+	estCU float64,
+	measuredRate float64,
+	startBalance float64,
+	startBalanceValid bool,
+	adopted bool,
+	maxAssignments int,
+	allowMeasured bool,
+	usage *colab.UsageSnapshot,
+) (core.BillingBasis, float64) {
+	if tier == core.TierFree {
+		return core.BillingFree, 0
+	}
+	est := estCU
+	if est <= 0 && durSec > 0 {
+		rate := measuredRate
+		if rate <= 0 {
+			rate = core.EstimatedHourlyCU(hw)
+		}
+		est = rate * float64(durSec) / 3600.0
+	}
+	if allowMeasured && usage != nil && maxAssignments <= 1 && !adopted && startBalanceValid {
+		delta := startBalance - usage.Balance
+		if delta > 0 && (est <= 0.05 || (delta >= est*0.3 && delta <= est*2.5)) {
+			return core.BillingMeasured, delta
+		}
+	}
+	return core.BillingEstimated, est
 }
 
 func buildClosedSessionRecordLocked(
@@ -1302,40 +1471,17 @@ func buildClosedSessionRecordLocked(
 		}
 	}
 
-	var basis core.BillingBasis
-	var consumed float64
-	if acc.Tier == core.TierFree {
-		basis = core.BillingFree
-		consumed = 0
-	} else {
-		est := rt.SessionEstimatedCU
-		if est <= 0 && durSec > 0 {
-			rate := rt.SessionMeasuredSingleRate
-			if rate <= 0 {
-				rate = core.EstimatedHourlyCU(hw)
-			}
-			est = rate * float64(durSec) / 3600.0
-		}
-		delta := 0.0
-		if usage != nil && rt.SessionStartBalanceValid {
-			delta = rt.SessionStartBalance - usage.Balance
-		}
-		if usage != nil &&
-			rt.SessionMaxAssignments <= 1 &&
-			!rt.SessionAdopted &&
-			rt.SessionStartBalanceValid &&
-			delta > 0 &&
-			(est <= 0.05 || (delta >= est*0.3 && delta <= est*2.5)) {
-			basis = core.BillingMeasured
-			consumed = delta
-		} else {
-			basis = core.BillingEstimated
-			consumed = est
-		}
-	}
+	basis, consumed := computeSessionBilling(
+		acc.Tier, hw, durSec,
+		rt.SessionEstimatedCU, rt.SessionMeasuredSingleRate,
+		rt.SessionStartBalance, rt.SessionStartBalanceValid,
+		rt.SessionAdopted, rt.SessionMaxAssignments,
+		true, usage,
+	)
 
 	endedAt := now
 	rec := core.HistoryRecord{
+		ID:              deterministicSessionRecordID(acc.ID, prevEndpoint, startedAt),
 		Kind:            core.HistoryKindSession,
 		AccountID:       acc.ID,
 		AccountName:     acc.DisplayName,
@@ -1367,6 +1513,62 @@ func buildClosedSessionRecordLocked(
 	rt.SessionModelDowngraded = false
 	rt.SessionUsedStandardRAM = false
 	return rec
+}
+
+func buildClosedRecordFromLedger(
+	entry core.ActiveSessionLedgerEntry,
+	acc core.AccountProfile,
+	usage *colab.UsageSnapshot,
+	now time.Time,
+) core.HistoryRecord {
+	endedAt := entry.LastSampleAt
+	if endedAt.IsZero() || endedAt.Before(entry.StartedAt) {
+		endedAt = now
+	}
+	startedAt := entry.StartedAt
+	if startedAt.IsZero() {
+		startedAt = endedAt.Add(-time.Duration(max(0, entry.LastUptimeSec)) * time.Second)
+	}
+	durSec := int(endedAt.Sub(startedAt).Seconds())
+	if entry.LastUptimeSec > durSec {
+		durSec = entry.LastUptimeSec
+	}
+	if durSec < 0 {
+		durSec = 0
+	}
+	// Session ended during unobserved app downtime: never attribute post-restart balance delta as BillingMeasured
+	basis, consumed := computeSessionBilling(
+		acc.Tier, entry.Hardware, durSec,
+		entry.EstimatedCU, entry.MeasuredSingleRate,
+		entry.StartBalance, entry.StartBalanceValid,
+		entry.Adopted, entry.MaxAssignments,
+		false, usage,
+	)
+	reason := core.ShutdownExternalOrLost
+	if durSec >= acc.Tier.MaxSessionHours()*3600-300 {
+		reason = core.ShutdownCapReached
+	}
+	return core.HistoryRecord{
+		ID:              deterministicSessionRecordID(acc.ID, entry.Endpoint, startedAt),
+		Kind:            core.HistoryKindSession,
+		AccountID:       acc.ID,
+		AccountName:     acc.DisplayName,
+		AccountColor:    acc.ColorTag,
+		SessionName:     entry.SessionName,
+		Endpoint:        entry.Endpoint,
+		StartedAt:       startedAt,
+		EndedAt:         &endedAt,
+		DurationSec:     durSec,
+		Hardware:        entry.Hardware,
+		HighMem:         entry.HighMem,
+		RecipeLabel:     entry.RecipeLabel,
+		ConsumedCU:      consumed,
+		BillingBasis:    basis,
+		ShutdownReason:  reason,
+		FallbackUsed:    entry.FallbackUsed,
+		ModelDowngraded: entry.ModelDowngraded,
+		Detail:          "重启后由活跃账本自动补记",
+	}
 }
 
 func (s *Service) applyServerSnapshotLocked(
@@ -1435,34 +1637,78 @@ func (s *Service) applyServerSnapshotLocked(
 				rec := buildClosedSessionRecordLocked(acc, &rt, prevEndpoint, prevHardware, prevGPUName, prevUptime, usage, core.ShutdownExternalOrLost, now)
 				closedRec = &rec
 			}
-			isFreshAlloc := rt.Phase.Kind == core.PhaseStarting || rt.Phase.Kind == core.PhaseQueuing
-			rt.SessionUptimeSec = 0
-			rt.IdleSeconds = 0
-			rt.WarnedForCurrentIdle = false
-			rt.SessionStartedAt = now
-			rt.SessionLastSampleAt = now
-			rt.SessionEstimatedCU = 0
-			rt.SessionAdopted = !isFreshAlloc
-			rt.SessionFallbackUsed = false
-			rt.SessionModelDowngraded = false
-			rt.SessionUsedStandardRAM = false
-			if isFreshAlloc && prevBalanceValid {
-				rt.SessionStartBalance = prevBalance
-				rt.SessionStartBalanceValid = true
-			} else {
-				rt.SessionStartBalance = 0
-				rt.SessionStartBalanceValid = false
+			ledgerEntry, hasLedger := s.pendingLedger[accountID]
+			if hasLedger {
+				delete(s.pendingLedger, accountID)
 			}
-			if usage != nil {
-				rt.SessionMaxAssignments = usage.ActiveAssignments
-				if usage.ActiveAssignments <= 1 && usage.RatePerHour > 0 {
-					rt.SessionMeasuredSingleRate = usage.RatePerHour
-				} else {
-					rt.SessionMeasuredSingleRate = 0
+			if hasLedger && ledgerEntry.Endpoint == primary.Endpoint {
+				// Seamlessly resume billing & uptime after app restart/crash
+				rt.SessionStartedAt = ledgerEntry.StartedAt
+				if rt.SessionStartedAt.IsZero() {
+					rt.SessionStartedAt = now.Add(-time.Duration(max(0, ledgerEntry.LastUptimeSec)) * time.Second)
+				}
+				rt.SessionUptimeSec = max(ledgerEntry.LastUptimeSec, int(now.Sub(rt.SessionStartedAt).Seconds()))
+				rt.IdleSeconds = 0
+				rt.WarnedForCurrentIdle = false
+				rt.SessionStartBalance = ledgerEntry.StartBalance
+				rt.SessionStartBalanceValid = ledgerEntry.StartBalanceValid
+				rt.SessionAdopted = ledgerEntry.Adopted
+				rt.SessionMaxAssignments = ledgerEntry.MaxAssignments
+				rt.SessionMeasuredSingleRate = ledgerEntry.MeasuredSingleRate
+				rt.SessionEstimatedCU = ledgerEntry.EstimatedCU
+				rt.SessionFallbackUsed = ledgerEntry.FallbackUsed
+				rt.SessionModelDowngraded = ledgerEntry.ModelDowngraded
+				rt.SessionUsedStandardRAM = ledgerEntry.UsedStandardRAM
+				if !ledgerEntry.LastSampleAt.IsZero() && now.After(ledgerEntry.LastSampleAt) {
+					rate := rt.SessionMeasuredSingleRate
+					if rate <= 0 {
+						rate = core.EstimatedHourlyCU(primary.Hardware)
+					}
+					rt.SessionEstimatedCU += rate * now.Sub(ledgerEntry.LastSampleAt).Seconds() / 3600.0
+				}
+				rt.SessionLastSampleAt = now
+				if usage != nil {
+					if usage.ActiveAssignments > rt.SessionMaxAssignments {
+						rt.SessionMaxAssignments = usage.ActiveAssignments
+					}
+					if usage.ActiveAssignments <= 1 && usage.RatePerHour > 0 {
+						rt.SessionMeasuredSingleRate = usage.RatePerHour
+					}
 				}
 			} else {
-				rt.SessionMaxAssignments = 0
-				rt.SessionMeasuredSingleRate = 0
+				if hasLedger && closedRec == nil {
+					rec := buildClosedRecordFromLedger(ledgerEntry, acc, usage, now)
+					closedRec = &rec
+				}
+				isFreshAlloc := rt.Phase.Kind == core.PhaseStarting || rt.Phase.Kind == core.PhaseQueuing
+				rt.SessionUptimeSec = 0
+				rt.IdleSeconds = 0
+				rt.WarnedForCurrentIdle = false
+				rt.SessionStartedAt = now
+				rt.SessionLastSampleAt = now
+				rt.SessionEstimatedCU = 0
+				rt.SessionAdopted = !isFreshAlloc
+				rt.SessionFallbackUsed = false
+				rt.SessionModelDowngraded = false
+				rt.SessionUsedStandardRAM = false
+				if isFreshAlloc && prevBalanceValid {
+					rt.SessionStartBalance = prevBalance
+					rt.SessionStartBalanceValid = true
+				} else {
+					rt.SessionStartBalance = 0
+					rt.SessionStartBalanceValid = false
+				}
+				if usage != nil {
+					rt.SessionMaxAssignments = usage.ActiveAssignments
+					if usage.ActiveAssignments <= 1 && usage.RatePerHour > 0 {
+						rt.SessionMeasuredSingleRate = usage.RatePerHour
+					} else {
+						rt.SessionMeasuredSingleRate = 0
+					}
+				} else {
+					rt.SessionMaxAssignments = 0
+					rt.SessionMeasuredSingleRate = 0
+				}
 			}
 
 			// Endpoint changed -> invalidate bound LLM URL & video deploy/auto-open state
@@ -1482,6 +1728,13 @@ func (s *Service) applyServerSnapshotLocked(
 			rt.RenderedVideoCount = 0
 			rt.SawQueueBusyThisRun = false
 			rt.AutoOpenedEndpoint = ""
+			rt.DriveMountedKnown = false
+			rt.DriveActuallyMounted = false
+			rt.EffectiveOutputDir = ""
+			rt.TempOutputVideos = 0
+			rt.TempOutputScanKnown = false
+			rt.WatchdogDeferredForTempOutputs = false
+			rt.CloudflaredActive = false
 		}
 		if settleBusy || !rt.Phase.IsBusy() {
 			rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
@@ -1495,6 +1748,7 @@ func (s *Service) applyServerSnapshotLocked(
 	}
 
 	if prevEndpoint != "" {
+		delete(s.pendingLedger, accountID)
 		rec := buildClosedSessionRecordLocked(acc, &rt, prevEndpoint, prevHardware, prevGPUName, prevUptime, usage, shutdownHint, now)
 		closedRec = &rec
 		if shutdownHint == "" {
@@ -1510,6 +1764,10 @@ func (s *Service) applyServerSnapshotLocked(
 		} else {
 			rt.LastUnexpectedStopMsg = ""
 		}
+	} else if ledgerEntry, hasLedger := s.pendingLedger[accountID]; hasLedger {
+		delete(s.pendingLedger, accountID)
+		rec := buildClosedRecordFromLedger(ledgerEntry, acc, usage, now)
+		closedRec = &rec
 	}
 
 	if settleBusy || (!rt.Phase.IsBusy() && !rt.Phase.IsQueuing()) {
@@ -1540,6 +1798,13 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.RenderedVideoCount = 0
 	rt.SawQueueBusyThisRun = false
 	rt.AutoOpenedEndpoint = ""
+	rt.DriveMountedKnown = false
+	rt.DriveActuallyMounted = false
+	rt.EffectiveOutputDir = ""
+	rt.TempOutputVideos = 0
+	rt.TempOutputScanKnown = false
+	rt.WatchdogDeferredForTempOutputs = false
+	rt.CloudflaredActive = false
 	rt.QueueRunning = 0
 	rt.QueuePending = 0
 	rt.IdleSeconds = 0
@@ -1629,6 +1894,24 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		rt.DeployRunning = false
 	}
 	rt.RenderedVideoCount = tel.RenderedVideoCount
+	if tel.TempOutputVideos != nil {
+		rt.TempOutputScanKnown = true
+		rt.TempOutputVideos = *tel.TempOutputVideos
+		if *tel.TempOutputVideos == 0 {
+			rt.WatchdogDeferredForTempOutputs = false
+		}
+	}
+	if tel.DriveMounted != nil {
+		rt.DriveMountedKnown = true
+		rt.DriveActuallyMounted = *tel.DriveMounted
+	}
+	if tel.EffectiveOutputDir != "" {
+		rt.EffectiveOutputDir = tel.EffectiveOutputDir
+	}
+	rt.CloudflaredActive = tel.CloudflaredActive
+	if !tel.CloudflaredActive && strings.Contains(rt.DisplayUIURL, "trycloudflare.com") {
+		rt.DisplayUIURL = ""
+	}
 
 	// Evaluate non-LLM signals (active deploy -> status.json with explicit busy -> ComfyUI /queue -> dual low-load fallback)
 	statusFresh := tel.StatusPayload != nil && tel.StatusAgeSeconds != nil && *tel.StatusAgeSeconds <= core.StatusFileMaxAgeSec
@@ -2462,9 +2745,16 @@ func (s *Service) CurrentActionPrompt() *core.UserActionPrompt {
 	return &cp
 }
 
-// PresentActionPrompt 展示一个用户行动弹窗并触发界面重绘（主要用于内置流程与测试注入）。
+// PresentActionPrompt 展示一个用户行动弹窗并触发界面重绘；若替换正在等待的 Drive 授权弹窗会安全解除旧通道阻塞。
 func (s *Service) PresentActionPrompt(prompt *core.UserActionPrompt) {
 	s.mu.Lock()
+	var oldDriveCh chan bool
+	if s.actionPrompt != nil && s.actionPrompt.Kind == core.PromptDriveAuth && s.driveAuthResultCh != nil {
+		if prompt == nil || prompt.Kind != core.PromptDriveAuth || prompt.ID != s.actionPrompt.ID {
+			oldDriveCh = s.driveAuthResultCh
+			s.driveAuthResultCh = nil
+		}
+	}
 	if prompt == nil {
 		s.actionPrompt = nil
 	} else {
@@ -2472,14 +2762,29 @@ func (s *Service) PresentActionPrompt(prompt *core.UserActionPrompt) {
 		s.actionPrompt = &cp
 	}
 	s.mu.Unlock()
+	if oldDriveCh != nil {
+		select {
+		case oldDriveCh <- false:
+		default:
+		}
+	}
 	s.notifyUI()
 }
 
 // ResolveActionPrompt 处理用户在行动弹窗上的点击操作（open_url / primary / secondary / cancel）。
 func (s *Service) ResolveActionPrompt(action string) {
+	s.ResolveActionPromptByID("", action)
+}
+
+// ResolveActionPromptByID 按弹窗 ID 精确匹配处理点击操作，防止弹窗被并发替换后误触发新弹窗按钮。
+func (s *Service) ResolveActionPromptByID(promptID, action string) {
 	s.mu.Lock()
 	prompt := s.actionPrompt
 	if prompt == nil {
+		s.mu.Unlock()
+		return
+	}
+	if promptID != "" && prompt.ID != promptID {
 		s.mu.Unlock()
 		return
 	}
@@ -2523,19 +2828,101 @@ func (s *Service) ResolveActionPrompt(action string) {
 		switch action {
 		case "primary":
 			if promptCopy.AccountID != "" {
-				go s.OpenComfyUI(promptCopy.AccountID)
+				if promptCopy.PrimaryAction == "open_colab" {
+					if promptCopy.URL != "" && opener != nil {
+						opener(promptCopy.URL)
+					} else {
+						s.OpenColabInBrowser(promptCopy.AccountID)
+					}
+				} else {
+					go s.OpenComfyUI(promptCopy.AccountID)
+				}
 			}
 		case "secondary":
-			if acc, ok := s.accountByID(promptCopy.AccountID); ok {
-				go s.launchVideoDeployFlow(acc)
+			if promptCopy.AccountID != "" {
+				if promptCopy.SecondaryAction == "enable_cloudflared" {
+					go s.OpenComfyUIViaCloudflared(promptCopy.AccountID)
+				} else if acc, ok := s.accountByID(promptCopy.AccountID); ok {
+					go s.launchVideoDeployFlow(acc)
+				}
 			}
 		}
 	case core.PromptConfirmStop:
+		expectedEP := promptCopy.ExpectedEndpoint
+		curEP := ""
+		if rt, ok := s.Runtime[promptCopy.AccountID]; ok {
+			curEP = rt.ActiveEndpoint
+		}
 		s.actionPrompt = nil
 		s.mu.Unlock()
 		s.notifyUI()
 		if action == "primary" && promptCopy.AccountID != "" {
-			go s.StopAccountSession(promptCopy.AccountID, "", "")
+			if promptCopy.SessionName == "" && expectedEP != "" && curEP != "" && curEP != expectedEP {
+				s.ShowToast("云端机器已切换为新实例，已取消本次过期停机确认")
+				return
+			}
+			go s.StopAccountSession(promptCopy.AccountID, promptCopy.SessionName, "")
+		}
+	case core.PromptConfirmStopAll:
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if action == "primary" {
+			go s.StopAllManagedSessions()
+		}
+	case core.PromptConfirmRemoveAccount:
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if promptCopy.AccountID != "" {
+			switch action {
+			case "primary":
+				go func(accID string) {
+					s.CancelQueue(accID)
+					if !s.StopAccountManagedSessions(accID) {
+						s.ShowToast("未能确认该账号云端机器已完全停机，为防计费失控已保留账号配置，请先在 Colab 网页确认")
+						return
+					}
+					s.RemoveAccount(accID)
+				}(promptCopy.AccountID)
+			case "secondary":
+				s.RemoveAccount(promptCopy.AccountID)
+			}
+		}
+	case core.PromptConfirmQuit:
+		quitFn := s.pendingQuitCallback
+		s.actionPrompt = nil
+		s.pendingQuitCallback = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		switch action {
+		case "primary":
+			go func() {
+				if !s.StopAllManagedSessions() {
+					s.ShowToast("仍有云端机器未能确认停机，已暂缓退出以保持监控")
+					return
+				}
+				if quitFn != nil {
+					quitFn()
+				}
+			}()
+		case "secondary":
+			if quitFn != nil {
+				quitFn()
+			}
+		}
+	case core.PromptTempOutputGuard:
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if promptCopy.AccountID != "" {
+			switch action {
+			case "primary":
+				s.ResetIdleTimer(promptCopy.AccountID)
+				go s.OpenComfyUI(promptCopy.AccountID)
+			case "secondary":
+				go s.StopAccountSession(promptCopy.AccountID, "", "用户确认跳过临时盘护片关机")
+			}
 		}
 	default:
 		s.actionPrompt = nil
@@ -2544,24 +2931,134 @@ func (s *Service) ResolveActionPrompt(action string) {
 	}
 }
 
-// RequestConfirmStop 弹出防误触二次确认弹窗，仅在目标账号处于运行态时触发。
+// RequestConfirmStop 弹出防误触二次确认弹窗，仅在目标账号主会话处于运行态时触发。
 func (s *Service) RequestConfirmStop(accountID string) {
-	if _, ok := s.accountByID(accountID); !ok {
+	s.RequestConfirmStopSession(accountID, "")
+}
+
+// RequestConfirmStopSession 弹出防误触二次确认弹窗，支持主会话或附加非孤儿会话。
+func (s *Service) RequestConfirmStopSession(accountID, specificSession string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
 		return
 	}
 	rt := s.StateFor(accountID)
-	if !rt.Phase.IsRunning() {
+	target := strings.TrimSpace(specificSession)
+	if target == "" || target == acc.SessionName {
+		if !rt.Phase.IsRunning() {
+			return
+		}
+		s.PresentActionPrompt(&core.UserActionPrompt{
+			ID:               uuid.New().String(),
+			Kind:             core.PromptConfirmStop,
+			AccountID:        accountID,
+			SessionName:      "",
+			ExpectedEndpoint: rt.ActiveEndpoint,
+			Title:            fmt.Sprintf("确认关闭当前 %s 云端机器？", rt.ShortGPUName()),
+			Message:          fmt.Sprintf("账号「%s」本次已运行 %s（当前约 %.2f CU/h）。确认关机后会立即释放云端显卡并停止计费。", acc.DisplayName, core.FormatStopwatch(rt.SessionUptimeSec), rt.CURatePerHour),
+			PrimaryLabel:     "确认关机止损",
+			CancelLabel:      "继续运行",
+		})
 		return
 	}
 	s.PresentActionPrompt(&core.UserActionPrompt{
 		ID:           uuid.New().String(),
 		Kind:         core.PromptConfirmStop,
 		AccountID:    accountID,
-		Title:        fmt.Sprintf("确认关闭当前 %s 云端机器？", rt.ShortGPUName()),
-		Message:      fmt.Sprintf("本次已运行 %s（当前约 %.2f CU/h）。确认关机后会立即释放云端显卡并停止计费。", core.FormatStopwatch(rt.SessionUptimeSec), rt.CURatePerHour),
-		PrimaryLabel: "确认关机止损",
-		CancelLabel:  "继续运行",
+		SessionName:  target,
+		Title:        fmt.Sprintf("确认关闭附加会话「%s」？", target),
+		Message:      fmt.Sprintf("将停止账号「%s」名下的附加云端会话 %s 并释放对应算力。", acc.DisplayName, target),
+		PrimaryLabel: "确认停止会话",
+		CancelLabel:  "取消",
 	})
+}
+
+// RequestConfirmStopAll 弹出多账号全部关机止损二次确认。
+func (s *Service) RequestConfirmStopAll() {
+	n := s.TotalManagedRunningSessionCount()
+	if n == 0 {
+		if orphans := s.TotalOrphanSessionCount(); orphans > 0 {
+			s.ShowToast(fmt.Sprintf("存在 %d 个外部孤儿会话 [?] 无法通过 CLI 关闭，请前往 Colab 网页释放", orphans))
+		}
+		return
+	}
+	_, totalRate := s.TotalBalanceAndRate()
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:           uuid.New().String(),
+		Kind:         core.PromptConfirmStopAll,
+		Title:        fmt.Sprintf("确认关闭全部 %d 个运行中的云端机器？", n),
+		Message:      fmt.Sprintf("当前所有账号合计消耗约 %.2f CU/h。确认后会逐一同步工作流并停止全部受管云端会话。", totalRate),
+		PrimaryLabel: "全部关机止损",
+		CancelLabel:  "先不关",
+	})
+}
+
+// RequestConfirmRemoveAccount 移除账号前核验是否有活跃、分配中、排队中或待恢复账本的云端会话，防止失去监控导致计费失控。
+func (s *Service) RequestConfirmRemoveAccount(accountID string) {
+	s.mu.RLock()
+	var acc core.AccountProfile
+	found := false
+	for _, a := range s.Settings.Accounts {
+		if a.ID == accountID {
+			acc = a
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.mu.RUnlock()
+		return
+	}
+	rt := s.Runtime[accountID]
+	managedCount := len(managedSessionsForAccountLocked(acc, rt))
+	_, hasPendingLedger := s.pendingLedger[accountID]
+	s.mu.RUnlock()
+
+	if managedCount == 0 && !rt.Phase.IsQueuing() && !rt.Phase.IsBusy() && !hasPendingLedger {
+		s.RemoveAccount(accountID)
+		return
+	}
+	msg := fmt.Sprintf("账号「%s」当前还有 %d 个运行中的云端会话（或正在启动/排队）。直接移除本地配置会导致失去监控与自动关机保护，建议先停机再移除。", acc.DisplayName, managedCount)
+	if managedCount == 0 && hasPendingLedger {
+		msg = fmt.Sprintf("账号「%s」上次退出前仍有未核验的云端计费记录，建议先停机核验后再移除，或确认仅移除本地配置。", acc.DisplayName)
+	} else if managedCount == 0 {
+		msg = fmt.Sprintf("账号「%s」当前正在申请或排队显卡。确认后将取消申请并移除该账号与本地凭据。", acc.DisplayName)
+	}
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:             uuid.New().String(),
+		Kind:           core.PromptConfirmRemoveAccount,
+		AccountID:      accountID,
+		Title:          fmt.Sprintf("账号「%s」尚有活跃任务，如何移除？", acc.DisplayName),
+		Message:        msg,
+		PrimaryLabel:   "先停机再移除",
+		SecondaryLabel: "仅移除本地配置",
+		CancelLabel:    "取消",
+	})
+}
+
+// RequestConfirmQuit 退出 App 前若检测到运行中 GPU，弹窗让用户决定先停机还是保持云端运行。
+func (s *Service) RequestConfirmQuit(onConfirmedQuit func()) {
+	n := s.TotalManagedRunningSessionCount()
+	if n == 0 {
+		if onConfirmedQuit != nil {
+			onConfirmedQuit()
+		}
+		return
+	}
+	_, totalRate := s.TotalBalanceAndRate()
+	s.mu.Lock()
+	s.pendingQuitCallback = onConfirmedQuit
+	s.actionPrompt = &core.UserActionPrompt{
+		ID:             uuid.New().String(),
+		Kind:           core.PromptConfirmQuit,
+		Title:          fmt.Sprintf("还有 %d 台云端显卡正在计费，确定退出？", n),
+		Message:        fmt.Sprintf("当前消耗约 %.2f CU/h。退出桌面端后，本地空闲自动关机监控将停止（云端将依赖 Colab 官方闲置超时回收）。", totalRate),
+		PrimaryLabel:   "先全部关机再退出",
+		SecondaryLabel: "保持云端运行，仅退出",
+		CancelLabel:    "留在后台继续监控",
+	}
+	s.mu.Unlock()
+	s.notifyUI()
 }
 
 func (s *Service) ClearAccountError(accountID string) {
@@ -2945,6 +3442,9 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 				reason = "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
 			}
 			if st, ok := s.Runtime[acc.ID]; ok {
+				st.DriveMountedKnown = true
+				st.DriveActuallyMounted = false
+				st.EffectiveOutputDir = "/content/output"
 				st.WorkloadDetail = reason
 				s.Runtime[acc.ID] = st
 			}
@@ -2952,7 +3452,17 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 			s.notifyUI()
 			s.ShowToast(reason)
 		} else {
+			if st, ok := s.Runtime[acc.ID]; ok {
+				st.DriveMountedKnown = true
+				st.DriveActuallyMounted = true
+				st.WatchdogDeferredForTempOutputs = false
+				if acc.DriveOutputDir != "" {
+					st.EffectiveOutputDir = acc.DriveOutputDir
+				}
+				s.Runtime[acc.ID] = st
+			}
 			s.mu.Unlock()
+			s.notifyUI()
 		}
 	}
 
@@ -3096,6 +3606,10 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 }
 
 func (s *Service) StopAccountSession(accountID, specificSession, reason string) {
+	_ = s.stopAccountSessionVerified(accountID, specificSession, reason)
+}
+
+func (s *Service) stopAccountSessionVerified(accountID, specificSession, reason string) bool {
 	s.mu.Lock()
 	var acc core.AccountProfile
 	found := false
@@ -3108,12 +3622,19 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 	}
 	if !found {
 		s.mu.Unlock()
-		return
+		return true
 	}
 	targetSession := specificSession
 	if targetSession == "" {
 		targetSession = acc.SessionName
 	}
+	stopKey := accountID + "|" + targetSession
+	if s.stoppingSessions[stopKey] {
+		s.mu.Unlock()
+		s.ShowToast("正在停止该会话并核验中，请稍候…")
+		return false
+	}
+	s.stoppingSessions[stopKey] = true
 	prevPhase := s.Runtime[accountID].Phase
 	if targetSession == acc.SessionName {
 		rt := s.Runtime[accountID]
@@ -3121,6 +3642,11 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 		s.Runtime[accountID] = rt
 	}
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.stoppingSessions, stopKey)
+		s.mu.Unlock()
+	}()
 	s.notifyUI()
 
 	flushFailed := false
@@ -3128,7 +3654,7 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 		s.cancelDeployFlow(accountID)
 		s.cancelDeployWatcher(accountID)
 		if prevPhase.IsRunning() && acc.UseGoogleDrive && !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() {
-			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 12*time.Second)
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 25*time.Second)
 			if err := s.Engine.FlushWorkspaceToDrive(flushCtx, acc); err != nil {
 				flushFailed = true
 			}
@@ -3161,7 +3687,7 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 		msg := fmt.Sprintf("警告：%s 会话 %s 停机后未能从服务端核验%s，请前往 Colab 网页确认！", acc.DisplayName, targetSession, extra)
 		s.ShowToast(msg)
 		s.SendNotification("停机未能核验", msg, true)
-		return
+		return false
 	}
 
 	shutdownHint := core.ShutdownReason("")
@@ -3169,10 +3695,21 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 		shutdownHint = mapShutdownReason(reason)
 	}
 	s.mu.Lock()
+	var ledgerBackup *core.ActiveSessionLedgerEntry
+	if prev, ok := s.pendingLedger[accountID]; ok {
+		cp := prev
+		ledgerBackup = &cp
+	}
 	ep, isRunning, closedRec := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, time.Now(), true, shutdownHint)
 	s.mu.Unlock()
 	if closedRec != nil {
-		s.recordHistory(*closedRec)
+		if !s.recordHistory(*closedRec) && ledgerBackup != nil && closedRec.Endpoint == ledgerBackup.Endpoint {
+			s.mu.Lock()
+			if _, exists := s.pendingLedger[accountID]; !exists {
+				s.pendingLedger[accountID] = *ledgerBackup
+			}
+			s.mu.Unlock()
+		}
 		if closedRec.ShutdownReason == core.ShutdownExternalOrLost || closedRec.ShutdownReason == core.ShutdownCapReached {
 			hwLbl := strings.TrimSpace(closedRec.Hardware)
 			if hwLbl == "" {
@@ -3181,6 +3718,7 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 			s.SendNotification("云端机器已被 Google 回收停机", fmt.Sprintf("%s 的 %s 已停止运行（非本软件关机），可在「记录」查看详情", acc.DisplayName, hwLbl), true)
 		}
 	}
+	s.PersistActiveLedger()
 	s.notifyUI()
 	if isRunning {
 		go s.fetchAndApplyTelemetry(acc, ep)
@@ -3202,15 +3740,47 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 		msg := fmt.Sprintf("警告：%s 会话 %s 仍出现在服务端，请前往 Colab 网页确认停机！", acc.DisplayName, targetSession)
 		s.ShowToast(msg + flushWarnSuffix)
 		s.SendNotification("停机核验异常", msg, true)
+		return false
 	} else if reason != "" {
 		s.ShowToast(fmt.Sprintf("%s：%s 已确认关机止损%s", reason, targetSession, flushWarnSuffix))
 	} else {
 		s.ShowToast(fmt.Sprintf("%s 已确认关机止损%s", targetSession, flushWarnSuffix))
 	}
+	return true
+}
+
+// StopAccountManagedSessions 仅停止指定账号下的主会话与附加非孤儿会话，绝不波及其他账号；返回是否全部确认离线。
+func (s *Service) StopAccountManagedSessions(accountID string) bool {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return true
+	}
+	s.mu.RLock()
+	sessions := managedSessionsForAccountLocked(acc, s.Runtime[accountID])
+	s.mu.RUnlock()
+
+	// 若缓存为空（如刚触发 412 或重启尚未刷新），对系统默认 OAuth 账号先核验本机 CLI 登录邮箱以防外部切号误停
+	if len(sessions) == 0 {
+		if acc.AuthMode != core.AuthIsolatedVaultADC && strings.TrimSpace(acc.Email) != "" {
+			if who, ok := s.Engine.Whoami(context.Background(), acc); ok && !strings.EqualFold(strings.TrimSpace(who.Email), strings.TrimSpace(acc.Email)) {
+				s.ShowToast(fmt.Sprintf("本机默认 colab CLI 当前已切换为 %s（非 %s），已中止自动停机防止误停其他账号", who.Email, acc.Email))
+				return false
+			}
+		}
+		sessions = append(sessions, acc.SessionName)
+	}
+	allStopped := true
+	for _, name := range sessions {
+		if !s.stopAccountSessionVerified(accountID, name, "停止旧会话") {
+			allStopped = false
+		}
+	}
+	return allStopped
 }
 
 // StopAllManagedSessions stops primary + all extra non-orphan sessions across all accounts and reports orphans.
-func (s *Service) StopAllManagedSessions() {
+// Returns true only when all targeted managed sessions are confirmed stopped.
+func (s *Service) StopAllManagedSessions() bool {
 	type target struct {
 		accID   string
 		session string
@@ -3218,17 +3788,8 @@ func (s *Service) StopAllManagedSessions() {
 	s.mu.RLock()
 	var targets []target
 	for _, acc := range s.Settings.Accounts {
-		rt := s.Runtime[acc.ID]
-		seen := map[string]bool{}
-		if rt.Phase.IsRunning() {
-			seen[acc.SessionName] = true
-			targets = append(targets, target{acc.ID, acc.SessionName})
-		}
-		for _, sess := range rt.Sessions {
-			if !sess.IsOrphan && !seen[sess.Name] {
-				seen[sess.Name] = true
-				targets = append(targets, target{acc.ID, sess.Name})
-			}
+		for _, name := range managedSessionsForAccountLocked(acc, s.Runtime[acc.ID]) {
+			targets = append(targets, target{acc.ID, name})
 		}
 	}
 	s.mu.RUnlock()
@@ -3237,10 +3798,13 @@ func (s *Service) StopAllManagedSessions() {
 		if orphans := s.TotalOrphanSessionCount(); orphans > 0 {
 			s.ShowToast(fmt.Sprintf("存在 %d 个外部孤儿会话 [?] 无法通过 CLI 关闭，请前往 Colab 网页释放", orphans))
 		}
-		return
+		return true
 	}
+	allVerified := true
 	for _, t := range targets {
-		s.StopAccountSession(t.accID, t.session, "全部关机止损")
+		if !s.stopAccountSessionVerified(t.accID, t.session, "全部关机止损") {
+			allVerified = false
+		}
 	}
 	stillManaged := s.TotalManagedRunningSessionCount()
 	orphans := s.TotalOrphanSessionCount()
@@ -3256,6 +3820,7 @@ func (s *Service) StopAllManagedSessions() {
 	} else {
 		s.ShowToast(fmt.Sprintf("已停止全部 %d 个受管会话", len(targets)))
 	}
+	return allVerified && stillManaged == 0
 }
 
 // Integrations, SSH Tunnel, Terminal & Browser Actions
@@ -3466,7 +4031,12 @@ func (s *Service) serviceContext() (context.Context, context.CancelFunc) {
 }
 
 func (s *Service) startSSHTunnelInternal(accountID string) (int, *tunnelStderrBuffer, error) {
-	s.mu.RLock()
+	s.mu.Lock()
+	if s.sshStarting[accountID] {
+		s.mu.Unlock()
+		return 0, nil, errSSHTunnelStarting
+	}
+	s.sshStarting[accountID] = true
 	usedPorts := map[int]bool{}
 	for id, rt := range s.Runtime {
 		if id != accountID && rt.SSHTunnelActive && rt.ActiveSSHTunnelPort != nil {
@@ -3474,7 +4044,16 @@ func (s *Service) startSSHTunnelInternal(accountID string) (int, *tunnelStderrBu
 		}
 	}
 	starter := s.sshStarter
-	s.mu.RUnlock()
+	_, hadExisting := s.sshTunnels[accountID]
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.sshStarting, accountID)
+		s.mu.Unlock()
+	}()
+	if hadExisting {
+		s.StopSSHTunnel(accountID)
+	}
 	if starter == nil {
 		starter = startSSHTunnelProcess
 	}
@@ -3649,18 +4228,27 @@ func (s *Service) OpenComfyUI(accountID string) {
 			s.URLOpener(rt.DisplayUIURL)
 			return
 		}
-		remotePort := acc.RemoteServicePort
-		if rt.DetectedServicePort != nil {
-			remotePort = *rt.DetectedServicePort
-		}
-		if cfURL, err := s.Engine.EnsureCloudflaredFallbackURL(context.Background(), acc, remotePort); err == nil && cfURL != "" {
-			if s.URLOpener != nil {
-				s.URLOpener(cfURL)
-			}
-			s.ShowToast("已自动切换云端临时通道打开 ComfyUI")
+		if acc.EnableCloudflared {
+			s.OpenComfyUIViaCloudflared(accountID)
 			return
 		}
-		s.ShowToast("免费版不支持本机加密通道，请打开「cloudflared 临时链接」或直接点 Colab 网页")
+		svcCtx, cancelSvcCtx := s.serviceContext()
+		defer cancelSvcCtx()
+		colabURL := s.Engine.ResolveColabURL(svcCtx, acc, acc.SessionName)
+		s.PresentActionPrompt(&core.UserActionPrompt{
+			ID:              uuid.New().String(),
+			Kind:            core.PromptComfyHelp,
+			AccountID:       acc.ID,
+			Title:           "免费版不支持本机 SSH 私连通道",
+			Message:         "Google 免费版不开放本机 SSH 隧道，为避免默认暴露无密码公网地址，本软件不会自动开启 cloudflared。你可以打开 Colab 官方网页操作，或显式开启临时公网链接（无密码保护，用完请及时点击关闭）。",
+			URL:             colabURL,
+			PrimaryLabel:    "打开 Colab 网页",
+			PrimaryAction:   "open_colab",
+			SecondaryLabel:  "显式开启临时公网链接",
+			SecondaryAction: "enable_cloudflared",
+			CancelLabel:     "关闭",
+		})
+		s.ShowToast("免费版不支持 SSH 私连，请确认打开方式")
 		return
 	}
 
@@ -3680,6 +4268,10 @@ func (s *Service) OpenComfyUI(accountID string) {
 	var lastErrText string
 	for attempt := 1; attempt <= 2; attempt++ {
 		port, errBuf, startErr := s.startSSHTunnelInternal(accountID)
+		if errors.Is(startErr, errSSHTunnelStarting) {
+			s.ShowToast(startErr.Error())
+			return
+		}
 		if startErr != nil {
 			lastErrText = startErr.Error()
 		} else {
@@ -3712,7 +4304,7 @@ func (s *Service) OpenComfyUI(accountID string) {
 		}
 
 		// 清理残留并准备重连
-		cleanupStaleColabSSH(acc.SessionName)
+		cleanupStaleColabSSH(acc)
 		s.StopSSHTunnel(accountID)
 
 		if attempt == 1 {
@@ -3729,47 +4321,170 @@ func (s *Service) OpenComfyUI(accountID string) {
 		}
 	}
 
-	// 本机 SSH 2 次失败：全自动尝试 cloudflared 云端安全临时链接兜底
+	// 仅在用户显式启用 cloudflared 开关时才自动降级公网隧道，默认绝不静默暴露无认证公网端口
+	if acc.EnableCloudflared {
+		s.OpenComfyUIViaCloudflared(accountID)
+		return
+	}
+
+	// 本机 SSH 2 次未连通且未开启公网隧道：弹窗由用户显式选择重试、打开 Colab 网页或手动启用临时公网链接
+	svcCtx, cancelSvcCtx := s.serviceContext()
+	defer cancelSvcCtx()
+	colabURL := s.Engine.ResolveColabURL(svcCtx, acc, acc.SessionName)
+	reasonHint := "本机加密通道两次尝试均未连通。"
+	if strings.Contains(strings.ToLower(lastErrText), "already-active ssh session") || strings.Contains(lastErrText, "429") {
+		reasonHint = "Google 检测到云端还有一个没关干净的旧 SSH 连接（通常等十几秒会自动释放）。"
+	}
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:              uuid.New().String(),
+		Kind:            core.PromptComfyHelp,
+		AccountID:       acc.ID,
+		Title:           "本机加密通道暂未连通",
+		Message:         reasonHint + "为保护安全，默认不会自动暴露无密码公网链接。你可以点击「重新连接」再试，或显式开启临时公网链接（无密码，使用后请在主页点击关闭）。",
+		URL:             colabURL,
+		PrimaryLabel:    "重新连接本机通道",
+		SecondaryLabel:  "临时开启公网链接（无密码）",
+		SecondaryAction: "enable_cloudflared",
+		CancelLabel:     "关闭",
+	})
+	s.ShowToast("本机加密通道暂未连通，已弹出处理选项")
+}
+
+// OpenComfyUIViaCloudflared 在用户显式授权或开启开关后启动 cloudflared 临时公网预览链接。
+func (s *Service) OpenComfyUIViaCloudflared(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("云端机器未运行")
+		return
+	}
 	remotePort := acc.RemoteServicePort
 	if rt.DetectedServicePort != nil {
 		remotePort = *rt.DetectedServicePort
 	}
-	s.ShowToast("本机通道未连通，正在自动开启云端临时安全通道…")
+	s.ShowToast("正在按你的确认开启云端临时公网链接（注意无访问密码）…")
 	svcCtx, cancelSvcCtx := s.serviceContext()
 	defer cancelSvcCtx()
-	if cfURL, err := s.Engine.EnsureCloudflaredFallbackURL(svcCtx, acc, remotePort); err == nil && cfURL != "" {
-		s.mu.Lock()
-		if cur, exists := s.Runtime[accountID]; exists && cur.ActiveEndpoint == rt.ActiveEndpoint {
-			cur.DisplayUIURL = cfURL
-			s.Runtime[accountID] = cur
-		}
-		s.mu.Unlock()
-		s.notifyUI()
-		if s.URLOpener != nil {
-			s.URLOpener(cfURL)
-		}
-		s.ShowToast("已自动切换云端临时通道打开 ComfyUI")
+	cfURL, err := s.Engine.EnsureCloudflaredFallbackURL(svcCtx, acc, remotePort)
+	if err != nil || cfURL == "" {
+		s.ShowToast("开启临时公网链接失败，请尝试重新连接本机通道或直接打开 Colab 网页")
 		return
 	}
-
-	// 所有通道均失败：弹出小白友好白话向导，绝不吐技术报错天书
-	colabURL := s.Engine.ResolveColabURL(svcCtx, acc, acc.SessionName)
-	reasonHint := "本机加密通道和云端临时通道这次都没连上。"
-	if strings.Contains(strings.ToLower(lastErrText), "already-active ssh session") || strings.Contains(lastErrText, "429") {
-		reasonHint = "Google 检测到云端还有一个没关干净的旧 SSH 连接（通常等十几秒会自动释放），刚才自动重连与云端临时通道也暂未连上。"
+	s.mu.Lock()
+	if cur, exists := s.Runtime[accountID]; exists && cur.ActiveEndpoint == rt.ActiveEndpoint {
+		cur.DisplayUIURL = cfURL
+		cur.CloudflaredActive = true
+		s.Runtime[accountID] = cur
 	}
-	s.PresentActionPrompt(&core.UserActionPrompt{
-		ID:             uuid.New().String(),
-		Kind:           core.PromptComfyHelp,
-		AccountID:      acc.ID,
-		Title:          "ComfyUI 通道暂时没连上",
-		Message:        reasonHint + "你可以点「重新连接」再试一次，或者点「重启云端画布」重新拉起服务。",
-		URL:            colabURL,
-		PrimaryLabel:   "重新连接",
-		SecondaryLabel: "重启云端画布",
-		CancelLabel:    "关闭",
+	s.mu.Unlock()
+	s.notifyUI()
+	if s.URLOpener != nil {
+		s.URLOpener(cfURL)
+	}
+	s.ShowToast("已开启临时公网链接（无密码保护，用完请及时点击关闭）")
+}
+
+// StopCloudflaredTunnel 立即关闭云端已开启的 cloudflared 临时公网通道。
+func (s *Service) StopCloudflaredTunnel(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	svcCtx, cancelSvcCtx := s.serviceContext()
+	defer cancelSvcCtx()
+	if err := s.Engine.StopCloudflaredTunnel(svcCtx, acc); err != nil {
+		s.ShowToast("关闭公网通道失败：" + err.Error())
+		return
+	}
+	s.mu.Lock()
+	if cur, exists := s.Runtime[accountID]; exists {
+		cur.CloudflaredActive = false
+		if strings.Contains(cur.DisplayUIURL, "trycloudflare.com") {
+			cur.DisplayUIURL = ""
+		}
+		s.Runtime[accountID] = cur
+	}
+	s.mu.Unlock()
+	s.notifyUI()
+	s.ShowToast("已关闭云端临时公网通道")
+}
+
+// RemountDriveNow 允许用户在降级临时盘状态下手动重新触发 Google Drive 授权挂载。
+func (s *Service) RemountDriveNow(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("云端机器未运行")
+		return
+	}
+	expectedEndpoint := rt.ActiveEndpoint
+	s.ShowToast("正在重新挂载 Google Drive…")
+	svcCtx, cancelSvcCtx := s.serviceContext()
+	defer cancelSvcCtx()
+	mounted, reason := s.Engine.EnsureDriveMountedInteractive(svcCtx, acc, func(authURL string) bool {
+		ch := make(chan bool, 1)
+		s.mu.Lock()
+		if oldCh := s.driveAuthResultCh; oldCh != nil {
+			select {
+			case oldCh <- false:
+			default:
+			}
+		}
+		s.driveAuthResultCh = ch
+		s.actionPrompt = &core.UserActionPrompt{
+			ID:             uuid.New().String(),
+			Kind:           core.PromptDriveAuth,
+			AccountID:      acc.ID,
+			Title:          "重新授权挂载 Google Drive",
+			Message:        "已在浏览器打开 Google Drive 授权页面，请点「允许」后回到这里点击下方按钮继续挂载。",
+			URL:            authURL,
+			PrimaryLabel:   "我已点完允许，继续",
+			SecondaryLabel: "取消挂载",
+			CancelLabel:    "关闭",
+		}
+		opener := s.URLOpener
+		s.mu.Unlock()
+		s.notifyUI()
+		if authURL != "" && opener != nil {
+			opener(authURL)
+		}
+		select {
+		case proceed := <-ch:
+			return proceed
+		case <-svcCtx.Done():
+			return false
+		case <-s.stopLoops:
+			return false
+		}
 	})
-	s.ShowToast("ComfyUI 通道暂未连上，已弹出快捷处理向导")
+	s.mu.Lock()
+	hasTempVideos := false
+	if cur, exists := s.Runtime[accountID]; exists && cur.ActiveEndpoint == expectedEndpoint {
+		cur.DriveMountedKnown = true
+		cur.DriveActuallyMounted = mounted
+		hasTempVideos = cur.TempOutputVideos > 0 || (!cur.TempOutputScanKnown && cur.RenderedVideoCount > 0)
+		s.Runtime[accountID] = cur
+	}
+	s.mu.Unlock()
+	s.notifyUI()
+	if mounted {
+		if hasTempVideos {
+			s.ShowToast("Google Drive 已挂载；当前运行中的 ComfyUI 既有成片仍在临时盘 /content/output，请先保存或重新部署切换目录")
+		} else {
+			s.ShowToast("Google Drive 已挂载；如需让运行中的 ComfyUI 切换输出目录到 Drive，请点击「重新部署」")
+		}
+	} else {
+		if reason == "" {
+			reason = "Google Drive 暂未完成挂载，当前仍使用云端临时盘"
+		}
+		s.ShowToast(reason)
+	}
 }
 
 // RefreshDeployLog fetches recent remote deploy/ComfyUI logs asynchronously into runtime state for the log viewer overlay.
@@ -3833,10 +4548,46 @@ func (s *Service) RefreshAccountTelemetryNow(accountID string) {
 	}()
 }
 
-func (s *Service) OpenDriveOutputs() {
-	if s.URLOpener != nil {
-		s.URLOpener("https://drive.google.com/drive/search?q=ColabTools")
+func (s *Service) OpenDriveOutputs(accountID ...string) {
+	if s.URLOpener == nil {
+		return
 	}
+	var acc core.AccountProfile
+	hasAcc := false
+	if len(accountID) > 0 && strings.TrimSpace(accountID[0]) != "" {
+		acc, hasAcc = s.accountByID(accountID[0])
+	}
+	if !hasAcc {
+		acc, hasAcc = s.SelectedAccount()
+	}
+	queryTerm := "ColabTools"
+	authEmail := ""
+	if hasAcc {
+		authEmail = strings.TrimSpace(acc.Email)
+		dir := strings.TrimSpace(acc.DriveOutputDir)
+		if dir != "" {
+			cleaned := path.Clean(strings.ReplaceAll(dir, `\`, "/"))
+			base := path.Base(cleaned)
+			if base != "" && base != "." && base != "/" {
+				// If user kept default .../ColabTools/outputs, search parent folder name for clearer hits when base is generic "outputs"
+				if strings.EqualFold(base, "outputs") {
+					parent := path.Base(path.Dir(cleaned))
+					if parent != "" && parent != "." && parent != "/" && !strings.EqualFold(parent, "MyDrive") {
+						queryTerm = parent
+					} else {
+						queryTerm = base
+					}
+				} else {
+					queryTerm = base
+				}
+			}
+		}
+	}
+	target := "https://drive.google.com/drive/search?q=" + url.QueryEscape(queryTerm)
+	if authEmail != "" {
+		target += "&authuser=" + url.QueryEscape(authEmail)
+	}
+	s.URLOpener(target)
 }
 
 func (s *Service) StopSSHTunnel(accountID string) {
@@ -3960,6 +4711,10 @@ func (s *Service) OpenWorkloadWebUI(accountID string) {
 		}()
 
 		port, errBuf, startErr := s.startSSHTunnelInternal(accountID)
+		if errors.Is(startErr, errSSHTunnelStarting) {
+			s.ShowToast(startErr.Error())
+			return
+		}
 		if startErr != nil {
 			s.ShowToast("WebUI 本机通道启动失败：" + startErr.Error())
 			return
@@ -3992,7 +4747,7 @@ func (s *Service) OpenWorkloadWebUI(accountID string) {
 		if errBuf != nil {
 			errText = errBuf.String()
 		}
-		cleanupStaleColabSSH(acc.SessionName)
+		cleanupStaleColabSSH(acc)
 		s.StopSSHTunnel(accountID)
 		if strings.Contains(strings.ToLower(errText), "already-active ssh session") || strings.Contains(errText, "429") {
 			s.ShowToast("检测到旧 SSH 连接占坑，已清理旧连接，请稍等十几秒后再点一次「打开 WebUI」")
@@ -4022,6 +4777,11 @@ func (s *Service) accountByID(id string) (core.AccountProfile, bool) {
 // 1-second loop: idle watchdog & off-peak scheduled starts
 func (s *Service) handleOneSecondTick(now time.Time) {
 	var toShutdown []string
+	var toTempGuard []struct {
+		id     string
+		name   string
+		videos int
+	}
 	var toWarn []struct {
 		name string
 		rem  int
@@ -4073,7 +4833,24 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 					rem  int
 				}{acc.DisplayName, act.RemainingMinutes})
 			case core.WatchdogShutdown:
-				toShutdown = append(toShutdown, acc.ID)
+				tempOutputsAtRisk := !acc.EnableLLMModule && acc.UseGoogleDrive && ((rt.TempOutputScanKnown && rt.TempOutputVideos > 0) ||
+					(rt.DriveMountedKnown && !rt.DriveActuallyMounted && (rt.RenderedVideoCount > 0 || (rt.TempOutputScanKnown && rt.TempOutputVideos < 0))))
+				if tempOutputsAtRisk {
+					if !rt.WatchdogDeferredForTempOutputs {
+						rt.WatchdogDeferredForTempOutputs = true
+						vidCount := rt.TempOutputVideos
+						if vidCount <= 0 {
+							vidCount = rt.RenderedVideoCount
+						}
+						toTempGuard = append(toTempGuard, struct {
+							id     string
+							name   string
+							videos int
+						}{acc.ID, acc.DisplayName, vidCount})
+					}
+				} else {
+					toShutdown = append(toShutdown, acc.ID)
+				}
 			}
 			s.Runtime[acc.ID] = rt
 		}
@@ -4104,6 +4881,20 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 
 	for _, w := range toWarn {
 		s.SendNotification("即将空闲关机", fmt.Sprintf("%s 将在约 %d 分钟后自动关机止损，可在主控台点击「续命」", w.name, w.rem), true)
+	}
+	for _, tg := range toTempGuard {
+		msg := fmt.Sprintf("检测到 %s 的云端临时盘（未挂载 Drive）有 %d 条新成片，已暂缓自动关机以防清空视频，请先打开画布下载或确认关机。", tg.name, tg.videos)
+		s.SendNotification("暂缓自动关机：临时盘有未保存成片", msg, true)
+		s.PresentActionPrompt(&core.UserActionPrompt{
+			ID:             uuid.New().String(),
+			Kind:           core.PromptTempOutputGuard,
+			AccountID:      tg.id,
+			Title:          "已暂缓自动关机：临时盘有新成片",
+			Message:        msg,
+			PrimaryLabel:   "打开画布保存（重置计时）",
+			SecondaryLabel: "已保存/放弃成片，立刻关机",
+			CancelLabel:    "稍后处理",
+		})
 	}
 	for _, id := range toShutdown {
 		go s.StopAccountSession(id, "", "空闲自动关机")

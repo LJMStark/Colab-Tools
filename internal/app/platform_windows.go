@@ -34,7 +34,7 @@ func openTerminalCommand(shellCmd string) error {
 	return nil
 }
 
-func cleanupStaleColabSSH(_ string) {}
+func cleanupStaleColabSSH(_ core.AccountProfile) {}
 
 func sshControlSocketPath(_, _ string) string { return "" }
 

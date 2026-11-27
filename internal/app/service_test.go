@@ -922,6 +922,9 @@ func (f *fakeInteractiveColabRunner) RunShell(_ context.Context, shellCmd string
 		}
 		return runner.Result{ExitCode: 1, Stderr: "cloudflared unavailable"}
 	}
+	if strings.Contains(opts.Stdin, "CLOUDFLARED_STOPPED=1") {
+		return runner.Result{ExitCode: 0, Stdout: "CLOUDFLARED_STOPPED=1\n"}
+	}
 	if strings.Contains(shellCmd, "'url'") || strings.Contains(shellCmd, " url ") {
 		return runner.Result{ExitCode: 0, Stdout: "https://colab.research.google.com/drive/demo\n"}
 	}
@@ -1082,7 +1085,8 @@ exit 0
 	svc.CancelQueue(pAcc.ID)
 	close(blockQueue)
 
-	// 3. OpenComfyUI: SSH 2 failures -> auto cloudflared fallback; all fail -> PromptComfyHelp
+	// 3. OpenComfyUI: SSH 2 failures with EnableCloudflared=false MUST NOT auto-open public cloudflared;
+	// instead it surfaces PromptComfyHelp and only opens cloudflared upon explicit user confirmation (or EnableCloudflared=true).
 	svcComfy := NewService(true)
 	defer svcComfy.Shutdown()
 	svcComfy.NotifySender = func(_, _ string) {}
@@ -1105,6 +1109,7 @@ exit 0
 	fr.cfURL = "https://auto-rescue-comfy.trycloudflare.com"
 	fr.mu.Unlock()
 	svcComfy.Engine = colab.NewEngine(fr, svcComfy.Vault)
+	acc.EnableCloudflared = false
 	svcComfy.Settings.Accounts = []core.AccountProfile{acc}
 	svcComfy.Settings.SelectedAccountID = acc.ID
 
@@ -1123,32 +1128,66 @@ exit 0
 	svcComfy.Runtime[acc.ID] = rt
 	svcComfy.mu.Unlock()
 
+	// Default (EnableCloudflared=false): must NOT auto-open cloudflared; must prompt user explicitly
 	svcComfy.OpenComfyUI(acc.ID)
 	openedMu.Lock()
-	hasCF := len(openedURLs) > 0 && openedURLs[len(openedURLs)-1] == "https://auto-rescue-comfy.trycloudflare.com"
+	openedAfterDefault := append([]string(nil), openedURLs...)
 	openedMu.Unlock()
-	if !hasCF {
-		t.Fatalf("expected OpenComfyUI to fall back to cloudflared URL, got openedURLs=%+v", openedURLs)
+	if len(openedAfterDefault) != 0 {
+		t.Fatalf("EnableCloudflared=false must NEVER auto-open cloudflared URL, got %+v", openedAfterDefault)
 	}
 	if svcComfy.StateFor(acc.ID).ComfyOpening {
 		t.Fatal("ComfyOpening must reset to false after OpenComfyUI finishes")
 	}
-
-	// All channels fail -> PromptComfyHelp with plain-Chinese guidance (never 8188 jargon)
-	fr.mu.Lock()
-	fr.cfURL = ""
-	fr.mu.Unlock()
-	svcComfy.OpenComfyUI(acc.ID)
 	helpPrompt := svcComfy.CurrentActionPrompt()
-	if helpPrompt == nil || helpPrompt.Kind != core.PromptComfyHelp {
-		t.Fatalf("expected PromptComfyHelp when both SSH and cloudflared fail, got %+v", helpPrompt)
+	if helpPrompt == nil || helpPrompt.Kind != core.PromptComfyHelp || helpPrompt.SecondaryAction != "enable_cloudflared" {
+		t.Fatalf("expected PromptComfyHelp with explicit cloudflared opt-in, got %+v", helpPrompt)
 	}
 	if strings.Contains(helpPrompt.Message, "8188") {
 		t.Fatalf("PromptComfyHelp must avoid technical 8188 port jargon, got %q", helpPrompt.Message)
 	}
-	svcComfy.ResolveActionPrompt("cancel")
-	if svcComfy.CurrentActionPrompt() != nil {
-		t.Fatal("cancel must dismiss PromptComfyHelp")
+
+	// Explicit user opt-in via secondary action opens cloudflared and marks CloudflaredActive=true
+	svcComfy.ResolveActionPrompt("secondary")
+	deadlineCF := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadlineCF) {
+		openedMu.Lock()
+		n := len(openedURLs)
+		openedMu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	openedMu.Lock()
+	hasCF := len(openedURLs) > 0 && openedURLs[len(openedURLs)-1] == "https://auto-rescue-comfy.trycloudflare.com"
+	openedMu.Unlock()
+	if !hasCF {
+		t.Fatalf("expected explicit secondary opt-in to open cloudflared URL, got openedURLs=%+v", openedURLs)
+	}
+	if stCF := svcComfy.StateFor(acc.ID); !stCF.CloudflaredActive || stCF.DisplayUIURL == "" {
+		t.Fatalf("expected CloudflaredActive=true and DisplayUIURL set, got %+v", stCF)
+	}
+
+	// Explicit StopCloudflaredTunnel clears CloudflaredActive and DisplayUIURL
+	svcComfy.StopCloudflaredTunnel(acc.ID)
+	if stStopped := svcComfy.StateFor(acc.ID); stStopped.CloudflaredActive || stStopped.DisplayUIURL != "" {
+		t.Fatalf("expected StopCloudflaredTunnel to clear active flag and URL, got %+v", stStopped)
+	}
+
+	// When user explicitly enables EnableCloudflared=true, auto-fallback works when SSH fails
+	accCFOn := acc
+	accCFOn.EnableCloudflared = true
+	svcComfy.Settings.Accounts = []core.AccountProfile{accCFOn}
+	openedMu.Lock()
+	openedURLs = nil
+	openedMu.Unlock()
+	svcComfy.OpenComfyUI(acc.ID)
+	openedMu.Lock()
+	hasAutoCF := len(openedURLs) > 0 && openedURLs[len(openedURLs)-1] == "https://auto-rescue-comfy.trycloudflare.com"
+	openedMu.Unlock()
+	if !hasAutoCF {
+		t.Fatalf("expected EnableCloudflared=true to allow fallback URL, got %+v", openedURLs)
 	}
 }
 
@@ -1736,5 +1775,295 @@ func TestStopSessionFlushesWorkspaceAndOpenCloudTerminal(t *testing.T) {
 	}
 	if p1 != "" && len(p1) >= 60 {
 		t.Fatalf("unix socket path too long (%d bytes): %q", len(p1), p1)
+	}
+}
+
+func TestV0320SafetyGuardsLedgerRecoveryAndDriveOutputs(t *testing.T) {
+	// 1. StopAccountManagedSessions scopes strictly to target account (never touches other accounts)
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	acc1 := core.NewDefaultAccountProfile("Acc1", "acc1@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc1.SessionName = "sess-one"
+	acc1.DriveOutputDir = "/content/drive/MyDrive/MyStudio/outputs"
+	acc2 := core.NewDefaultAccountProfile("Acc2", "acc2@example.com", core.TierColabPro, core.AuthSystemDefaultOAuth2)
+	acc2.SessionName = "sess-two"
+	svc.Settings.Accounts = []core.AccountProfile{acc1, acc2}
+	svc.Settings.SelectedAccountID = acc1.ID
+
+	rt1 := core.NewAccountRuntimeState()
+	rt1.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt1.ActiveEndpoint = "ep-1"
+	rt1.Sessions = []core.ColabSessionItem{
+		{Name: "sess-one", Endpoint: "ep-1", Hardware: "A100"},
+		{Name: "sess-one-extra", Endpoint: "ep-1b", Hardware: "L4"},
+	}
+	rt2 := core.NewAccountRuntimeState()
+	rt2.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt2.ActiveEndpoint = "ep-2"
+	rt2.Sessions = []core.ColabSessionItem{{Name: "sess-two", Endpoint: "ep-2", Hardware: "L4"}}
+	svc.Runtime[acc1.ID] = rt1
+	svc.Runtime[acc2.ID] = rt2
+
+	var mu sync.Mutex
+	var stoppedCmds []string
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		switch {
+		case strings.Contains(cmd, "stop"):
+			mu.Lock()
+			stoppedCmds = append(stoppedCmds, cmd)
+			mu.Unlock()
+			return runner.Result{ExitCode: 0, Stdout: "Stopped.\n"}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		case strings.Contains(cmd, "sessions"):
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	svc.StopAccountManagedSessions(acc1.ID)
+	mu.Lock()
+	cmds := append([]string(nil), stoppedCmds...)
+	mu.Unlock()
+	if len(cmds) != 2 {
+		t.Fatalf("expected exactly 2 stops for acc1 (primary + extra), got %+v", cmds)
+	}
+	for _, c := range cmds {
+		if strings.Contains(c, "sess-two") {
+			t.Fatalf("StopAccountManagedSessions must never touch acc2 session, got %q", c)
+		}
+	}
+	if !svc.StateFor(acc2.ID).Phase.IsRunning() {
+		t.Fatal("acc2 must remain untouched and running")
+	}
+
+	// 2. RequestConfirmRemoveAccount prompts for running acc2, and removes idle acc1 directly
+	svc.RequestConfirmRemoveAccount(acc2.ID)
+	rmPrompt := svc.CurrentActionPrompt()
+	if rmPrompt == nil || rmPrompt.Kind != core.PromptConfirmRemoveAccount || rmPrompt.AccountID != acc2.ID {
+		t.Fatalf("expected PromptConfirmRemoveAccount for running acc2, got %+v", rmPrompt)
+	}
+	svc.ResolveActionPrompt("cancel")
+	if _, ok := svc.accountByID(acc2.ID); !ok {
+		t.Fatal("cancel must keep running acc2")
+	}
+
+	// 3. RequestConfirmQuit prompts when acc2 is running; secondary invokes quit callback without stopping
+	quitCalled := false
+	svc.RequestConfirmQuit(func() { quitCalled = true })
+	qPrompt := svc.CurrentActionPrompt()
+	if qPrompt == nil || qPrompt.Kind != core.PromptConfirmQuit {
+		t.Fatalf("expected PromptConfirmQuit when GPU running, got %+v", qPrompt)
+	}
+	svc.ResolveActionPrompt("secondary")
+	if !quitCalled {
+		t.Fatal("expected secondary action on PromptConfirmQuit to invoke quit callback")
+	}
+
+	// 4. OpenDriveOutputs honors custom DriveOutputDir and authuser email
+	var openedDriveURL string
+	svc.URLOpener = func(u string) { openedDriveURL = u }
+	svc.OpenDriveOutputs(acc1.ID)
+	if !strings.Contains(openedDriveURL, "q=MyStudio") || !strings.Contains(openedDriveURL, "authuser=acc1%40example.com") {
+		t.Fatalf("unexpected Drive URL: %q", openedDriveURL)
+	}
+
+	// 5. Watchdog temp-output guard defers auto-shutdown when Drive is unmounted and temp videos exist
+	now := time.Now()
+	svc.mu.Lock()
+	acc2Mod := acc2
+	acc2Mod.UseGoogleDrive = true
+	acc2Mod.EnableLLMModule = false
+	acc2Mod.AutoShutdownEnabled = true
+	acc2Mod.IdleTimeoutMinutes = 10
+	acc2Mod.QueueDrainMinutes = 10
+	svc.Settings.Accounts = []core.AccountProfile{acc1, acc2Mod}
+	rt2Guard := svc.Runtime[acc2.ID]
+	rt2Guard.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt2Guard.DriveMountedKnown = true
+	rt2Guard.DriveActuallyMounted = false
+	rt2Guard.RenderedVideoCount = 2
+	rt2Guard.SignalSource = core.SignalSourceComfyQueue
+	rt2Guard.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
+	rt2Guard.IdleSeconds = 600 // hits 10m threshold
+	svc.Runtime[acc2.ID] = rt2Guard
+	svc.mu.Unlock()
+
+	svc.handleOneSecondTick(now)
+	if !svc.StateFor(acc2.ID).WatchdogDeferredForTempOutputs {
+		t.Fatal("expected watchdog to defer shutdown when temp disk holds rendered videos")
+	}
+	if p := svc.CurrentActionPrompt(); p == nil || p.Kind != core.PromptTempOutputGuard {
+		t.Fatalf("expected PromptTempOutputGuard, got %+v", p)
+	}
+
+	// 6. Active session ledger recovery on restart (resume live endpoint + backfill dead endpoint)
+	dir := t.TempDir()
+	ledgerPath := filepath.Join(dir, "active_sessions.json")
+	started := now.Add(-30 * time.Minute)
+	if err := core.SaveActiveLedger(ledgerPath, map[string]core.ActiveSessionLedgerEntry{
+		"acc-live": {
+			AccountID:          "acc-live",
+			AccountName:        "Live",
+			SessionName:        "s-live",
+			Endpoint:           "ep-live-keep",
+			Hardware:           "A100",
+			StartedAt:          started,
+			StartBalance:       200.0,
+			StartBalanceValid:  true,
+			MeasuredSingleRate: 12.0,
+			EstimatedCU:        6.0,
+			LastSampleAt:       now.Add(-5 * time.Minute),
+			LastUptimeSec:      1500,
+		},
+		"acc-dead": {
+			AccountID:          "acc-dead",
+			AccountName:        "Dead",
+			SessionName:        "s-dead",
+			Endpoint:           "ep-dead-gone",
+			Hardware:           "L4",
+			StartedAt:          started,
+			MeasuredSingleRate: 2.0,
+			EstimatedCU:        1.0,
+			LastSampleAt:       now.Add(-2 * time.Minute),
+			LastUptimeSec:      1680,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svcR := NewService(true)
+	defer svcR.Shutdown()
+	svcR.persistChanges = true
+	svcR.activeLedgerPath = ledgerPath
+	svcR.pendingLedger = core.LoadActiveLedger(ledgerPath)
+	aLive := core.NewDefaultAccountProfile("Live", "live@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	aLive.ID = "acc-live"
+	aLive.SessionName = "s-live"
+	aDead := core.NewDefaultAccountProfile("Dead", "dead@example.com", core.TierColabPro, core.AuthSystemDefaultOAuth2)
+	aDead.ID = "acc-dead"
+	aDead.SessionName = "s-dead"
+	svcR.Settings.Accounts = []core.AccountProfile{aLive, aDead}
+	svcR.Runtime[aLive.ID] = core.NewAccountRuntimeState()
+	svcR.Runtime[aDead.ID] = core.NewAccountRuntimeState()
+
+	svcR.mu.Lock()
+	_, isLiveRun, closedLive := svcR.applyServerSnapshotLocked(aLive.ID, aLive, &colab.UsageSnapshot{Balance: 193.0, RatePerHour: 12.0, ActiveAssignments: 1}, []core.ColabSessionItem{{Name: "s-live", Endpoint: "ep-live-keep", Hardware: "A100"}}, now, false, "")
+	_, isDeadRun, closedDead := svcR.applyServerSnapshotLocked(aDead.ID, aDead, &colab.UsageSnapshot{Balance: 98.0, RatePerHour: 0, ActiveAssignments: 0}, nil, now, false, "")
+	svcR.mu.Unlock()
+	if !isLiveRun || closedLive != nil {
+		t.Fatalf("expected live endpoint resumed without closing, isLiveRun=%v closed=%+v", isLiveRun, closedLive)
+	}
+	resumedRT := svcR.StateFor(aLive.ID)
+	if resumedRT.SessionEstimatedCU < 6.9 || resumedRT.SessionStartBalance != 200.0 || resumedRT.SessionAdopted {
+		t.Fatalf("expected seamless ledger resumption, got estCU=%.2f startBal=%.2f adopted=%v", resumedRT.SessionEstimatedCU, resumedRT.SessionStartBalance, resumedRT.SessionAdopted)
+	}
+	if isDeadRun || closedDead == nil || closedDead.Endpoint != "ep-dead-gone" || closedDead.ConsumedCU < 0.99 || closedDead.BillingBasis != core.BillingEstimated {
+		t.Fatalf("expected dead ledger entry backfilled as BillingEstimated, got run=%v rec=%+v", isDeadRun, closedDead)
+	}
+}
+
+func TestV0320CodexReviewFixesStopGuardPromptIDAndTempDir(t *testing.T) {
+	// 1. Stop failure must NOT remove account or invoke quit callback
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	acc := core.NewDefaultAccountProfile("GuardAcc", "guard@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.SessionName = "sess-guard"
+	acc.UseGoogleDrive = true
+	acc.AutoShutdownEnabled = true
+	acc.IdleTimeoutMinutes = 10
+	acc.QueueDrainMinutes = 10
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-guard-1"
+	rt.Sessions = []core.ColabSessionItem{{Name: "sess-guard", Endpoint: "ep-guard-1", Hardware: "A100"}}
+	svc.Runtime[acc.ID] = rt
+
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		switch {
+		case strings.Contains(cmd, "stop"):
+			return runner.Result{ExitCode: 1, Stderr: "transient stop error"}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.0 compute units\nUsage rate: 12.00/hr\nActive assignments: 1\n"}
+		case strings.Contains(cmd, "sessions"):
+			// Server still reports session alive!
+			return runner.Result{ExitCode: 0, Stdout: "[sess-guard] ep-guard-1 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	// Remove with primary ("先停机再移除") must keep account when stop verification fails
+	svc.RequestConfirmRemoveAccount(acc.ID)
+	pRm := svc.CurrentActionPrompt()
+	if pRm == nil || pRm.Kind != core.PromptConfirmRemoveAccount {
+		t.Fatalf("expected PromptConfirmRemoveAccount, got %+v", pRm)
+	}
+	// Stale prompt ID click must be ignored
+	svc.ResolveActionPromptByID("wrong-id", "secondary")
+	if svc.CurrentActionPrompt() == nil {
+		t.Fatal("stale prompt ID must NOT resolve active prompt")
+	}
+	svc.ResolveActionPromptByID(pRm.ID, "primary")
+	time.Sleep(80 * time.Millisecond)
+	if _, stillExists := svc.accountByID(acc.ID); !stillExists {
+		t.Fatal("account must NOT be removed when StopAccountManagedSessions fails to verify offline")
+	}
+
+	// Quit with primary ("先全部关机再退出") must NOT invoke quitFn when stop fails
+	var quitCalled bool
+	svc.RequestConfirmQuit(func() { quitCalled = true })
+	pQuit := svc.CurrentActionPrompt()
+	svc.ResolveActionPromptByID(pQuit.ID, "primary")
+	time.Sleep(80 * time.Millisecond)
+	if quitCalled {
+		t.Fatal("quit callback must NOT fire when StopAllManagedSessions fails to verify offline")
+	}
+
+	// 2. Endpoint-bound PromptConfirmStop refuses to stop a newer replacement endpoint
+	svc.RequestConfirmStop(acc.ID)
+	pStop := svc.CurrentActionPrompt()
+	if pStop == nil || pStop.ExpectedEndpoint != "ep-guard-1" {
+		t.Fatalf("expected PromptConfirmStop bound to ep-guard-1, got %+v", pStop)
+	}
+	svc.mu.Lock()
+	cur := svc.Runtime[acc.ID]
+	cur.ActiveEndpoint = "ep-guard-2-newer"
+	svc.Runtime[acc.ID] = cur
+	svc.mu.Unlock()
+	svc.ResolveActionPromptByID(pStop.ID, "primary")
+	if !strings.Contains(svc.ViewState().ToastMessage, "已取消本次过期停机确认") {
+		t.Fatalf("expected stale endpoint guard toast, got %q", svc.ViewState().ToastMessage)
+	}
+
+	// 3. Even after Drive remount succeeds, non-zero TempOutputVideos in /content/output still defers auto-shutdown
+	now := time.Now()
+	svc.mu.Lock()
+	cur = svc.Runtime[acc.ID]
+	cur.DriveMountedKnown = true
+	cur.DriveActuallyMounted = true // Drive remounted later, but temp dir still holds unsaved video!
+	cur.TempOutputScanKnown = true
+	cur.TempOutputVideos = 1
+	cur.WatchdogDeferredForTempOutputs = false
+	cur.SignalSource = core.SignalSourceComfyQueue
+	cur.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
+	cur.IdleSeconds = 600
+	svc.Runtime[acc.ID] = cur
+	svc.mu.Unlock()
+
+	svc.handleOneSecondTick(now)
+	if !svc.StateFor(acc.ID).WatchdogDeferredForTempOutputs {
+		t.Fatal("expected watchdog to remain deferred while /content/output still holds unsaved videos even after Drive remount")
 	}
 }

@@ -391,3 +391,78 @@ func TestHistoryExportCSVFormulaInjectionGuard(t *testing.T) {
 		t.Fatalf("numeric columns should remain plain numbers, got dur=%q rounds=%q", row[7], row[18])
 	}
 }
+
+func TestHistoryStoreCorruptReadOnlyPreventsOverwriteAndSchemaVersion(t *testing.T) {
+	dir := t.TempDir()
+	corruptPath := filepath.Join(dir, "history.json")
+	corruptBody := "{corrupt-history-json"
+	if err := os.WriteFile(corruptPath, []byte(corruptBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := core.LoadHistoryStore(corruptPath)
+	if !store.IsCorruptReadOnly() {
+		t.Fatal("expected corrupt history store to enable read-only protection")
+	}
+	loadErr, backupPath := store.LoadError()
+	if loadErr == nil || backupPath == "" {
+		t.Fatalf("expected loadErr and backupPath, got err=%v backup=%q", loadErr, backupPath)
+	}
+	if rawBak, err := os.ReadFile(backupPath); err != nil || string(rawBak) != corruptBody {
+		t.Fatalf("expected backup file to preserve original bytes, got %q err=%v", string(rawBak), err)
+	}
+	if err := store.AddRecord(core.HistoryRecord{Kind: core.HistoryKindSession, AccountID: "acc-1"}); err == nil {
+		t.Fatal("AddRecord must return error and refuse overwrite when history is corrupt read-only")
+	}
+	if err := store.Clear(); err == nil {
+		t.Fatal("Clear must return error when history is corrupt read-only")
+	}
+	if rawOrig, err := os.ReadFile(corruptPath); err != nil || string(rawOrig) != corruptBody {
+		t.Fatalf("original corrupt history.json must remain untouched, got %q err=%v", string(rawOrig), err)
+	}
+
+	// Valid history writes schemaVersion=1
+	goodPath := filepath.Join(dir, "good-history.json")
+	goodStore := core.LoadHistoryStore(goodPath)
+	if err := goodStore.AddRecord(core.HistoryRecord{
+		Kind:        core.HistoryKindSession,
+		AccountID:   "acc-good",
+		AccountName: "Good",
+		StartedAt:   time.Now(),
+		DurationSec: 120,
+		Hardware:    "L4",
+	}); err != nil {
+		t.Fatalf("AddRecord on valid store failed: %v", err)
+	}
+	rawGood, err := os.ReadFile(goodPath)
+	if err != nil || !strings.Contains(string(rawGood), `"schemaVersion": 1`) {
+		t.Fatalf("expected schemaVersion=1 in history.json, got %q err=%v", string(rawGood), err)
+	}
+
+	// Idempotent upsert by deterministic ID prevents duplicate ledger recovery records
+	rec := core.HistoryRecord{
+		ID:          "sess-fixed-id-01",
+		Kind:        core.HistoryKindSession,
+		AccountID:   "acc-good",
+		AccountName: "Good",
+		StartedAt:   time.Now(),
+		DurationSec: 300,
+		ConsumedCU:  1.2,
+	}
+	if err := goodStore.AddRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := goodStore.AddRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := goodStore.Query(core.HistoryFilter{AccountID: "acc-good"}, time.Now())
+	fixedHits := 0
+	for _, r := range recs {
+		if r.ID == "sess-fixed-id-01" {
+			fixedHits++
+		}
+	}
+	if fixedHits != 1 {
+		t.Fatalf("expected exactly 1 record for deterministic ID, got %d", fixedHits)
+	}
+}

@@ -106,3 +106,31 @@ func TestVaultMemoryBackendAndCredentialNormalization(t *testing.T) {
 		t.Fatalf("legacy API key must migrate transparently: %q err=%v", gotKey, err)
 	}
 }
+
+func TestStreamingShellHandlesOver600KiBSingleLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test runs on Unix runners")
+	}
+	r := runner.NewOSRunner()
+	var lines []string
+	// Emit a >600KiB single line followed by a normal marker line; must neither deadlock nor drop the trailing line
+	res := r.RunStreamingShell(context.Background(), `python3 -c 'print("A"*650000); print("AFTER_HUGE_LINE")'`, 10*time.Second, func(line string) {
+		lines = append(lines, line)
+	})
+	if res.ExitCode != 0 {
+		t.Fatalf("expected ExitCode 0 for huge single-line stream, got %+v", res)
+	}
+	foundTrunc := false
+	foundAfter := false
+	for _, ln := range lines {
+		if strings.HasSuffix(ln, "…[truncated]") {
+			foundTrunc = true
+		}
+		if ln == "AFTER_HUGE_LINE" {
+			foundAfter = true
+		}
+	}
+	if !foundTrunc || !foundAfter {
+		t.Fatalf("expected truncated huge line and trailing marker, got foundTrunc=%v foundAfter=%v count=%d", foundTrunc, foundAfter, len(lines))
+	}
+}

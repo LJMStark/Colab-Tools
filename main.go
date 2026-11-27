@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"sync/atomic"
 
 	"github.com/LJMStark/Colab-Tools/internal/app"
 	"github.com/LJMStark/Colab-Tools/internal/uiapp"
@@ -22,7 +23,7 @@ func main() {
 	var mainWin *mygo.Window
 	var flyout *mygo.Window
 	var tray *mygo.Tray
-	var quitting bool
+	var quitting atomic.Bool
 
 	openMainWindow := func(sec app.MainSection, onboarding bool) {
 		if onboarding {
@@ -45,7 +46,7 @@ func main() {
 				Content:       ui.View(mainUI.View),
 			})
 			mainWin.OnClose(func(e *mygo.CloseEvent) {
-				if quitting {
+				if quitting.Load() {
 					return
 				}
 				// Hide to quiet menu bar / system tray instead of quitting the background monitor
@@ -139,6 +140,25 @@ func main() {
 		tray.SetToolTip(tooltip)
 	}
 
+	doFinalQuit := func() {
+		if quitting.Swap(true) {
+			return
+		}
+		svc.Shutdown()
+		mygo.App.Quit()
+	}
+	requestAppQuit := func() {
+		if flyout != nil && !flyout.IsDestroyed() {
+			flyout.Hide()
+		}
+		if svc.TotalManagedRunningSessionCount() > 0 {
+			openMainWindow(app.SectionHome, false)
+			svc.RequestConfirmQuit(doFinalQuit)
+			return
+		}
+		doFinalQuit()
+	}
+
 	svc.OnOpenMainWin = openMainWindow
 	svc.OnUIInvalidate = func() {
 		if mainWin != nil && !mainWin.IsDestroyed() {
@@ -155,11 +175,28 @@ func main() {
 		}
 		openMainWindow(sec, false)
 	}
-	popUI.OnQuit = func() {
-		quitting = true
-		svc.Shutdown()
-		mygo.App.Quit()
+	popUI.OnOpenOnboarding = func() {
+		if flyout != nil && !flyout.IsDestroyed() {
+			flyout.Hide()
+		}
+		svc.ReopenOnboarding()
+		openMainWindow(app.SectionStatus, true)
 	}
+	popUI.OnRequestStop = func(accountID string) {
+		if flyout != nil && !flyout.IsDestroyed() {
+			flyout.Hide()
+		}
+		openMainWindow(app.SectionHome, false)
+		svc.RequestConfirmStop(accountID)
+	}
+	popUI.OnRequestStopAll = func() {
+		if flyout != nil && !flyout.IsDestroyed() {
+			flyout.Hide()
+		}
+		openMainWindow(app.SectionHome, false)
+		svc.RequestConfirmStopAll()
+	}
+	popUI.OnQuit = requestAppQuit
 
 	mygo.App.WhenReady(func() {
 		if !mygo.App.RequestSingleInstanceLock() {
@@ -174,8 +211,16 @@ func main() {
 				openMainWindow(svc.ViewState().SelectedSection, false)
 			}
 		})
-		mygo.App.OnBeforeQuit(func(_ *mygo.QuitEvent) {
-			quitting = true
+		mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
+			if quitting.Load() {
+				return
+			}
+			if !e.SessionEnding && svc.TotalManagedRunningSessionCount() > 0 {
+				e.PreventDefault()
+				requestAppQuit()
+				return
+			}
+			quitting.Store(true)
 			svc.Shutdown()
 		})
 
@@ -222,17 +267,18 @@ func main() {
 				mygo.Separator(),
 				{
 					ID:    "stop-all",
-					Label: "全部关机止损",
-					Click: func(_ *mygo.MenuItem, _ *mygo.Window) { go svc.StopAllManagedSessions() },
+					Label: "全部关机止损…",
+					Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
+						openMainWindow(app.SectionHome, false)
+						svc.RequestConfirmStopAll()
+					},
 				},
 				mygo.Separator(),
 				{
 					ID:    "quit",
 					Label: "退出 Colab Tools",
 					Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
-						quitting = true
-						svc.Shutdown()
-						mygo.App.Quit()
+						requestAppQuit()
 					},
 				},
 			})

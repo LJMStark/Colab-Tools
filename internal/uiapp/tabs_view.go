@@ -562,7 +562,7 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).Gap(4).Children(func() {
 			ui.Text(c, "账号").FontSize(22).Bold().TextColor(pal.TextPrimary)
-			ui.Text(c, "账号凭证加密存在本机系统凭据库（macOS 钥匙串 / Windows 凭据管理器），多账号点数完全隔离。").FontSize(13).TextColor(pal.TextMuted)
+			ui.Text(c, "账号凭证加密存在本机 macOS 系统钥匙串中，多账号点数完全隔离。").FontSize(13).TextColor(pal.TextMuted)
 		})
 		PillButton(c, pal, "+ 绑定新账号", true, !vs.CLIInstalled, func() {
 			m.ShowAddAccPanel = !m.ShowAddAccPanel
@@ -640,7 +640,7 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 						}
 					})
 					SmallActionButton(c, pal, "移除", &pal.Coral, false, func() {
-						m.Svc.RemoveAccount(accCopy.ID)
+						m.Svc.RequestConfirmRemoveAccount(accCopy.ID)
 					})
 				})
 
@@ -1011,9 +1011,9 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 					a := pal.Amber
 					recessedStatusPill(c, pal, &a, "v"+app.AppVersion)
 					s := pal.Sky
-					recessedStatusPill(c, pal, &s, "macOS & Windows")
+					recessedStatusPill(c, pal, &s, "macOS")
 				})
-				ui.Text(c, "全调用 Google 官方 google-colab-cli · 纯 Go 零依赖跨平台桌面控制台").FontSize(12).TextColor(pal.TextMuted)
+				ui.Text(c, "全调用 Google 官方 google-colab-cli · 纯 Go 零依赖 macOS 桌面控制台").FontSize(12).TextColor(pal.TextMuted)
 			})
 			SmallActionButton(c, pal, "GitHub", nil, false, func() {
 				if m.Svc.URLOpener != nil {

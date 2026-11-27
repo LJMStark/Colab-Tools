@@ -1040,8 +1040,11 @@ func (a AccountProfile) IsolatedConfigFilePath() string {
 	return filepath.Join(ConfigDir(), "profiles", a.ID, "sessions.json")
 }
 
+const CurrentConfigSchemaVersion = 1
+
 // AppSettings is the root persisted workspace configuration.
 type AppSettings struct {
+	SchemaVersion            int                  `json:"schemaVersion,omitempty"`
 	Accounts                 []AccountProfile     `json:"accounts"`
 	SelectedAccountID        string               `json:"selectedAccountId"`
 	StatusBarMode            StatusBarDisplayMode `json:"statusBarMode"`
@@ -1055,6 +1058,7 @@ type AppSettings struct {
 
 func DefaultAppSettings() AppSettings {
 	return AppSettings{
+		SchemaVersion:            CurrentConfigSchemaVersion,
 		Accounts:                 []AccountProfile{},
 		StatusBarMode:            StatusBarCompact,
 		BackgroundRefreshSeconds: 180,
@@ -1232,6 +1236,13 @@ func LoadAppSettings(path string) AppSettings {
 		_ = os.WriteFile(backupPath, raw, 0o600)
 		return DefaultAppSettings()
 	}
+	if s.SchemaVersion > CurrentConfigSchemaVersion {
+		backupPath := fmt.Sprintf("%s.future-v%d.%d", path, s.SchemaVersion, time.Now().Unix())
+		_ = os.WriteFile(backupPath, raw, 0o600)
+	}
+	if s.SchemaVersion <= 0 {
+		s.SchemaVersion = CurrentConfigSchemaVersion
+	}
 	if !hasOnboardingKey && len(s.Accounts) > 0 {
 		s.HasCompletedOnboarding = true
 	}
@@ -1253,6 +1264,9 @@ func LoadAppSettings(path string) AppSettings {
 func (s AppSettings) Save(path string) error {
 	if path == "" {
 		path = DefaultConfigPath()
+	}
+	if s.SchemaVersion <= 0 {
+		s.SchemaVersion = CurrentConfigSchemaVersion
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1299,22 +1313,30 @@ type InstancePhase struct {
 type ActionPromptKind string
 
 const (
-	PromptDriveAuth   ActionPromptKind = "drive_auth"
-	PromptComfyHelp   ActionPromptKind = "comfy_help"
-	PromptConfirmStop ActionPromptKind = "confirm_stop"
+	PromptDriveAuth            ActionPromptKind = "drive_auth"
+	PromptComfyHelp            ActionPromptKind = "comfy_help"
+	PromptConfirmStop          ActionPromptKind = "confirm_stop"
+	PromptConfirmStopAll       ActionPromptKind = "confirm_stop_all"
+	PromptConfirmRemoveAccount ActionPromptKind = "confirm_remove_account"
+	PromptConfirmQuit          ActionPromptKind = "confirm_quit"
+	PromptTempOutputGuard      ActionPromptKind = "temp_output_guard"
 )
 
 // UserActionPrompt 描述需要用户在桌面弹窗中确认或处理的小白向引导操作。
 type UserActionPrompt struct {
-	ID             string
-	Kind           ActionPromptKind
-	AccountID      string
-	Title          string
-	Message        string
-	URL            string
-	PrimaryLabel   string
-	SecondaryLabel string
-	CancelLabel    string
+	ID               string
+	Kind             ActionPromptKind
+	AccountID        string
+	SessionName      string
+	ExpectedEndpoint string
+	Title            string
+	Message          string
+	URL              string
+	PrimaryLabel     string
+	PrimaryAction    string
+	SecondaryLabel   string
+	SecondaryAction  string
+	CancelLabel      string
 }
 
 func (p InstancePhase) IsRunning() bool { return p.Kind == PhaseRunning }
@@ -1428,10 +1450,17 @@ type AccountRuntimeState struct {
 	DeployNotifiedFailEndpoint string
 	DeployLogTail              string
 	DeployLogLoading           bool
-	RenderedVideoCount         int
-	SawQueueBusyThisRun        bool
-	AutoOpenedEndpoint         string
-	ComfyOpening               bool
+	RenderedVideoCount             int
+	SawQueueBusyThisRun            bool
+	AutoOpenedEndpoint             string
+	ComfyOpening                   bool
+	DriveMountedKnown              bool
+	DriveActuallyMounted           bool
+	EffectiveOutputDir             string
+	TempOutputVideos               int
+	TempOutputScanKnown            bool
+	WatchdogDeferredForTempOutputs bool
+	CloudflaredActive              bool
 
 	ActivitySignal ActivitySignal
 	SignalSource   ActivitySignalSource

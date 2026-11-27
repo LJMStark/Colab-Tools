@@ -24,7 +24,7 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 					}
 					ui.Column(c).Grow(1).Gap(3).Children(func() {
 						ui.Text(c, "欢迎使用 Colab Tools").FontSize(22).Bold().TextColor(pal.TextPrimary)
-						ui.Text(c, "3 步完成环境体检与 Google 账号绑定，即可跨 macOS / Windows 一键管控云端 GPU / TPU").FontSize(13).TextColor(pal.TextMuted)
+						ui.Text(c, "3 步完成环境体检与 Google 账号绑定，即可在 macOS 上一键管控云端 GPU 与 ComfyUI").FontSize(13).TextColor(pal.TextMuted)
 					})
 					SmallActionButton(c, pal, "先跳过，直接看界面", nil, false, func() {
 						m.Svc.CompleteOnboarding()
