@@ -26,7 +26,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.18"
+const AppVersion = "0.3.19"
 
 // tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
 type tunnelStderrBuffer struct {
@@ -3123,12 +3123,15 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 	s.mu.Unlock()
 	s.notifyUI()
 
+	flushFailed := false
 	if targetSession == acc.SessionName {
 		s.cancelDeployFlow(accountID)
 		s.cancelDeployWatcher(accountID)
 		if prevPhase.IsRunning() && acc.UseGoogleDrive && !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() {
 			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 12*time.Second)
-			_ = s.Engine.FlushWorkspaceToDrive(flushCtx, acc)
+			if err := s.Engine.FlushWorkspaceToDrive(flushCtx, acc); err != nil {
+				flushFailed = true
+			}
 			cancelFlush()
 		}
 		s.StopSSHTunnel(accountID)
@@ -3190,14 +3193,19 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 			break
 		}
 	}
+	flushWarnSuffix := ""
+	if flushFailed {
+		flushWarnSuffix = "（注意：关机前工作流最终同步未完成，请核对 Drive）"
+		s.SendNotification("工作流最终同步未完成", fmt.Sprintf("%s 已继续执行关机止损，但关机前最后一次工作流同步到 Drive 失败，请核对最新工作流是否已保存。", acc.DisplayName), true)
+	}
 	if stillAlive {
 		msg := fmt.Sprintf("警告：%s 会话 %s 仍出现在服务端，请前往 Colab 网页确认停机！", acc.DisplayName, targetSession)
-		s.ShowToast(msg)
+		s.ShowToast(msg + flushWarnSuffix)
 		s.SendNotification("停机核验异常", msg, true)
 	} else if reason != "" {
-		s.ShowToast(fmt.Sprintf("%s：%s 已确认关机止损", reason, targetSession))
+		s.ShowToast(fmt.Sprintf("%s：%s 已确认关机止损%s", reason, targetSession, flushWarnSuffix))
 	} else {
-		s.ShowToast(fmt.Sprintf("%s 已确认关机止损", targetSession))
+		s.ShowToast(fmt.Sprintf("%s 已确认关机止损%s", targetSession, flushWarnSuffix))
 	}
 }
 
@@ -3365,18 +3373,34 @@ func (s *Service) OpenCloudTerminal(accountID string) {
 	}
 
 	sockPath := ""
+	reuseSock := false
 	if rt.SSHTunnelActive {
 		sockPath = sshControlSocketPath(acc.ID, acc.SessionName)
+		reuseSock = canReuseSSHControlSocket(sockPath)
 	}
 	adcPath := ""
-	if acc.AuthMode == core.AuthIsolatedVaultADC {
-		if raw, err := s.Vault.LoadADCCredentials(acc.ID); err == nil {
-			if p, err := s.Vault.WriteEphemeralFile("term-adc", "json", []byte(raw)); err == nil {
-				adcPath = p
+	if !reuseSock {
+		switch acc.AuthMode {
+		case core.AuthSystemDefaultOAuth2, "":
+			// system default OAuth2 session
+		case core.AuthIsolatedVaultADC:
+			raw, err := s.Vault.LoadADCCredentials(acc.ID)
+			if err != nil || strings.TrimSpace(raw) == "" {
+				s.ShowToast("无法读取该隔离账号的凭据，已取消打开终端以防跨账号连接")
+				return
 			}
+			p, err := s.Vault.WriteEphemeralFile("term-adc", "json", []byte(raw))
+			if err != nil || p == "" {
+				s.ShowToast("无法创建临时凭据文件，已取消打开终端")
+				return
+			}
+			adcPath = p
+		default:
+			s.ShowToast("无法识别账号认证模式，已拒绝打开终端")
+			return
 		}
 	}
-	shellCmd, reused := buildCloudTerminalShellCmd(s.OSRunner, acc, sockPath, adcPath)
+	shellCmd, reused := buildCloudTerminalShellCmd(s.OSRunner, acc, sockPath, reuseSock, adcPath)
 	if reused && adcPath != "" {
 		vault.ShredAndRemove(adcPath)
 	}

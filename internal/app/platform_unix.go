@@ -129,15 +129,20 @@ func removeSSHControlSocket(accountID, sessionName string) {
 	}
 }
 
-func buildCloudTerminalShellCmd(r *runner.OSRunner, profile core.AccountProfile, sockPath, adcPath string) (string, bool) {
-	if sockPath != "" {
-		if _, err := os.Stat(sockPath); err == nil {
-			chk := exec.Command("ssh", "-S", sockPath, "-O", "check", "root@colab")
-			if err := chk.Run(); err == nil {
-				return fmt.Sprintf("ssh -t -S %s -o ControlMaster=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@colab",
-					runner.ShellEscapePOSIX(sockPath)), true
-			}
-		}
+func canReuseSSHControlSocket(sockPath string) bool {
+	if sockPath == "" {
+		return false
+	}
+	if _, err := os.Stat(sockPath); err != nil {
+		return false
+	}
+	return exec.Command("ssh", "-S", sockPath, "-O", "check", "root@colab").Run() == nil
+}
+
+func buildCloudTerminalShellCmd(r *runner.OSRunner, profile core.AccountProfile, sockPath string, reuseSock bool, adcPath string) (string, bool) {
+	if reuseSock && sockPath != "" {
+		return fmt.Sprintf("ssh -t -S %s -o ControlMaster=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@colab",
+			runner.ShellEscapePOSIX(sockPath)), true
 	}
 
 	colabPath := "colab"

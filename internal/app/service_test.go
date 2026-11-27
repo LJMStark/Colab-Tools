@@ -1676,16 +1676,56 @@ func TestStopSessionFlushesWorkspaceAndOpenCloudTerminal(t *testing.T) {
 		t.Fatalf("free tier OpenCloudTerminal must not launch terminal, got %d calls", afterFree)
 	}
 
-	// StopAccountSession triggers flush BEFORE stop, and stop still succeeds even when flush errors
+	var notices []string
+	svc.NotifySender = func(title, body string) {
+		mu.Lock()
+		notices = append(notices, title+": "+body)
+		mu.Unlock()
+	}
+
+	// Isolated ADC account without vault credentials must abort OpenCloudTerminal (never fall back to default ADC)
+	isoAcc := core.NewDefaultAccountProfile("IsoAcc", "iso@example.com", core.TierColabPro, core.AuthIsolatedVaultADC)
+	isoAcc.SessionName = "colab-iso"
+	svc.Settings.Accounts = append(svc.Settings.Accounts, isoAcc)
+	isoRT := core.NewAccountRuntimeState()
+	isoRT.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	isoRT.CUBalance = 80
+	svc.Runtime[isoAcc.ID] = isoRT
+	svc.OpenCloudTerminal(isoAcc.ID)
+	mu.Lock()
+	afterIsoMissing := len(termCmds)
+	mu.Unlock()
+	if afterIsoMissing != 1 {
+		t.Fatalf("isolated ADC account with missing credentials must NOT launch terminal, got %d calls", afterIsoMissing)
+	}
+	if !strings.Contains(svc.ViewState().ToastMessage, "凭据") {
+		t.Fatalf("expected credential error toast for missing isolated ADC, got %q", svc.ViewState().ToastMessage)
+	}
+
+	// StopAccountSession triggers flush BEFORE stop, still stops on flush error, and notifies user of flush failure
 	svc.StopAccountSession(acc.ID, "", "测试关机")
 	mu.Lock()
 	gotEvents := append([]string(nil), events...)
+	gotNotices := append([]string(nil), notices...)
 	mu.Unlock()
 	if len(gotEvents) < 2 || gotEvents[0] != "flush" || gotEvents[1] != "stop" {
 		t.Fatalf("expected [flush stop] sequence, got %+v", gotEvents)
 	}
 	if svc.StateFor(acc.ID).Phase.Kind != core.PhaseOffline {
 		t.Fatalf("expected PhaseOffline after stop even when flush failed, got %+v", svc.StateFor(acc.ID).Phase)
+	}
+	if !strings.Contains(svc.ViewState().ToastMessage, "工作流最终同步未完成") {
+		t.Fatalf("expected flush failure warning in stop toast, got %q", svc.ViewState().ToastMessage)
+	}
+	hasFlushNotice := false
+	for _, n := range gotNotices {
+		if strings.Contains(n, "工作流最终同步未完成") {
+			hasFlushNotice = true
+			break
+		}
+	}
+	if !hasFlushNotice {
+		t.Fatalf("expected notification when pre-stop flush fails, got %+v", gotNotices)
 	}
 
 	// Verify sshControlSocketPath isolation & macOS <104-byte safety

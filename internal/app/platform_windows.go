@@ -40,7 +40,9 @@ func sshControlSocketPath(_, _ string) string { return "" }
 
 func removeSSHControlSocket(_, _ string) {}
 
-func buildCloudTerminalShellCmd(r *runner.OSRunner, profile core.AccountProfile, _, adcPath string) (string, bool) {
+func canReuseSSHControlSocket(_ string) bool { return false }
+
+func buildCloudTerminalShellCmd(r *runner.OSRunner, profile core.AccountProfile, _ string, _ bool, adcPath string) (string, bool) {
 	args := []string{"colab"}
 	if profile.AuthMode == core.AuthIsolatedVaultADC {
 		cfg := profile.IsolatedConfigFilePath()

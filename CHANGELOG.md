@@ -3,6 +3,20 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.19] - 2026-11-27
+
+### Fixed
+- **真正三向基线双向工作流同步与零静默覆盖冲突保护**:
+  - 启动同步、15 秒后台轮询与关机 Flush 统一改用基于内容 `sha256` 与基线状态（`/tmp/colab-tools-wf-state.json`）的三向双向同步引擎：运行期 Drive 新增/编辑/删除与 ComfyUI 内新增/编辑/删除双向传播，消除同秒同大小修改被跳过的问题，双端并发修改或无基线重部署冲突时保留较新版本并将较旧版本另存为 `.conflict-<ts>.json` 副本，绝不静默丢稿。
+- **保留所有既有与自定义 Drive 模型子目录**:
+  - `extra_model_paths.yaml` 改为多行别名路径（同时兼容 `unet/` 与 `diffusion_models/`、`clip/` 与 `text_encoders/`），并动态纳入 `ColabTools/models/` 下所有既有与自定义模型目录，避免老用户升级后出现模型丢失。
+- **自定义节点快照覆盖 Manager Registry (CNR) 节点**:
+  - 节点快照同时采集 Git 仓库与 ComfyUI-Manager Registry（`pyproject.toml` + `cm-cli save-snapshot`）节点，开启开关后换机可一并恢复非 Git 安装节点。
+- **保护 HuggingFace 共享缓存与安全加固**:
+  - `h3-video.sh` 下载 HF 权重后同盘改用硬链接（`os.link`），保持零双倍占盘同时不移动或删除共享缓存 blob；
+  - 停机前工作流最终 Flush 失败时仍立即止损停机，但通过 Toast 与桌面通知明确提醒用户核对 Drive；
+  - 隔离 ADC 账号打开云端终端时先检查是否可复用当前控制套接字，无法复用且读取凭据/写临时文件失败时立即拒绝启动并提示，绝不无凭据回退。
+
 ## [0.3.18] - 2026-11-27
 
 ### Added
