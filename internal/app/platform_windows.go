@@ -36,6 +36,37 @@ func openTerminalCommand(shellCmd string) error {
 
 func cleanupStaleColabSSH(_ string) {}
 
+func sshControlSocketPath(_, _ string) string { return "" }
+
+func removeSSHControlSocket(_, _ string) {}
+
+func buildCloudTerminalShellCmd(r *runner.OSRunner, profile core.AccountProfile, _, adcPath string) (string, bool) {
+	args := []string{"colab"}
+	if profile.AuthMode == core.AuthIsolatedVaultADC {
+		cfg := profile.IsolatedConfigFilePath()
+		if r == nil || r.UseWSLOnWindows {
+			cfg = runner.WindowsToWSLPath(cfg)
+		}
+		args = append(args, "--auth=adc", "--config", cfg)
+	} else {
+		args = append(args, "--auth=oauth2")
+	}
+	args = append(args, "ssh", "-s", profile.SessionName)
+	escaped := make([]string, len(args))
+	for i, a := range args {
+		escaped[i] = runner.ShellEscapePOSIX(a)
+	}
+	cmd := strings.Join(escaped, " ")
+	if adcPath != "" {
+		if r == nil || r.UseWSLOnWindows {
+			adcPath = runner.WindowsToWSLPath(adcPath)
+		}
+		escADC := runner.ShellEscapePOSIX(adcPath)
+		cmd = fmt.Sprintf("export GOOGLE_APPLICATION_CREDENTIALS=%s && trap 'rm -f %s' EXIT && %s", escADC, escADC, cmd)
+	}
+	return cmd, false
+}
+
 func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error) {
 	useWSL := r == nil || r.UseWSLOnWindows
 	errBuf := &tunnelStderrBuffer{}

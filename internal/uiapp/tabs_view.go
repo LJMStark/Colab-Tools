@@ -930,8 +930,30 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 						cp.DriveModelsDir = core.SanitizeDriveSubpath(m.DriveModelsDraft, "")
 						cp.DriveOutputDir = core.SanitizeDriveSubpath(m.DriveOutputDraft, "/content/drive/MyDrive/ColabTools/outputs")
 						m.Svc.UpdateAccount(cp)
-						m.Svc.ShowToast("已保存 Google Drive 成片目录")
+						m.Svc.ShowToast("已保存 Google Drive 目录设置")
 					})
+				})
+
+				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "Drive 模型目录").FontSize(12.5).TextColor(pal.TextMuted).Width(96)
+					ui.TextInput(c, &m.DriveModelsDraft).Placeholder("/content/drive/MyDrive/ColabTools/models（留空使用默认）").Grow(1)
+				})
+
+				snapRestore := acc.RestoreCustomNodesSnapshot
+				ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+					ui.Column(c).Grow(1).Gap(2).Cursor(ui.CursorPointer).OnClick(func() {
+						cp := acc
+						cp.RestoreCustomNodesSnapshot = !acc.RestoreCustomNodesSnapshot
+						m.Svc.UpdateAccount(cp)
+					}).Children(func() {
+						ui.Text(c, "换机自动恢复自定义节点快照").FontSize(12.5).FontWeight(500).TextColor(pal.TextPrimary)
+						ui.Text(c, "默认关闭以保持最快开机；开启后将在关机前记录你在 Manager 装过的节点，下次开机自动恢复。").FontSize(11.5).TextColor(pal.TextMuted)
+					})
+					if ui.Switch(c, &snapRestore).Clicked() || snapRestore != acc.RestoreCustomNodesSnapshot {
+						cp := acc
+						cp.RestoreCustomNodesSnapshot = snapRestore
+						m.Svc.UpdateAccount(cp)
+					}
 				})
 
 				ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {

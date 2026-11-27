@@ -38,22 +38,22 @@ type WhoamiInfo struct {
 }
 
 type RemoteTelemetry struct {
-	GPUName          string
-	VRAMUsedMB       int
-	VRAMTotalMB      int
-	RAMUsedMB        int
-	RAMTotalMB       int
-	GPUUtil          *int
-	CPUUtil          *int
-	CUDAProcessCount int
-	PublicURL        string
-	DisplayUIURL     string
-	ModelFile        string
-	ModelAlias       string
-	ContextLimit     int
-	KVQuant          string
-	Healthy          bool
-	UptimeSeconds    int
+	GPUName            string
+	VRAMUsedMB         int
+	VRAMTotalMB        int
+	RAMUsedMB          int
+	RAMTotalMB         int
+	GPUUtil            *int
+	CPUUtil            *int
+	CUDAProcessCount   int
+	PublicURL          string
+	DisplayUIURL       string
+	ModelFile          string
+	ModelAlias         string
+	ContextLimit       int
+	KVQuant            string
+	Healthy            bool
+	UptimeSeconds      int
 	StatusPayload      *core.WorkloadStatusPayload
 	StatusAgeSeconds   *int
 	ComfyQueue         *core.ComfyQueueSummary
@@ -1297,12 +1297,13 @@ func (e *Engine) FetchDeployLogTail(ctx context.Context, profile core.AccountPro
 	if port <= 0 {
 		port = 8188
 	}
-	py := fmt.Sprintf(`import pathlib, subprocess, json
+	py := fmt.Sprintf(`import pathlib, subprocess, json, shutil
 lines = %d
 port = %d
 out = []
 status_p = pathlib.Path("/tmp/colab-tools-status.json")
 pid_p = pathlib.Path("/tmp/colab-tools-deploy.pid")
+wf_pid_p = pathlib.Path("/tmp/colab-tools-wf-sync.pid")
 deploy_log = pathlib.Path("/tmp/colab-tools-deploy.log")
 comfy_log = pathlib.Path("/tmp/comfyui.log")
 
@@ -1315,15 +1316,38 @@ if pid_p.exists():
         if "colab-tools-deploy.sh" in cmd:
             alive = True
 
+wf_alive = False
+wf_pid = ""
+if wf_pid_p.exists():
+    wf_pid = wf_pid_p.read_text(errors="ignore").strip()
+    if wf_pid and pathlib.Path(f"/proc/{wf_pid}/cmdline").exists():
+        wcmd = pathlib.Path(f"/proc/{wf_pid}/cmdline").read_bytes().decode("utf-8", errors="ignore")
+        if "colab-tools-wf-sync.py" in wcmd:
+            wf_alive = True
+
 p_check = subprocess.run(["bash", "-c", f"ss -tlnp 2>/dev/null | grep -E ':{port}\\b' || true"], text=True, capture_output=True).stdout.strip()
 drive_ok = pathlib.Path("/content/drive/MyDrive").is_dir()
 comfy_dir = pathlib.Path("/content/ComfyUI").is_dir()
+drive_wf_dir = pathlib.Path("/content/drive/MyDrive/ColabTools/workflows")
+wf_count = 0
+if drive_wf_dir.is_dir():
+    try:
+        wf_count = sum(1 for p in drive_wf_dir.rglob("*.json") if p.is_file() and ".part." not in p.name and "examples" not in p.relative_to(drive_wf_dir).parts)
+    except Exception:
+        pass
+try:
+    du = shutil.disk_usage("/content")
+    disk_line = f"{du.free / (1024**3):.1f} GB / {du.total / (1024**3):.1f} GB"
+except Exception:
+    disk_line = "未知"
 
 out.append("=== 云端实时状态 ===")
 out.append(f"部署进程: {'运行中 (PID ' + dpid + ')' if alive else '未运行'}")
 out.append(f"端口 :{port}: {'已监听' if p_check else '未监听'}")
 out.append(f"ComfyUI 目录: {'已存在 (/content/ComfyUI)' if comfy_dir else '尚未安装'}")
 out.append(f"Google Drive: {'已挂载' if drive_ok else '未挂载'}")
+out.append(f"工作流同步: {'运行中 (PID ' + wf_pid + ')' if wf_alive else '未运行'}（Drive workflows 共 {wf_count} 个）")
+out.append(f"本地磁盘剩余: {disk_line}")
 if status_p.exists():
     raw = status_p.read_text(errors="ignore").strip()
     try:
@@ -1363,6 +1387,41 @@ print("\n".join(out))
 		return "", errors.New(msg)
 	}
 	return strings.TrimSpace(runner.StripCR(r.Stdout)), nil
+}
+
+// FlushWorkspaceToDrive triggers a one-shot workflow & optional custom-node snapshot flush before stopping the VM.
+func (e *Engine) FlushWorkspaceToDrive(ctx context.Context, profile core.AccountProfile) error {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return errors.New("会话名不合法")
+	}
+	snapFlag := "0"
+	if profile.RestoreCustomNodesSnapshot {
+		snapFlag = "1"
+	}
+	py := fmt.Sprintf(`import os, pathlib, subprocess
+p = pathlib.Path("/tmp/colab-tools-flush.py")
+if not p.is_file():
+    print("FLUSH_SKIP=1")
+    raise SystemExit(0)
+env = os.environ.copy()
+env["RESTORE_CUSTOM_NODES_SNAPSHOT"] = "%s"
+r = subprocess.run(["python3", str(p)], env=env, text=True, capture_output=True)
+if r.stdout:
+    print(r.stdout.strip())
+raise SystemExit(r.returncode)
+`, snapFlag)
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 12*time.Second)
+	if r.ExitCode != 0 {
+		msg := strings.TrimSpace(r.Stderr)
+		if msg == "" {
+			msg = strings.TrimSpace(r.Stdout)
+		}
+		if msg == "" {
+			msg = "云端工作流同步失败"
+		}
+		return errors.New(msg)
+	}
+	return nil
 }
 
 func (e *Engine) RunDriveStartScript(ctx context.Context, profile core.AccountProfile) (bool, string, string) {

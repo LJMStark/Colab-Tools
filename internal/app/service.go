@@ -26,7 +26,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.17"
+const AppVersion = "0.3.18"
 
 // tunnelStderrBuffer 线程安全地记录 SSH 隧道进程最后 4KB 的 stderr 输出，用于诊断 HTTP 429 / 连接故障。
 type tunnelStderrBuffer struct {
@@ -153,6 +153,7 @@ type Service struct {
 	comfyTunnelWaitTimeout time.Duration
 	comfyRetryPause        time.Duration
 	sshStarter             func(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error)
+	terminalOpener         func(shellCmd string) error
 
 	OSRunner *runner.OSRunner
 	Engine   *colab.Engine
@@ -198,6 +199,7 @@ func NewService(skipBootstrap bool) *Service {
 		deployFlowCancels:  map[string]deployWatchHandle{},
 		deployWatchCancels: map[string]deployWatchHandle{},
 		sshStarter:         startSSHTunnelProcess,
+		terminalOpener:     openTerminalCommand,
 		OSRunner:           r,
 		Engine:             colab.NewEngine(r, v),
 		Vault:              v,
@@ -3124,6 +3126,11 @@ func (s *Service) StopAccountSession(accountID, specificSession, reason string) 
 	if targetSession == acc.SessionName {
 		s.cancelDeployFlow(accountID)
 		s.cancelDeployWatcher(accountID)
+		if prevPhase.IsRunning() && acc.UseGoogleDrive && !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() {
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 12*time.Second)
+			_ = s.Engine.FlushWorkspaceToDrive(flushCtx, acc)
+			cancelFlush()
+		}
 		s.StopSSHTunnel(accountID)
 	}
 	stopRes := s.Engine.StopSession(context.Background(), acc, targetSession)
@@ -3328,10 +3335,69 @@ func (s *Service) LaunchClaudeTerminal(accountID string) {
 		ids.EnvKey,
 		runner.ShellEscapePOSIX(apiKey),
 	)
-	if err := openTerminalCommand(cmd); err != nil {
+	s.mu.RLock()
+	opener := s.terminalOpener
+	s.mu.RUnlock()
+	if opener == nil {
+		opener = openTerminalCommand
+	}
+	if err := opener(cmd); err != nil {
 		s.ShowToast("拉起终端失败：" + err.Error())
 	} else {
 		s.ShowToast("已在独立终端安全拉起 Claude Code")
+	}
+}
+
+// OpenCloudTerminal opens an interactive shell to the running Colab VM, reusing the isolated SSH ControlMaster socket when active to prevent HTTP 429.
+func (s *Service) OpenCloudTerminal(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("云端机器尚未开机，请先点击开机")
+		return
+	}
+	if rt.IsFreeRuntimeRestricted(acc) {
+		s.ShowToast("免费版不支持 SSH 终端，请点「Colab 网页」进入云端后台")
+		return
+	}
+
+	sockPath := ""
+	if rt.SSHTunnelActive {
+		sockPath = sshControlSocketPath(acc.ID, acc.SessionName)
+	}
+	adcPath := ""
+	if acc.AuthMode == core.AuthIsolatedVaultADC {
+		if raw, err := s.Vault.LoadADCCredentials(acc.ID); err == nil {
+			if p, err := s.Vault.WriteEphemeralFile("term-adc", "json", []byte(raw)); err == nil {
+				adcPath = p
+			}
+		}
+	}
+	shellCmd, reused := buildCloudTerminalShellCmd(s.OSRunner, acc, sockPath, adcPath)
+	if reused && adcPath != "" {
+		vault.ShredAndRemove(adcPath)
+	}
+
+	s.mu.RLock()
+	opener := s.terminalOpener
+	s.mu.RUnlock()
+	if opener == nil {
+		opener = openTerminalCommand
+	}
+	if err := opener(shellCmd); err != nil {
+		if !reused && adcPath != "" {
+			vault.ShredAndRemove(adcPath)
+		}
+		s.ShowToast("打开云端终端失败：" + err.Error())
+		return
+	}
+	if reused {
+		s.ShowToast("已在独立终端打开云端后台（复用加密通道）")
+	} else {
+		s.ShowToast("已在独立终端连接云端后台")
 	}
 }
 
@@ -3751,6 +3817,13 @@ func (s *Service) OpenDriveOutputs() {
 
 func (s *Service) StopSSHTunnel(accountID string) {
 	s.mu.Lock()
+	var accSessionName string
+	for _, a := range s.Settings.Accounts {
+		if a.ID == accountID {
+			accSessionName = a.SessionName
+			break
+		}
+	}
 	proc := s.sshTunnels[accountID]
 	adc := s.sshADCPaths[accountID]
 	delete(s.sshTunnels, accountID)
@@ -3764,6 +3837,9 @@ func (s *Service) StopSSHTunnel(accountID string) {
 	s.mu.Unlock()
 	if proc != nil && proc.Process != nil {
 		_ = proc.Process.Kill()
+	}
+	if accSessionName != "" {
+		removeSSHControlSocket(accountID, accSessionName)
 	}
 	if adc != "" {
 		vault.ShredAndRemove(adc)

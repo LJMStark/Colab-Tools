@@ -270,7 +270,7 @@ func (m *MainUI) renderDeployLogOverlay(c *ui.Context, pal Palette) {
 						}
 						DrawPrecisionLED(c, led, 12)
 						ui.Column(c).Grow(1).Gap(2).Children(func() {
-							ui.Text(c, "云端部署日志与状态核查").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
+							ui.Text(c, "云端后台与日志").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
 							sub := fmt.Sprintf("会话 %s · %s", acc.SessionName, rt.ShortGPUName())
 							if rt.DeployRunning && rt.WorkloadMetricValue != "" {
 								sub += fmt.Sprintf(" · %s %s", rt.WorkloadMetricValue, rt.WorkloadMetricUnit)
@@ -306,18 +306,40 @@ func (m *MainUI) renderDeployLogOverlay(c *ui.Context, pal Palette) {
 
 					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
+					// 云端后台直达操作栏 + Drive 目录与画布补模速查
+					ui.Column(c).FillWidth().Gap(8).Padding(10, 12).Radius(10).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).Children(func() {
+						ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
+							ui.Text(c, "云端后台直达").FontSize(12.5).FontWeight(600).TextColor(pal.TextPrimary)
+							ui.Spacer(c)
+							SmallActionButton(c, pal, "Colab 网页", &pal.Sky, !rt.Phase.IsRunning(), func() {
+								m.Svc.OpenColabInBrowser(acc.ID)
+							})
+							termDisabled := !rt.Phase.IsRunning() || rt.IsFreeRuntimeRestricted(acc)
+							SmallActionButton(c, pal, ">_ 云端终端", &pal.Amber, termDisabled, func() {
+								go m.Svc.OpenCloudTerminal(acc.ID)
+							})
+							SmallActionButton(c, pal, "Drive 目录", nil, false, func() {
+								m.Svc.OpenDriveOutputs()
+							})
+						})
+						ui.Text(c, "Drive 标准目录：workflows/（工作流自动双向同步）· models/<checkpoints|loras|vae|diffusion_models>/（零拷贝直挂）· outputs/（成片直出）").
+							FontSize(11.5).TextColor(pal.TextMuted)
+						ui.Text(c, "换工作流缺节点/缺模型：在 ComfyUI 顶栏点「Manager」补节点，点「Missing Models」直接在云端高速补齐所需模型。").
+							FontSize(11.5).TextColor(pal.TextMuted)
+					})
+
 					logText := rt.DeployLogTail
 					if rt.DeployLogLoading && logText == "" {
 						logText = "正在连接云端机器读取 /tmp/colab-tools-deploy.log 与 /tmp/comfyui.log…"
 					} else if logText == "" {
 						logText = "点击右上角「刷新日志」拉取云端实时安装记录与端口状态。"
 					}
-					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(480).Children(func() {
+					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(420).Children(func() {
 						ui.Column(c).FillWidth().Padding(12, 14).Radius(10).Background(pal.SubtleBg).Border(1, pal.SubtleBorder).Children(func() {
 							ui.Text(c, logText).FontSize(11.5).Font("monospace").TextColor(pal.TextPrimary)
 						})
 					})
-				}).Width(780).MaxHeight(620).Gap(12).
+				}).Width(820).MaxHeight(648).Gap(12).
 					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.45))
 			})
 	})
@@ -1555,7 +1577,7 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 					m.quickCardBtn(c, pal, "Drive 成片", false, false, func() {
 						m.Svc.OpenDriveOutputs()
 					})
-					m.quickCardCompactBtn(c, pal, "日志", m.ShowDeployLog, false, func() {
+					m.quickCardCompactBtn(c, pal, "后台", m.ShowDeployLog, false, func() {
 						m.openDeployLogOverlay(acc.ID)
 					})
 				} else if rt.Phase.IsRunning() && rt.DeployRunning {

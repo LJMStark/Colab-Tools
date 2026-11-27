@@ -413,7 +413,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	tt := ui.NewTester(mui.View, 1160, 760)
 
 	for _, want := range []string{
-		"2374.8", "Personal", "G4 → A100", "2轮保底 L4", "开 ComfyUI",
+		"2374.8", "Personal", "G4 → A100", "2轮保底 L4", "开 ComfyUI", "后台",
 		"CU 余额与速率", "实时负载", "当前任务", "空闲自动关机", "挑卡与守候",
 		"调整策略与进阶选项", "点此关机", "账单 ›", "账号与活跃会话 (3)",
 	} {
@@ -480,8 +480,14 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if err := tt.Click("展开高级参数 ▾"); err != nil {
 		t.Fatalf("click 展开高级参数 ▾ failed: %v", err)
 	}
-	if !tt.HasText("Drive 成片目录") {
-		t.Fatalf("expected Drive 成片目录 in settings advanced section: %q", tt.Texts())
+	if !tt.HasText("Drive 成片目录") || !tt.HasText("Drive 模型目录") || !tt.HasText("换机自动恢复自定义节点快照") {
+		t.Fatalf("expected Drive & snapshot settings in advanced section: %q", tt.Texts())
+	}
+	if err := tt.Click("换机自动恢复自定义节点快照"); err != nil {
+		t.Fatalf("click 换机自动恢复自定义节点快照 failed: %v", err)
+	}
+	if acc, ok := svc.SelectedAccount(); !ok || !acc.RestoreCustomNodesSnapshot {
+		t.Fatalf("expected RestoreCustomNodesSnapshot=true after click, got %+v", acc.RestoreCustomNodesSnapshot)
 	}
 	for _, unwanted := range []string{
 		"解除冷静等待 / 清空报错",
@@ -593,8 +599,13 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	}
 	bareUI.ShowDeployLog = true
 	logTester := ui.NewTester(bareUI.View, 1160, 760)
-	if !logTester.HasText("云端部署日志与状态核查") || !logTester.HasText("端口 :8188: 未监听") {
-		t.Fatalf("missing deploy log overlay content: %q", logTester.Texts())
+	for _, want := range []string{
+		"云端后台与日志", "Colab 网页", ">_ 云端终端", "Drive 目录",
+		"Drive 标准目录", "端口 :8188: 未监听",
+	} {
+		if !logTester.HasText(want) {
+			t.Fatalf("missing deploy log overlay content %q: %q", want, logTester.Texts())
+		}
 	}
 
 	// 6. Persistent queue toggle in options drawer (single 8h toggle, zero 4h/12h buttons), ComfyOpening disabled feedback, and persistent queuing labels (never 7/5)

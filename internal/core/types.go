@@ -591,14 +591,15 @@ func BuildDeployEnv(acc AccountProfile) (map[string]string, error) {
 		return "0"
 	}
 	env := map[string]string{
-		"SERVICE_PORT":        fmt.Sprintf("%d", acc.RemoteServicePort),
-		"WORKLOAD_KIND":       string(acc.WorkloadKind),
-		"USE_GOOGLE_DRIVE":    boolStr(acc.UseGoogleDrive),
-		"DRIVE_MODELS_DIR":    acc.DriveModelsDir,
-		"DRIVE_OUTPUT_DIR":    acc.DriveOutputDir,
-		"DRIVE_WHEELS_DIR":    "/content/drive/MyDrive/ColabTools/wheels",
-		"CACHE_BASE_TO_DRIVE": boolStr(acc.CacheBaseToDrive),
-		"ENABLE_CLOUDFLARED":  boolStr(acc.EnableCloudflared),
+		"SERVICE_PORT":                  fmt.Sprintf("%d", acc.RemoteServicePort),
+		"WORKLOAD_KIND":                 string(acc.WorkloadKind),
+		"USE_GOOGLE_DRIVE":              boolStr(acc.UseGoogleDrive),
+		"DRIVE_MODELS_DIR":              acc.DriveModelsDir,
+		"DRIVE_OUTPUT_DIR":              acc.DriveOutputDir,
+		"DRIVE_WHEELS_DIR":              "/content/drive/MyDrive/ColabTools/wheels",
+		"CACHE_BASE_TO_DRIVE":           boolStr(acc.CacheBaseToDrive),
+		"ENABLE_CLOUDFLARED":            boolStr(acc.EnableCloudflared),
+		"RESTORE_CUSTOM_NODES_SNAPSHOT": boolStr(acc.RestoreCustomNodesSnapshot),
 	}
 	if acc.DeployRecipe == RecipeH3Video {
 		env["H3_VARIANT"] = string(acc.H3Variant)
@@ -813,21 +814,22 @@ type AccountProfile struct {
 	EnableHardwareIdle   bool              `json:"enableHardwareIdleFallback"`
 
 	// Built-in Video / H3 One-Click Deployment & Google Drive Sync
-	DeployRecipe          DeployRecipe `json:"deployRecipe,omitempty"`
-	H3Variant             H3Variant    `json:"h3Variant,omitempty"`
-	H3GGUFQuant           string       `json:"h3GGUFQuant,omitempty"`
-	H3CustomHFRepo        string       `json:"h3CustomHFRepo,omitempty"`
-	H3CustomHFFiles       string       `json:"h3CustomHFFiles,omitempty"`
-	H3DriveOnly           bool         `json:"h3DriveOnly,omitempty"`
-	H3EnableSolAttn       bool         `json:"h3EnableSolAttn"`
-	UseGoogleDrive        bool         `json:"useGoogleDrive"`
-	DriveModelsDir        string       `json:"driveModelsDir,omitempty"`
-	DriveOutputDir        string       `json:"driveOutputDir,omitempty"`
-	CacheBaseToDrive      bool         `json:"cacheBaseToDrive"`
-	AutoOpenComfyUI       bool         `json:"autoOpenComfyUI"`
-	EnableCloudflared     bool         `json:"enableCloudflared,omitempty"`
-	StopAfterQueueDrained bool         `json:"stopAfterQueueDrained"`
-	QueueDrainMinutes     int          `json:"queueDrainMinutes,omitempty"`
+	DeployRecipe               DeployRecipe `json:"deployRecipe,omitempty"`
+	H3Variant                  H3Variant    `json:"h3Variant,omitempty"`
+	H3GGUFQuant                string       `json:"h3GGUFQuant,omitempty"`
+	H3CustomHFRepo             string       `json:"h3CustomHFRepo,omitempty"`
+	H3CustomHFFiles            string       `json:"h3CustomHFFiles,omitempty"`
+	H3DriveOnly                bool         `json:"h3DriveOnly,omitempty"`
+	H3EnableSolAttn            bool         `json:"h3EnableSolAttn"`
+	UseGoogleDrive             bool         `json:"useGoogleDrive"`
+	DriveModelsDir             string       `json:"driveModelsDir,omitempty"`
+	DriveOutputDir             string       `json:"driveOutputDir,omitempty"`
+	RestoreCustomNodesSnapshot bool         `json:"restoreCustomNodesSnapshot,omitempty"`
+	CacheBaseToDrive           bool         `json:"cacheBaseToDrive"`
+	AutoOpenComfyUI            bool         `json:"autoOpenComfyUI"`
+	EnableCloudflared          bool         `json:"enableCloudflared,omitempty"`
+	StopAfterQueueDrained      bool         `json:"stopAfterQueueDrained"`
+	QueueDrainMinutes          int          `json:"queueDrainMinutes,omitempty"`
 
 	// Polite queue & off-peak scheduling
 	EnablePoliteQueue        bool                `json:"enablePoliteQueue"`
@@ -878,53 +880,54 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 	}
 	fallback := DefaultFallbackTarget(defaultTargets, tier)
 	return AccountProfile{
-		ID:                        id,
-		DisplayName:               name,
-		Email:                     email,
-		ColorTag:                  ColorAmber,
-		Tier:                      tier,
-		AuthMode:                  authMode,
-		SessionName:               fmt.Sprintf("colab-%s", shortID),
-		GPUStrategy:               GPUStrategyAutoSmart,
-		PreferredAccelerator:      tier.DefaultAccelerator(),
-		HighMem:                   tier.SupportsHighMem(),
-		WorkloadKind:              WorkloadVideo,
-		EnableLLMModule:           false,
-		EnableHardwareIdle:        true,
-		DeployRecipe:              RecipeH3Video,
-		H3Variant:                 H3VariantFlash,
-		H3GGUFQuant:               "Q4_K_M",
-		H3EnableSolAttn:           true,
-		UseGoogleDrive:            true,
-		DriveModelsDir:            "",
-		DriveOutputDir:            "/content/drive/MyDrive/ColabTools/outputs",
-		CacheBaseToDrive:          true,
-		AutoOpenComfyUI:           true,
-		EnableCloudflared:         false,
-		StopAfterQueueDrained:     true,
-		QueueDrainMinutes:         10,
-		EnablePoliteQueue:         true,
-		QueuePersistentMode:       false,
-		QueuePersistentMaxHours:   QueuePersistentDefaultHours,
-		QueueTargets:              defaultTargets,
-		QueueFallbackEnabled:      false,
-		QueueFallbackAfterRounds:  2,
-		QueueFallbackTarget:       fallback,
-		ScheduledStartEnabled:     false,
-		ScheduledStartHour:        7,
-		ScheduledStartMinute:      0,
-		ScheduledStartRepeatDaily: true,
-		AutoShutdownEnabled:       true,
-		IdleTimeoutMinutes:        10,
-		WarnBeforeMinutes:         2,
-		DriveScriptPath:           "/content/drive/MyDrive/colab-llm/scripts/start_server.sh",
-		AutoSyncCCSwitch:          false,
-		AutoSyncOpenCode:          false,
-		AutoSyncCodex:             false,
-		CCSwitchProviderID:        "colab-tools-" + shortID,
-		CCSwitchName:              fmt.Sprintf("Colab (%s)", name),
-		LocalSSHTunnelPort:        8188,
-		RemoteServicePort:         8188,
+		ID:                         id,
+		DisplayName:                name,
+		Email:                      email,
+		ColorTag:                   ColorAmber,
+		Tier:                       tier,
+		AuthMode:                   authMode,
+		SessionName:                fmt.Sprintf("colab-%s", shortID),
+		GPUStrategy:                GPUStrategyAutoSmart,
+		PreferredAccelerator:       tier.DefaultAccelerator(),
+		HighMem:                    tier.SupportsHighMem(),
+		WorkloadKind:               WorkloadVideo,
+		EnableLLMModule:            false,
+		EnableHardwareIdle:         true,
+		DeployRecipe:               RecipeH3Video,
+		H3Variant:                  H3VariantFlash,
+		H3GGUFQuant:                "Q4_K_M",
+		H3EnableSolAttn:            true,
+		UseGoogleDrive:             true,
+		DriveModelsDir:             "",
+		DriveOutputDir:             "/content/drive/MyDrive/ColabTools/outputs",
+		RestoreCustomNodesSnapshot: false,
+		CacheBaseToDrive:           true,
+		AutoOpenComfyUI:            true,
+		EnableCloudflared:          false,
+		StopAfterQueueDrained:      true,
+		QueueDrainMinutes:          10,
+		EnablePoliteQueue:          true,
+		QueuePersistentMode:        false,
+		QueuePersistentMaxHours:    QueuePersistentDefaultHours,
+		QueueTargets:               defaultTargets,
+		QueueFallbackEnabled:       false,
+		QueueFallbackAfterRounds:   2,
+		QueueFallbackTarget:        fallback,
+		ScheduledStartEnabled:      false,
+		ScheduledStartHour:         7,
+		ScheduledStartMinute:       0,
+		ScheduledStartRepeatDaily:  true,
+		AutoShutdownEnabled:        true,
+		IdleTimeoutMinutes:         10,
+		WarnBeforeMinutes:          2,
+		DriveScriptPath:            "/content/drive/MyDrive/colab-llm/scripts/start_server.sh",
+		AutoSyncCCSwitch:           false,
+		AutoSyncOpenCode:           false,
+		AutoSyncCodex:              false,
+		CCSwitchProviderID:         "colab-tools-" + shortID,
+		CCSwitchName:               fmt.Sprintf("Colab (%s)", name),
+		LocalSSHTunnelPort:         8188,
+		RemoteServicePort:          8188,
 	}
 }
 

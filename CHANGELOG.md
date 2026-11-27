@@ -3,6 +3,24 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.18] - 2026-11-27
+
+### Added
+- **ComfyUI 工作流双向安全同步与示例自动导入**:
+  - 启动时将 Google Drive `MyDrive/ColabTools/workflows/` 中的工作流同步至本地高速盘 `/content/ComfyUI/user/default/workflows/`，运行期间每 15 秒轻量检测变更并原子回写 Drive，主动关机前还会触发一次最终 Flush 保护（绝不将 `--user-directory` 指向 FUSE，彻底规避 SQLite `database is locked` 与软链断链）；
+  - 自动收集已安装节点（如 `ComfyUI-HyperFlow-Flash`）顶层示例工作流至本地 `workflows/examples/` 只读参考，不污染用户 Drive 目录。
+- **官方 ComfyUI-Manager v4 + 画布内服务端一键补模型**:
+  - 部署脚本默认按官方 v4 方式启用 `--enable-manager` 并配置 `security_level = normal` 与 `network_mode = personal_cloud`，并预装 `slahiri/ComfyUI-Workflow-Models-Downloader`，支持在 ComfyUI 画布内直接扫描任意工作流缺失模型并在云端高速后台下载（绕开 ComfyUI V2 弹窗下到本机浏览器的坑），同时自带本地模型磁盘浏览与清理。
+- **Drive 标准模型仓零拷贝直挂与可选自定义节点快照恢复**:
+  - 自动初始化 `MyDrive/ColabTools/models/{checkpoints,diffusion_models,text_encoders,vae,loras,clip_vision,controlnet,upscale_models,embeddings}`，通过 `extra_model_paths.yaml` 零拷贝直挂 ComfyUI（移除通用 ComfyUI 全量 `rsync`，防止爆盘）；
+  - 在「设置 → 高级选项」新增「Drive 模型目录」输入框与默认关闭的「换机自动恢复自定义节点快照」开关，开启后关机前自动记录第三方节点并在下次开机宽松恢复。
+- **主页「后台」直达入口与会话隔离 SSH 复用终端**:
+  - 将主页 Card 4 就绪态按钮「日志」升级为「后台」，在「云端后台与日志」浮层顶部露出 **`Colab 网页`**、**`>_ 云端终端`**（通过会话隔离 OpenSSH `ControlMaster` 复用现有隧道，不断 ComfyUI 且零 HTTP 429）与 **`Drive 目录`**，附带目录速查及磁盘余量/同步状态诊断。
+
+### Fixed
+- **消除 HuggingFace 模型下载双倍占盘**:
+  - `scripts/templates/h3-video.sh` 下载大模型后改为从 HF 缓存原子移入目标 `models/`（跨文件系统则校验复制后清理缓存），避免 20GB+ 权重在本地临时盘占用双倍空间。
+
 ## [0.3.17] - 2026-11-27
 
 ### Fixed

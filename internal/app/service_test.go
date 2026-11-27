@@ -1590,3 +1590,111 @@ func TestReviewFixesDeployPreLaunchStopCancelAndQueueRace(t *testing.T) {
 		t.Fatalf("cancelled queue must NOT auto-open ComfyUI browser, got %d opens", gotOpened)
 	}
 }
+
+func TestStopSessionFlushesWorkspaceAndOpenCloudTerminal(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	var mu sync.Mutex
+	var events []string
+	var serverAlive = true
+	fr := &fakeRunner{}
+	fr.onShellOpts = func(cmd string, opts runner.RunOptions) runner.Result {
+		switch {
+		case strings.Contains(cmd, "exec") && strings.Contains(opts.Stdin, "colab-tools-flush.py"):
+			mu.Lock()
+			events = append(events, "flush")
+			mu.Unlock()
+			return runner.Result{ExitCode: 1, Stderr: "transient flush timeout"} // best-effort must never block stop
+		case strings.Contains(cmd, "stop"):
+			mu.Lock()
+			events = append(events, "stop")
+			serverAlive = false
+			mu.Unlock()
+			return runner.Result{ExitCode: 0, Stdout: "Stopped.\n"}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 150.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		case strings.Contains(cmd, "sessions"):
+			mu.Lock()
+			up := serverAlive
+			mu.Unlock()
+			if up {
+				return runner.Result{ExitCode: 0, Stdout: "[colab-flush] ep-flush | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	acc := core.NewDefaultAccountProfile("FlushAcc", "flush@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.SessionName = "colab-flush"
+	acc.UseGoogleDrive = true
+	acc.DeployRecipe = core.RecipeH3Video
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-flush"
+	svc.Runtime[acc.ID] = rt
+
+	var termCmds []string
+	svc.terminalOpener = func(shellCmd string) error {
+		mu.Lock()
+		termCmds = append(termCmds, shellCmd)
+		mu.Unlock()
+		return nil
+	}
+
+	// OpenCloudTerminal opens terminal for paid running account
+	svc.OpenCloudTerminal(acc.ID)
+	mu.Lock()
+	gotTerms := len(termCmds)
+	firstTerm := ""
+	if gotTerms > 0 {
+		firstTerm = termCmds[0]
+	}
+	mu.Unlock()
+	if gotTerms != 1 || !strings.Contains(firstTerm, "ssh") || !strings.Contains(firstTerm, acc.SessionName) {
+		t.Fatalf("expected OpenCloudTerminal to invoke ssh command for %q, got %+v", acc.SessionName, termCmds)
+	}
+
+	// Free tier must be blocked with plain hint without launching terminal
+	freeAcc := core.NewDefaultAccountProfile("FreeAcc", "free@example.com", core.TierFree, core.AuthSystemDefaultOAuth2)
+	svc.Settings.Accounts = append(svc.Settings.Accounts, freeAcc)
+	freeRT := core.NewAccountRuntimeState()
+	freeRT.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	freeRT.CUBalance = 0
+	svc.Runtime[freeAcc.ID] = freeRT
+	svc.OpenCloudTerminal(freeAcc.ID)
+	mu.Lock()
+	afterFree := len(termCmds)
+	mu.Unlock()
+	if afterFree != 1 {
+		t.Fatalf("free tier OpenCloudTerminal must not launch terminal, got %d calls", afterFree)
+	}
+
+	// StopAccountSession triggers flush BEFORE stop, and stop still succeeds even when flush errors
+	svc.StopAccountSession(acc.ID, "", "测试关机")
+	mu.Lock()
+	gotEvents := append([]string(nil), events...)
+	mu.Unlock()
+	if len(gotEvents) < 2 || gotEvents[0] != "flush" || gotEvents[1] != "stop" {
+		t.Fatalf("expected [flush stop] sequence, got %+v", gotEvents)
+	}
+	if svc.StateFor(acc.ID).Phase.Kind != core.PhaseOffline {
+		t.Fatalf("expected PhaseOffline after stop even when flush failed, got %+v", svc.StateFor(acc.ID).Phase)
+	}
+
+	// Verify sshControlSocketPath isolation & macOS <104-byte safety
+	p1 := sshControlSocketPath("acc-1", "sess-a")
+	p2 := sshControlSocketPath("acc-2", "sess-a")
+	if p1 == p2 {
+		t.Fatalf("socket paths must be isolated across accounts: %q", p1)
+	}
+	if p1 != "" && len(p1) >= 60 {
+		t.Fatalf("unix socket path too long (%d bytes): %q", len(p1), p1)
+	}
+}

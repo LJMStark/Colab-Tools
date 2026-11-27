@@ -3,6 +3,8 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -115,6 +117,54 @@ func cleanupStaleColabSSH(sessionName string) {
 	}
 }
 
+func sshControlSocketPath(accountID, sessionName string) string {
+	sum := sha256.Sum256([]byte(core.ConfigDir() + "|" + accountID + "|" + sessionName))
+	return filepath.Join("/tmp", "ct-ssh-"+hex.EncodeToString(sum[:6])+".sock")
+}
+
+func removeSSHControlSocket(accountID, sessionName string) {
+	p := sshControlSocketPath(accountID, sessionName)
+	if p != "" {
+		_ = os.Remove(p)
+	}
+}
+
+func buildCloudTerminalShellCmd(r *runner.OSRunner, profile core.AccountProfile, sockPath, adcPath string) (string, bool) {
+	if sockPath != "" {
+		if _, err := os.Stat(sockPath); err == nil {
+			chk := exec.Command("ssh", "-S", sockPath, "-O", "check", "root@colab")
+			if err := chk.Run(); err == nil {
+				return fmt.Sprintf("ssh -t -S %s -o ControlMaster=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@colab",
+					runner.ShellEscapePOSIX(sockPath)), true
+			}
+		}
+	}
+
+	colabPath := "colab"
+	if r != nil {
+		if p := r.LookPath("colab"); p != "" {
+			colabPath = p
+		}
+	}
+	args := []string{colabPath}
+	if profile.AuthMode == core.AuthIsolatedVaultADC {
+		args = append(args, "--auth=adc", "--config", profile.IsolatedConfigFilePath())
+	} else {
+		args = append(args, "--auth=oauth2")
+	}
+	args = append(args, "ssh", "-s", profile.SessionName)
+	escaped := make([]string, len(args))
+	for i, a := range args {
+		escaped[i] = runner.ShellEscapePOSIX(a)
+	}
+	cmd := strings.Join(escaped, " ")
+	if adcPath != "" {
+		escADC := runner.ShellEscapePOSIX(adcPath)
+		cmd = fmt.Sprintf("export GOOGLE_APPLICATION_CREDENTIALS=%s && trap 'rm -f %s' EXIT && %s", escADC, escADC, cmd)
+	}
+	return cmd, false
+}
+
 func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error) {
 	colabPath := "colab"
 	if r != nil {
@@ -123,6 +173,8 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 		}
 	}
 	keyPath, _ := ensureLocalSSHKey()
+	removeSSHControlSocket(profile.ID, profile.SessionName)
+	sockPath := sshControlSocketPath(profile.ID, profile.SessionName)
 
 	proxyArgs := []string{colabPath}
 	if profile.AuthMode == core.AuthIsolatedVaultADC {
@@ -138,6 +190,7 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 	proxyCmd := strings.Join(escapedProxy, " ")
 
 	// Delegate -N -L local port forwarding to local OpenSSH backed by `colab ssh --proxy-mode`
+	// Session-isolated ControlMaster allows opening an interactive cloud terminal over the same single SSH session without HTTP 429.
 	sshArgs := []string{
 		"-N",
 		"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", localPort, remotePort),
@@ -148,8 +201,9 @@ func startSSHTunnelProcess(r *runner.OSRunner, profile core.AccountProfile, loca
 	sshArgs = append(sshArgs,
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=15",
-		"-o", "ControlMaster=no",
-		"-o", "ControlPath=none",
+		"-o", "ControlMaster=yes",
+		"-o", "ControlPath="+sockPath,
+		"-o", "ControlPersist=no",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",

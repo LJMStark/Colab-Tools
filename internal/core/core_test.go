@@ -341,9 +341,14 @@ func TestH3DeployEnvValidationAndSanitization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for original variant: %v", err)
 	}
-	if env["H3_VARIANT"] != "original" || env["USE_GOOGLE_DRIVE"] != "1" || env["ENABLE_CLOUDFLARED"] != "0" {
+	if env["H3_VARIANT"] != "original" || env["USE_GOOGLE_DRIVE"] != "1" || env["ENABLE_CLOUDFLARED"] != "0" || env["RESTORE_CUSTOM_NODES_SNAPSHOT"] != "0" {
 		t.Fatalf("unexpected deploy env: %+v", env)
 	}
+	acc.RestoreCustomNodesSnapshot = true
+	if envSnap, err := core.BuildDeployEnv(acc); err != nil || envSnap["RESTORE_CUSTOM_NODES_SNAPSHOT"] != "1" {
+		t.Fatalf("expected RESTORE_CUSTOM_NODES_SNAPSHOT=1 when enabled, got %+v err=%v", envSnap, err)
+	}
+	acc.RestoreCustomNodesSnapshot = false
 
 	// Custom variant rejects command-injection repo / traversal paths
 	acc.H3Variant = core.H3VariantCustom
