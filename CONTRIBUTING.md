@@ -20,8 +20,8 @@ chmod +x scripts/package.sh
 1. **Official CLI Only**: Never add private/undocumented Colab web endpoints, cookie scrapers, or fake kernel keepalive loops.
 2. **Privacy & Safety**: Never persist plaintext tokens or API keys outside macOS Keychain; validate all remote values through `internal/core` sanitizers before passing to subprocesses.
 3. **Verify Before PR**:
-   - Run `GOTOOLCHAIN=auto go vet ./...` and `GOTOOLCHAIN=auto go test -race ./...` and ensure all tests pass.
-   - Run shell syntax checks one file at a time (never `bash -n a.sh b.sh`, which only checks the first file):
+   - Run `GOTOOLCHAIN=auto go vet ./...`, `GOTOOLCHAIN=auto go tool mygo vet .`, and `GOTOOLCHAIN=auto go test -race ./...` and ensure all tests pass.
+   - Verify LLM script parity (`cmp -s scripts/templates/llm-proxy.sh scripts/remote/start_server.sh`) and run shell syntax checks one file at a time (never `bash -n a.sh b.sh`, which only checks the first file):
      ```bash
      for f in scripts/package.sh scripts/remote/start_server.sh scripts/templates/*.sh docs/examples/*.sh; do bash -n "$f" || exit 1; done
      ```

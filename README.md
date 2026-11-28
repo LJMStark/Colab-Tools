@@ -60,7 +60,7 @@ Renting A100 / G4 / H100 GPUs through Google Colab is great value for running vi
    - Real bill from an 18-clip H3 run: rendering all 18 clips cost only **17 Compute Units**, while accidentally leaving the machine sitting overnight burned **54 Compute Units**.
    - **How Colab Tools helps**: It watches your ComfyUI queue plus GPU+CPU load (so 30 GB model downloads or FFmpeg muxing are never killed early). Once your video queue finishes and sits idle (default 10 min), it **stops the runtime automatically and re-checks Colab servers to confirm billing truly stopped**.
 2. **Re-installing ComfyUI and uploading bash scripts on every fresh VM gets old fast**
-   - **How Colab Tools helps**: Deployment scripts are built straight into the app and sent to the cloud VM automatically. Pick **H3 Original (31B)** or **H3 Flash (13.7B fast)** out of the box — or expand **More Versions** for 24GB-friendly GGUF, any HuggingFace repo, or models already in your Drive. All variants share the exact same 21.5 GB base weights (text encoder + audio/video VAE).
+   - **How Colab Tools helps**: Deployment scripts are built straight into the app and sent to the cloud VM automatically. Pick **H3 Original (31B)**, **H3 Flash (13.7B fast)**, **Lightweight GGUF**, **Custom H3**, **General ComfyUI**, or **Bare Boot** right from the Home task card — all H3 variants share the same 21.5 GB base weights (text encoder + audio/video VAE).
 3. **Symlinking 20GB+ weights straight from Google Drive FUSE causes stalls and disconnects**
    - **How Colab Tools helps**: When Google Drive is enabled, Colab Tools sequentially copies active H3 base weights onto the VM's fast local NVMe SSD (`rsync -ahW`) with zero double-copy HF downloads, mounts your custom `ColabTools/models/` subfolders zero-copy via `extra_model_paths.yaml`, seeds workflows on boot and backs up changes incrementally to `ColabTools/workflows/` (`flock`-guarded, plus pre-shutdown flush), pre-installs **ComfyUI-Manager v4** + **Workflow Models Downloader** for in-canvas missing model/node downloads, and **writes every finished video clip straight to Drive `outputs/`**. You can also turn Drive off for quick cloud-only trials.
 4. **Colab tabs drop connections and native port proxy breaks ComfyUI WebSockets**
@@ -70,7 +70,8 @@ Renting A100 / G4 / H100 GPUs through Google Colab is great value for running vi
 
 ## Also Works Great for Self-Hosted LLM Proxies
 
-Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大模型代理 (LLM Proxy)** in the Home recipe card:
+Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大模型代理 (LLM Proxy)** right inside the Home task card:
+- **Zero manual script upload**: Ships with an embedded generic `llama.cpp` proxy starter (automatically picks a single-file GGUF matching GPU VRAM and protects the HTTPS tunnel with a random Bearer API key); if you place a custom startup script on Google Drive, your Drive script still takes precedence;
 - Auto-detects and safely writes standby configs with backups for **[CC Switch](https://github.com/farion1231/cc-switch)**, **OpenCode** (`opencode.json`), and **Codex CLI** (`config.toml`) without touching your active official subscription or storing plaintext keys;
 - One-click terminal launcher for **Claude Code**, plus safe-by-default **OpenAI (`/v1`) & Anthropic** copy templates for Cherry Studio, Cline, Roo Code, and Cursor.
 

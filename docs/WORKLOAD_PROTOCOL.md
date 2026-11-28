@@ -47,10 +47,12 @@ To display custom model names, exact step progress, or explicit busy flags direc
 
 ---
 
-## 3. Built-in Templates & Custom Drive Scripts
+## 3. Built-in Templates, Backup Contracts & Custom Drive Scripts
 Built-in embedded templates live in [`scripts/templates/`](../scripts/templates/):
-- `comfyui-deploy.sh` — Unified ComfyUI & H3 video deployment template (`COMFY_RECIPE=h3|general`)
-- `llm-proxy.sh` — Parameterized `llama.cpp` OpenAI/Anthropic proxy starter (also mirrored at `scripts/remote/start_server.sh`)
+- `comfyui-deploy.sh` — Unified ComfyUI & H3 video deployment template (`COMFY_RECIPE=h3|general`). Boot-seeds workflows from Drive to local NVMe, backs up edits one-way under `flock` every 20s, retires any legacy unauthenticated video `cloudflared` tunnel on the same port, and enforces strict pre-shutdown flush (`FLUSH_OK` line emitted only when zero file errors occur).
+- `llm-proxy.sh` — Parameterized `llama.cpp` OpenAI/Anthropic proxy starter (byte-identical mirror at `scripts/remote/start_server.sh`, enforced by CI `cmp -s`). Works out of the box with zero manual Drive upload; if a user configures a custom Drive script that exists on Drive, the Drive script takes precedence.
+
+Remote telemetry also recursively scans temporary output directories (`/content/output` and `/content/ComfyUI/output`) and emits `TEMP_OUT_VIDEOS=<count|unknown>`; when Drive is unmounted and temp outputs exist (or scan reports `unknown`), idle auto-shutdown defers and prompts the user to avoid silent clip loss.
 
 Optional community examples for Drive custom startup scripts live in [`docs/examples/`](examples/):
 - `gradio-audio-music.sh` — Gradio audio / speech / music starter (CosyVoice, Fish Speech, ACE-Step)
