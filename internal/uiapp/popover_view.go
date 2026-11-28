@@ -10,7 +10,7 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// PopoverUI renders the compact 420pt menu-bar / system-tray companion HUD.
+// PopoverUI renders the compact 420pt menu-bar companion HUD.
 type PopoverUI struct {
 	Svc              *app.Service
 	ForceTheme       string
@@ -81,7 +81,7 @@ func (p *PopoverUI) View(c *ui.Context) {
 								} else {
 									p.Svc.ReopenOnboarding()
 									if p.OnOpenMain != nil {
-										p.OnOpenMain(app.SectionStatus)
+										p.OnOpenMain(app.SectionHome)
 									}
 								}
 							})
@@ -115,11 +115,12 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 				pill = fmt.Sprintf("%s · %dK", rt.ShortGPUName(), rt.ContextLimit/1024)
 			} else if acc.DeployRecipe == core.RecipeH3Video {
 				shortV := "H3 Flash"
-				if acc.H3Variant == core.H3VariantOriginal {
+				switch acc.H3Variant {
+				case core.H3VariantOriginal:
 					shortV = "H3 原版"
-				} else if acc.H3Variant == core.H3VariantFlashGGUF {
+				case core.H3VariantFlashGGUF:
 					shortV = "H3 GGUF"
-				} else if acc.H3Variant == core.H3VariantCustom {
+				case core.H3VariantCustom:
 					shortV = "H3 自定义"
 				}
 				pill = fmt.Sprintf("%s · %s", rt.ShortGPUName(), shortV)
@@ -135,9 +136,7 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 		}
 		DrawPrecisionLED(c, dotCol, 12)
 		ui.Text(c, "Colab Tools").FontSize(14.5).Bold().TextColor(pal.TextPrimary).MaxLines(1)
-		ui.Row(c).Padding(3, 8).Radius(6).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Shrink(0).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, pill).FontSize(11).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
-		})
+		StatusPill(c, pal, nil, pill)
 		ui.Spacer(c)
 		popoverIconButton(c, pal, "refresh", func() {
 			go p.Svc.RefreshAllAccounts(true, false)
@@ -206,7 +205,7 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 			}
 			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
 				DrawPrecisionLED(c, dot, 11)
-				ui.Column(c).Grow(1).Gap(2).OnClick(func() {
+				ui.Column(c).Grow(1).Gap(2).Cursor(ui.CursorPointer).OnClick(func() {
 					p.OverviewMode = false
 					p.Svc.SelectAccount(acc.ID)
 				}).Children(func() {
@@ -235,87 +234,24 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 					})
 				} else {
 					SmallActionButton(c, pal, "启", nil, !cliReady, func() {
-						p.Svc.StartAccountSession(acc.ID)
+						p.Svc.DeployNow(acc.ID)
 					})
 				}
 			})
 		}
 	})
-
-	ui.Row(c).FillWidth().Gap(8).Children(func() {
-		p.popoverQuickBtn(c, pal, "打开主页", false, false, func() {
-			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionHome)
-			}
-		})
-		p.popoverQuickBtn(c, pal, "管理账号", false, false, func() {
-			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionAccounts)
-			}
-		})
-		p.popoverQuickBtn(c, pal, "偏好设置", false, false, func() {
-			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionSettings)
-			}
-		})
-	})
-}
-
-func (p *PopoverUI) popoverQuickBtn(c *ui.Context, pal Palette, label string, active, disabled bool, onClick func()) {
-	bg := pal.SubtleBg
-	border := pal.SubtleBorder
-	fg := pal.TextPrimary
-	if active {
-		bg = WithAlpha(pal.Amber, 0.16)
-		border = WithAlpha(pal.Amber, 0.42)
-		fg = pal.Amber
-	} else if disabled {
-		bg = pal.DisabledBg
-		border = pal.DisabledBorder
-		fg = pal.TextFaint
-	}
-	el := ui.Row(c).Grow(1).Padding(7, 8).Radius(8).Background(bg).Border(1, border).AlignItems(ui.Center).Justify(ui.Center)
-	if !disabled && onClick != nil {
-		el.OnClick(onClick)
-	}
-	el.Children(func() {
-		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
-	})
 }
 
 func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.AccountProfile) {
 	rt := p.Svc.StateFor(acc.ID)
+	st, stCol := AccountDisplayStatus(acc, rt, pal)
 
 	// Hero row
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
 			ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
 				ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
-				st := "待机中"
-				col := pal.TextMuted
-				if rt.Phase.IsRunning() {
-					if rt.DeployRunning {
-						st = "部署中"
-						col = pal.Amber
-					} else if rt.DeployFailed {
-						st = "部署中断"
-						col = pal.Coral
-					} else if !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() && !rt.ServerHealthy {
-						st = "未部署"
-						col = pal.Amber
-					} else {
-						st = "运行良好"
-						col = pal.Emerald
-					}
-				} else if rt.Phase.IsQueuing() {
-					if rt.Phase.QueuePersistent {
-						st = fmt.Sprintf("守候 第%d轮", rt.Phase.QueueAttempt)
-					} else {
-						st = fmt.Sprintf("排队 %d/%d", rt.Phase.QueueAttempt, rt.Phase.QueueMax)
-					}
-					col = pal.Amber
-				}
-				ui.Text(c, st).FontSize(13).FontWeight(600).TextColor(col).Padding(0, 0, 4, 0)
+				ui.Text(c, st).FontSize(13).FontWeight(600).TextColor(stCol).Padding(0, 0, 4, 0)
 			})
 			ui.Row(c).Gap(6).Children(func() {
 				Badge(c, pal, acc.Tier.ShortBadge(), nil)
@@ -338,7 +274,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 				p.Svc.CancelQueue(acc.ID)
 			})
 		} else {
-			popoverLaunchButton(c, pal, "一键开机", !p.Svc.ViewState().CLIInstalled, func() {
+			PrimaryBtn(c, pal, "一键开机", "play", false, !p.Svc.ViewState().CLIInstalled, func() {
 				p.Svc.DeployNow(acc.ID)
 			})
 		}
@@ -361,7 +297,6 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 	}
 
 	if rt.Phase.IsRunning() {
-		// 2-column Live HUD Cards (only when running)
 		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
 			BentoCard(c, pal, 126, func() {
 				pct := int(math.Round(rt.VRAMRatio() * 100))
@@ -378,7 +313,6 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 			})
 		})
 
-		// Quota + active scheme summary when running
 		hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
 		energyRatio := 0.0
 		if ok {
@@ -404,7 +338,6 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 			drawPopoverAmberEnergyBar(c, pal, energyRatio, !ok)
 		})
 	} else {
-		// Compact standby summary replaces 0% VRAM / 0% GPU empty cards
 		rateSummary := "已关机 · 0.00 CU/h"
 		rateColor := pal.TextMuted
 		if rt.CURatePerHour > 0 {
@@ -427,8 +360,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		})
 	}
 
-	// Idle Watchdog + Golden Quick Actions card (no SSH tunnel / browser clutter)
-	effMins := core.EffectiveIdleTimeoutMinutes(acc, rt)
+	effMins := core.EffectiveIdleTimeoutMinutes(acc)
 	remMin := max(0, (rt.RemainingIdleSeconds(effMins)+59)/60)
 	guardStatus := "未开启"
 	if acc.AutoShutdownEnabled {
@@ -442,65 +374,70 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		hasTargets := acc.AutoSyncCCSwitch || acc.AutoSyncOpenCode || acc.AutoSyncCodex
 		allSynced := hasTargets && (!acc.AutoSyncCCSwitch || rt.CCSwitchSynced) && (!acc.AutoSyncOpenCode || rt.OpenCodeSynced) && (!acc.AutoSyncCodex || rt.CodexSynced)
 		isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
-		ui.Column(c).FillWidth().Gap(7).Children(func() {
-			ui.Row(c).FillWidth().Gap(7).Children(func() {
-				if isVideo {
-					if rt.Phase.IsRunning() && !rt.ServerHealthy {
-						if rt.DeployRunning {
-							lbl := "部署中"
-							if rt.WorkloadMetricValue != "" {
-								lbl = "部署 " + rt.WorkloadMetricValue
+		amber := pal.Amber
+		ui.Row(c).FillWidth().Gap(7).Children(func() {
+			if isVideo {
+				if rt.Phase.IsRunning() && !rt.ServerHealthy {
+					if rt.DeployRunning {
+						lbl := "部署中"
+						if rt.WorkloadMetricValue != "" {
+							lbl = "部署 " + rt.WorkloadMetricValue
+						}
+						ActionBtn(c, pal, lbl, &amber, "", true, false, func() {
+							if p.OnOpenMain != nil {
+								p.OnOpenMain(app.SectionHome)
 							}
-							p.popoverQuickBtn(c, pal, lbl, true, false, func() {
-								if p.OnOpenMain != nil {
-									p.OnOpenMain(app.SectionHome)
-								}
-							})
-						} else if rt.DeployFailed {
-							p.popoverQuickBtn(c, pal, "重新部署", true, false, func() {
-								p.Svc.DeployNow(acc.ID)
-							})
-						} else {
-							p.popoverQuickBtn(c, pal, "立即部署", true, false, func() {
-								p.Svc.DeployNow(acc.ID)
-							})
-						}
+						})
+					} else if rt.DeployFailed {
+						ActionBtn(c, pal, "重新部署", &amber, "", true, false, func() {
+							p.Svc.DeployNow(acc.ID)
+						})
 					} else {
-						comfyLabel := "打开 ComfyUI"
-						if rt.ComfyOpening {
-							comfyLabel = "连接中…"
-						}
-						p.popoverQuickBtn(c, pal, comfyLabel, (rt.Phase.IsRunning() && rt.ServerHealthy) || rt.ComfyOpening, !rt.Phase.IsRunning() || rt.ComfyOpening, func() {
-							go p.Svc.OpenComfyUI(acc.ID)
+						ActionBtn(c, pal, "立即部署", &amber, "", true, false, func() {
+							p.Svc.DeployNow(acc.ID)
 						})
 					}
-					p.popoverQuickBtn(c, pal, "Drive 成片", false, false, func() {
-						p.Svc.OpenDriveOutputs(acc.ID)
-					})
 				} else {
-					syncLbl := "配置接入"
-					if allSynced {
-						syncLbl = "✓ 已同步"
-					} else if rt.PublicURL != "" {
-						syncLbl = "同步工具"
+					comfyLabel := "打开 ComfyUI"
+					var tint *ui.Color
+					if rt.ComfyOpening {
+						comfyLabel = "连接中…"
+						tint = &amber
+					} else if rt.Phase.IsRunning() && rt.ServerHealthy {
+						tint = &amber
 					}
-					p.popoverQuickBtn(c, pal, syncLbl, allSynced, false, func() {
-						if hasTargets && rt.PublicURL != "" {
-							go p.Svc.SyncAllEnabledClients(acc.ID, false)
-						} else if p.OnOpenMain != nil {
-							p.OnOpenMain(app.SectionHome)
-						}
-					})
-					p.popoverQuickBtn(c, pal, ">_ Claude", false, !rt.Phase.IsRunning() || rt.PublicURL == "", func() {
-						p.Svc.LaunchClaudeTerminal(acc.ID)
+					ActionBtn(c, pal, comfyLabel, tint, "", true, !rt.Phase.IsRunning() || rt.ComfyOpening, func() {
+						go p.Svc.OpenComfyUI(acc.ID)
 					})
 				}
-				if rt.Phase.IsRunning() && acc.AutoShutdownEnabled {
-					p.popoverQuickBtn(c, pal, "续命", false, false, func() {
-						p.Svc.ResetIdleTimer(acc.ID)
-					})
+				ActionBtn(c, pal, "Drive 成片", nil, "", true, false, func() {
+					p.Svc.OpenDriveOutputs(acc.ID)
+				})
+			} else {
+				syncLbl := "配置接入"
+				var tint *ui.Color
+				if allSynced {
+					syncLbl = "✓ 已同步"
+					tint = &amber
+				} else if rt.PublicURL != "" {
+					syncLbl = "同步工具"
 				}
-			})
+				ActionBtn(c, pal, syncLbl, tint, "", true, false, func() {
+					if hasTargets && rt.PublicURL != "" {
+						go p.Svc.SyncAllEnabledClients(acc.ID, false)
+					} else if p.OnOpenMain != nil {
+						p.OnOpenMain(app.SectionHome)
+					}
+				})
+				ActionBtn(c, pal, ">_ Claude", nil, "", true, !rt.Phase.IsRunning() || rt.PublicURL == "", func() {
+					p.Svc.LaunchClaudeTerminal(acc.ID)
+				})
+			}
+			if rt.Phase.IsRunning() && acc.AutoShutdownEnabled {
+				ActionBtn(c, pal, "续命", nil, "", true, false, func() {
+					p.Svc.ResetIdleTimer(acc.ID)
+				})
+			}
 		})
 	})
 }
@@ -509,25 +446,25 @@ func (p *PopoverUI) renderFooter(c *ui.Context, pal Palette) {
 	ui.Row(c).FillWidth().Padding(9, 16).AlignItems(ui.Center).Gap(10).Children(func() {
 		ui.Text(c, "v"+app.AppVersion).FontSize(11.5).FontFeatures("tnum").TextColor(pal.TextFaint)
 		ui.Spacer(c)
-		ui.Text(c, "主控制台").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).OnClick(func() {
+		ui.Text(c, "主控制台").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Cursor(ui.CursorPointer).OnClick(func() {
 			if p.OnOpenMain != nil {
-				p.OnOpenMain(app.SectionStatus)
+				p.OnOpenMain(app.SectionHome)
 			}
 		})
 		ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
-		ui.Text(c, "记录").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).OnClick(func() {
+		ui.Text(c, "记录").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Cursor(ui.CursorPointer).OnClick(func() {
 			if p.OnOpenMain != nil {
 				p.OnOpenMain(app.SectionHistory)
 			}
 		})
 		ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
-		ui.Text(c, "设置").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).OnClick(func() {
+		ui.Text(c, "设置").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Cursor(ui.CursorPointer).OnClick(func() {
 			if p.OnOpenMain != nil {
 				p.OnOpenMain(app.SectionSettings)
 			}
 		})
 		ui.Text(c, "·").FontSize(12).TextColor(pal.TextFaint)
-		ui.Text(c, "退出").FontSize(12).FontWeight(500).TextColor(pal.Coral).OnClick(func() {
+		ui.Text(c, "退出").FontSize(12).FontWeight(500).TextColor(pal.Coral).Cursor(ui.CursorPointer).OnClick(func() {
 			if p.OnQuit != nil {
 				p.OnQuit()
 			}
@@ -556,48 +493,6 @@ func popoverIconButton(c *ui.Context, pal Palette, iconName string, onClick func
 	}
 	el.Children(func() {
 		ToolbarIcon(c, iconName, 14, pal.TextMuted)
-	})
-}
-
-func popoverLaunchButton(c *ui.Context, pal Palette, label string, disabled bool, onClick func()) {
-	el := ui.Row(c).
-		Height(34).
-		Padding(0, 15).
-		Radius(9).
-		Gap(6).
-		Shrink(0).
-		AlignItems(ui.Center).
-		Justify(ui.Center)
-
-	fg := pal.PrimaryBtnFg
-	if disabled {
-		fg = pal.TextFaint
-		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
-	} else {
-		topCol := pal.PrimaryBtnTop
-		botCol := pal.PrimaryBtnBottom
-		shadowBlur := float32(12)
-		shadowAlpha := float32(0.36)
-		if el.Hovered() {
-			topCol = topCol.Mix(ui.RGB(255, 255, 255), 0.08)
-			botCol = botCol.Mix(ui.RGB(255, 255, 255), 0.06)
-			shadowBlur = 16
-			shadowAlpha = 0.46
-		}
-		el.LinearGradient(ui.LinearGradient{From: topCol, To: botCol, Angle: 180}).
-			Border(1, ui.Color{}).
-			BorderLinearGradient(ui.LinearGradient{From: pal.PrimaryBtnBorderTop, To: pal.PrimaryBtnBorderBottom, Angle: 180}).
-			InsetShadow(0, 1, 0, 0, ui.RGBA(255, 255, 255, 0.48)).
-			Shadow(0, 4, shadowBlur, -2, ui.RGBA(235, 148, 14, shadowAlpha)).
-			Cursor(ui.CursorPointer)
-		if onClick != nil {
-			el.OnClick(onClick)
-		}
-	}
-
-	el.Children(func() {
-		ToolbarIcon(c, "play", 11, fg)
-		ui.Text(c, label).FontSize(13).FontWeight(600).TextColor(fg).MaxLines(1)
 	})
 }
 

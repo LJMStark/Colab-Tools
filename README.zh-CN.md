@@ -32,8 +32,8 @@
       <sub><b>打开主页点 1 下就能跑</b> · 默认已配齐 H3 Flash 极速版 + 智能挑卡（没货自动换下张）+ Drive 存片 + 跑完 10 分钟关机</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-settings-queue.png" alt="按需展开的自定义显卡顺位与清晨预约" width="420" /><br />
-      <sub><b>老手也能按需展开微调</b> · 平时折叠不打扰，需要时一键切省点模式或自定义多卡顺位、保底与清晨定时预约</sub>
+      <img src="docs/images/preview-settings-queue.png" alt="按需展开的自定义显卡顺位与持续守候" width="420" /><br />
+      <sub><b>老手也能按需展开微调</b> · 平时折叠不打扰，需要时一键切省点模式或自定义多卡顺位、保底与 8 小时低频守候</sub>
     </td>
   </tr>
   <tr>
@@ -62,9 +62,9 @@
 2. **每次换新机器都要重新装环境、写脚本、传网盘，太折腾**
    - **Colab Tools 怎么帮**：启动脚本直接内置在软件里，开机自动送上去装。界面里默认摆好 **「H3 原版（31B 画质最好）」** 和 **「H3 Flash 极速版（13.7B 速度快省点）」** 两档，其他版本（比如 24G 显存就能跑的 GGUF、自己贴 HuggingFace 链接、或者只用你网盘里现成的模型）也能随时切换。不管选哪一版，**21.5 GB 的通用底座只存一份复用，换版本不用重新下**。
 3. **直接拿软链接挂 Google Drive 读几十 GB 大模型，慢到卡死还动不动掉盘**
-   - **Colab Tools 怎么帮**：聪明分工——有 Google Drive 时，开机先把 H3 底座与主权重按需顺序拷到云端本地高速盘（并消除 HF 下载双倍占盘），你放进 `ColabTools/models/` 里的其他模型通过 `extra_model_paths.yaml` 零拷贝直挂立即可见；工作流自动在本地高速盘与 `ColabTools/workflows/` 之间增量同步且预装官方 **ComfyUI-Manager v4** 与画布内服务端补模插件，**每生成完一条视频立刻自动写进 Drive 的 `outputs` 文件夹**。不想绑 Drive 也能直接纯云端试跑。
+   - **Colab Tools 怎么帮**：聪明分工——有 Google Drive 时，开机先把 H3 底座与主权重按需顺序拷到云端本地高速盘（并消除 HF 下载双倍占盘），你放进 `ColabTools/models/` 里的其他模型通过 `extra_model_paths.yaml` 零拷贝直挂立即可见；工作流开机从 `ColabTools/workflows/` 拷入本地高速盘，运行期加锁单向增量备份回 Drive 并在关机前冲刷落盘，同时预装官方 **ComfyUI-Manager v4** 与画布内服务端补模插件，**每生成完一条视频立刻自动写进 Drive 的 `outputs` 文件夹**。不想绑 Drive 也能直接纯云端试跑。
 4. **Colab 网页一关就断连，原生代理开 ComfyUI 动不动黑屏**
-   - **Colab Tools 怎么帮**：装好 ComfyUI 后，默认自动通过**本机加密通道（`127.0.0.1:8188`）**帮你弹出浏览器直接用——不暴露公网网址更安全，也不会黑屏断流（想用手机或另一台电脑看进度时，也能手动打开 `cloudflared` 临时链接）。而且纯 Go 零依赖打包（zip 仅约 9 MB，无 Electron），在 **macOS** 上轻量顺滑。
+   - **Colab Tools 怎么帮**：装好 ComfyUI 后，自动通过**本机加密通道（`127.0.0.1:8188`）**帮你弹出浏览器直接用——不暴露任何无认证公网链接，也不会黑屏断流。纯 Go 零依赖打包（zip 仅约 9 MB，无 Electron），在 **macOS** 上轻量顺滑。
 
 ---
 
@@ -78,15 +78,15 @@
 
 ## 下载与使用
 
-> **平台说明**：目前专注打磨 **macOS** 体验，Windows 版本已暂时下架，待 macOS 全面稳定后再单独适配发布。
+> **平台说明**：Colab Tools 专注 **macOS** 桌面体验（提供 Apple Silicon 预编译包，Intel Mac 可从源码编译）。
 
 ### 准备条件
 - **系统支持**：macOS 14.0+（提供 Apple Silicon 预编译包，Intel Mac 可从源码编译）
 - **官方 Google Colab CLI**（`uv tool install google-colab-cli`，**第一次打开 Colab Tools 会自动检查并带你一键装好**，不用提前折腾）
 
 ### 方式一：直接下载安装包（推荐）
-1. 去 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载 **`Colab-Tools-v0.3.19-macOS-arm64.zip`**，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
-2. 跟着 3 步开箱引导绑好 Google 账号，回到「**主页**」默认已经选好 **H3 Flash 极速版 + 智能挑卡 + Drive 存片 + 跑完自动关机**，直接点顶部中央的 **电源大标志（已关机 · 点击开机）** 就行。
+1. 去 [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest) 下载最新版 **`Colab-Tools-v0.3.24-macOS-arm64.zip`**，解压后把 **`Colab Tools.app`** 拖进「应用程序」打开。
+2. 跟着 2 步开箱引导（环境体检 + 绑定账号）进入「**主页**」，默认已经选好 **H3 Flash 极速版 + 智能挑卡 + Drive 存片 + 跑完自动关机**，直接点顶部中央的 **电源大标志（已关机 · 点击开机）** 就行。
 
 > **系统弹窗提示**：开源工具使用自签发布。首次打开如遇提示，请右键应用点「打开」（或在终端执行 `xattr -cr "/Applications/Colab Tools.app"`）。
 

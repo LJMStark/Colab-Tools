@@ -241,10 +241,32 @@ func (v *Vault) CleanupStaleEphemeralFiles() {
 		return
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
-			ShredAndRemove(filepath.Join(v.ephemeralDir, e.Name()))
+		full := filepath.Join(v.ephemeralDir, e.Name())
+		if e.IsDir() {
+			if sub, err := os.ReadDir(full); err == nil {
+				for _, se := range sub {
+					if !se.IsDir() {
+						ShredAndRemove(filepath.Join(full, se.Name()))
+					}
+				}
+			}
+			_ = os.RemoveAll(full)
+			continue
 		}
+		ShredAndRemove(full)
 	}
+}
+
+func (v *Vault) MkdirEphemeral(prefix string) (string, error) {
+	if err := os.MkdirAll(v.ephemeralDir, 0o700); err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp(v.ephemeralDir, prefix+"-*")
+	if err != nil {
+		return "", err
+	}
+	_ = os.Chmod(dir, 0o700)
+	return dir, nil
 }
 
 func (v *Vault) WriteEphemeralFile(prefix, ext string, content []byte) (string, error) {

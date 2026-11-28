@@ -137,7 +137,7 @@ func TestPhaseSettlementPostAllocAndStopVerification(t *testing.T) {
 	}
 }
 
-func TestIdleTickOnlyCountsFreshIdleEvidenceAndInsightsSnapshotIsRaceFree(t *testing.T) {
+func TestIdleTickOnlyCountsFreshIdleEvidence(t *testing.T) {
 	svc := NewService(true)
 	acc := core.NewDefaultAccountProfile("Watchdog", "wd@example.com", core.TierColabPro, core.AuthSystemDefaultOAuth2)
 	acc.AutoShutdownEnabled = true
@@ -165,31 +165,12 @@ func TestIdleTickOnlyCountsFreshIdleEvidenceAndInsightsSnapshotIsRaceFree(t *tes
 	if svc.StateFor(acc.ID).IdleSeconds != 1 {
 		t.Fatalf("fresh idle signal must increment IdleSeconds to 1, got %d", svc.StateFor(acc.ID).IdleSeconds)
 	}
-
-	// Concurrent Insights writes + InsightsSnapshot reads must be race-free under -race
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 100; i++ {
-			svc.recordProbeInsights([]colab.ProbeAttemptRecord{{Hardware: "G4", Succeeded: i%2 == 0}})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 100; i++ {
-			_, _, _ = svc.InsightsSnapshot("G4")
-		}
-	}()
-	wg.Wait()
 }
 
-func TestVideoQueueDrainFastAutoShutdownAndDeployRecipeSync(t *testing.T) {
+func TestVideoIdleAutoShutdownAndDeployRecipeSync(t *testing.T) {
 	svc := NewService(true)
 	acc := core.NewDefaultAccountProfile("H3User", "h3@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
-	acc.IdleTimeoutMinutes = 40
-	acc.QueueDrainMinutes = 10
-	acc.StopAfterQueueDrained = true
+	acc.IdleTimeoutMinutes = 10
 	acc.AutoShutdownEnabled = true
 	svc.Settings.Accounts = []core.AccountProfile{acc}
 
@@ -205,7 +186,7 @@ func TestVideoQueueDrainFastAutoShutdownAndDeployRecipeSync(t *testing.T) {
 		t.Fatalf("expected H3 video recipe alignment, got %+v", gotAcc)
 	}
 
-	// Once video queue was busy and then drains to 0/0, 10m idle triggers fast shutdown even though general IdleTimeout is 40m
+	// Unified IdleTimeoutMinutes (10m) triggers auto-shutdown after ComfyUI queue drains
 	var stopped atomicStopTracker
 	fr := &fakeRunner{}
 	fr.onShell = func(cmd string) runner.Result {
@@ -222,10 +203,9 @@ func TestVideoQueueDrainFastAutoShutdownAndDeployRecipeSync(t *testing.T) {
 	now := time.Now()
 	rt := core.NewAccountRuntimeState()
 	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
-	rt.SawQueueBusyThisRun = true
 	rt.QueueRunning = 0
 	rt.QueuePending = 0
-	rt.IdleSeconds = 10*60 - 1 // 1 second before 10m drain timeout
+	rt.IdleSeconds = 10*60 - 1 // 1 second before 10m timeout
 	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now.Add(-5 * time.Second)}
 	rt.SignalSource = core.SignalSourceComfyQueue
 	svc.Runtime[acc.ID] = rt
@@ -236,7 +216,7 @@ func TestVideoQueueDrainFastAutoShutdownAndDeployRecipeSync(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 	if !stopped.didStop() {
-		t.Fatal("expected fast auto-shutdown after ComfyUI queue drained for QueueDrainMinutes")
+		t.Fatal("expected fast auto-shutdown after ComfyUI queue drained for IdleTimeoutMinutes")
 	}
 }
 
@@ -601,9 +581,9 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 	// 1. Pre-boot usage refresh gives valid baseline balance (100.00 CU)
 	t0 := time.Now().Add(-2 * time.Hour)
 	svc.mu.Lock()
-	_, _, rec0 := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+	_, _, rec0, _ := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
 		Balance: 100.0, RatePerHour: 0, ActiveAssignments: 0,
-	}, nil, t0, false, "")
+	}, nil, nil, t0, false, "")
 	svc.mu.Unlock()
 	if rec0 != nil {
 		t.Fatalf("offline initial snapshot must not emit closed record, got %+v", rec0)
@@ -617,9 +597,9 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 	rt.IdleSeconds = 123
 	svc.Runtime[acc.ID] = rt
 	tBoot := t0.Add(2 * time.Minute)
-	_, running, rec1 := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+	_, running, rec1, _ := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
 		Balance: 100.0, RatePerHour: 2.33, ActiveAssignments: 1,
-	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-1", Hardware: "L4"}}, tBoot, true, "")
+	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-1", Hardware: "L4"}}, nil, tBoot, true, "")
 	svc.mu.Unlock()
 	if !running || rec1 != nil {
 		t.Fatalf("expected running without closed record, running=%v rec=%+v", running, rec1)
@@ -632,9 +612,9 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 	// 3. Mid-run sample 30m later accumulates estimated CU
 	tMid := tBoot.Add(30 * time.Minute)
 	svc.mu.Lock()
-	_, _, _ = svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+	_, _, _, _ = svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
 		Balance: 98.83, RatePerHour: 2.33, ActiveAssignments: 1,
-	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-1", Hardware: "L4"}}, tMid, false, "")
+	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-1", Hardware: "L4"}}, nil, tMid, false, "")
 	svc.mu.Unlock()
 
 	// 4. StopAccountSession (auto_idle) settles measured CU and prevents duplicate closed record
@@ -670,9 +650,9 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 
 	// Second offline poll must NOT duplicate the closed session record
 	svc.mu.Lock()
-	_, _, recDup := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+	_, _, recDup, _ := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
 		Balance: 97.67, RatePerHour: 0, ActiveAssignments: 0,
-	}, nil, time.Now(), false, "")
+	}, nil, nil, time.Now(), false, "")
 	svc.mu.Unlock()
 	if recDup != nil {
 		t.Fatalf("expected no duplicate session record on subsequent offline poll, got %+v", recDup)
@@ -684,50 +664,22 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 	rt2.Phase = core.InstancePhase{Kind: core.PhaseStarting}
 	svc.Runtime[acc.ID] = rt2
 	t2Start := time.Now().Add(-24 * time.Hour)
-	_, _, _ = svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+	_, _, _, _ = svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
 		Balance: 97.67, RatePerHour: 7.0, ActiveAssignments: 2,
-	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-2", Hardware: "G4"}}, t2Start, true, "")
+	}, []core.ColabSessionItem{{Name: acc.SessionName, Endpoint: "ep-2", Hardware: "G4"}}, nil, t2Start, true, "")
 	rt2 = svc.Runtime[acc.ID]
 	rt2.SessionUptimeSec = 24*3600 - 100
 	svc.Runtime[acc.ID] = rt2
-	_, _, recCap := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
+	_, _, recCap, _ := svc.applyServerSnapshotLocked(acc.ID, acc, &colab.UsageSnapshot{
 		Balance: 50.0, RatePerHour: 0, ActiveAssignments: 0,
-	}, nil, time.Now(), false, "")
+	}, nil, nil, time.Now(), false, "")
 	svc.mu.Unlock()
 	if recCap == nil || recCap.BillingBasis != core.BillingEstimated || recCap.ShutdownReason != core.ShutdownCapReached {
 		t.Fatalf("expected estimated billing + cap_reached on multi-assignment 24h disconnect, got %+v", recCap)
 	}
 
-	// 6. Allocation records: direct shortage sets LastAllocHadShortage, CancelQueue logs cancelled once
-	accDirect := acc
-	accDirect.GPUStrategy = core.GPUStrategyCustom
-	accDirect.EnablePoliteQueue = false
-	accDirect.QueueTargets = []core.AcceleratorOption{core.AccG4}
-	svc.mu.Lock()
-	svc.Settings.Accounts[0] = accDirect
-	svc.mu.Unlock()
-
-	frShortage := &fakeRunner{}
-	frShortage.onShell = func(cmd string) runner.Result {
-		if strings.Contains(cmd, "--gpu") {
-			return runner.Result{ExitCode: 1, Stderr: "503 Service Unavailable"}
-		}
-		return runner.Result{ExitCode: 0}
-	}
-	svc.Engine = colab.NewEngine(frShortage, svc.Vault)
-	svc.StartAccountSession(acc.ID)
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		allocs, _ := svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
-		if len(allocs) >= 1 && svc.StateFor(acc.ID).Phase.Kind == core.PhaseOffline {
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	allocs, _ := svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
-	if len(allocs) != 1 || allocs[0].AllocOutcome != core.AllocTagShortage {
-		t.Fatalf("expected 1 shortage allocation record, got %+v", allocs)
-	}
+	// 6. Allocation records: shortage sets LastAllocHadShortage, CancelQueue logs cancelled once
+	svc.handleProvisionFailure(acc, core.ProvisionOutcome{Kind: core.OutcomeCapacity503, Hardware: "G4", Message: "G4 暂时没货"})
 	if !svc.StateFor(acc.ID).LastAllocHadShortage {
 		t.Fatalf("expected LastAllocHadShortage=true after 503 failure")
 	}
@@ -755,7 +707,7 @@ func TestHistoryLedgerLifecycle_SessionAndAllocationAndHybridCU(t *testing.T) {
 	close(blockCh)
 	time.Sleep(80 * time.Millisecond)
 
-	allocs, _ = svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
+	allocs, _ := svc.HistorySnapshot(core.HistoryFilter{Kind: core.HistoryKindAllocation})
 	cancelCount := 0
 	for _, r := range allocs {
 		if r.AllocOutcome == core.AllocTagCancelled {
@@ -861,21 +813,6 @@ func TestCrossModelFallbackDoesNotMutateAccountAndQuickActions(t *testing.T) {
 		t.Fatalf("expected cross-model downgrade notification title, got %+v", notices)
 	}
 	mu.Unlock()
-
-	// QuickScheduleMorningStart sets schedule & clears error & shows toast
-	svc.mu.Lock()
-	rtErr := svc.Runtime[acc.ID]
-	rtErr.LastError = "没抢到"
-	svc.Runtime[acc.ID] = rtErr
-	svc.mu.Unlock()
-	svc.QuickScheduleMorningStart(acc.ID, 6, 30)
-	afterSched, _ := svc.accountByID(acc.ID)
-	if !afterSched.ScheduledStartEnabled || afterSched.ScheduledStartHour != 6 || afterSched.ScheduledStartMinute != 30 || afterSched.ScheduledNextFireAt == nil {
-		t.Fatalf("QuickScheduleMorningStart did not update schedule properly: %+v", afterSched)
-	}
-	if svc.StateFor(acc.ID).LastError != "" || !strings.Contains(svc.ToastMessage, "06:30") {
-		t.Fatalf("expected cleared error and schedule toast, err=%q toast=%q", svc.StateFor(acc.ID).LastError, svc.ToastMessage)
-	}
 
 	// SwitchToLightGGUFAndStart updates H3Variant to flash_gguf, clears error, and triggers DeployNow
 	svc.mu.Lock()
@@ -1104,7 +1041,6 @@ exit 0
 	preAcc := core.NewDefaultAccountProfile("EarlyDrive", "early@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
 	preAcc.SessionName = "colab-tools"
 	preAcc.UseGoogleDrive = true
-	preAcc.EnablePoliteQueue = false
 	svcPre.Settings.Accounts = []core.AccountProfile{preAcc}
 	svcPre.Runtime[preAcc.ID] = core.NewAccountRuntimeState()
 	svcPre.StartAccountSession(preAcc.ID)
@@ -1172,8 +1108,8 @@ exit 0
 	svc.CancelQueue(pAcc.ID)
 	close(blockQueue)
 
-	// 3. OpenComfyUI: SSH 2 failures with EnableCloudflared=false MUST NOT auto-open public cloudflared;
-	// instead it surfaces PromptComfyHelp and only opens cloudflared upon explicit user confirmation (or EnableCloudflared=true).
+	// 3. OpenComfyUI: SSH 2 failures NEVER open unauthenticated public cloudflared;
+	// surfaces PromptComfyHelp with retry/redeploy options only.
 	svcComfy := NewService(true)
 	defer svcComfy.Shutdown()
 	svcComfy.NotifySender = func(_, _ string) {}
@@ -1192,11 +1128,7 @@ exit 0
 		return cmd, buf, nil
 	}
 
-	fr.mu.Lock()
-	fr.cfURL = "https://auto-rescue-comfy.trycloudflare.com"
-	fr.mu.Unlock()
 	svcComfy.Engine = colab.NewEngine(fr, svcComfy.Vault)
-	acc.EnableCloudflared = false
 	svcComfy.Settings.Accounts = []core.AccountProfile{acc}
 	svcComfy.Settings.SelectedAccountID = acc.ID
 
@@ -1215,66 +1147,22 @@ exit 0
 	svcComfy.Runtime[acc.ID] = rt
 	svcComfy.mu.Unlock()
 
-	// Default (EnableCloudflared=false): must NOT auto-open cloudflared; must prompt user explicitly
 	svcComfy.OpenComfyUI(acc.ID)
 	openedMu.Lock()
 	openedAfterDefault := append([]string(nil), openedURLs...)
 	openedMu.Unlock()
 	if len(openedAfterDefault) != 0 {
-		t.Fatalf("EnableCloudflared=false must NEVER auto-open cloudflared URL, got %+v", openedAfterDefault)
+		t.Fatalf("video mode must NEVER auto-open unauthenticated cloudflared URL, got %+v", openedAfterDefault)
 	}
 	if svcComfy.StateFor(acc.ID).ComfyOpening {
 		t.Fatal("ComfyOpening must reset to false after OpenComfyUI finishes")
 	}
 	helpPrompt := svcComfy.CurrentActionPrompt()
-	if helpPrompt == nil || helpPrompt.Kind != core.PromptComfyHelp || helpPrompt.SecondaryAction != "enable_cloudflared" {
-		t.Fatalf("expected PromptComfyHelp with explicit cloudflared opt-in, got %+v", helpPrompt)
+	if helpPrompt == nil || helpPrompt.Kind != core.PromptComfyHelp || helpPrompt.SecondaryAction == "enable_cloudflared" {
+		t.Fatalf("expected PromptComfyHelp without unauthenticated cloudflared option, got %+v", helpPrompt)
 	}
 	if strings.Contains(helpPrompt.Message, "8188") {
 		t.Fatalf("PromptComfyHelp must avoid technical 8188 port jargon, got %q", helpPrompt.Message)
-	}
-
-	// Explicit user opt-in via secondary action opens cloudflared and marks CloudflaredActive=true
-	svcComfy.ResolveActionPrompt("secondary")
-	deadlineCF := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadlineCF) {
-		openedMu.Lock()
-		n := len(openedURLs)
-		openedMu.Unlock()
-		if n > 0 {
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
-	openedMu.Lock()
-	hasCF := len(openedURLs) > 0 && openedURLs[len(openedURLs)-1] == "https://auto-rescue-comfy.trycloudflare.com"
-	openedMu.Unlock()
-	if !hasCF {
-		t.Fatalf("expected explicit secondary opt-in to open cloudflared URL, got openedURLs=%+v", openedURLs)
-	}
-	if stCF := svcComfy.StateFor(acc.ID); !stCF.CloudflaredActive || stCF.DisplayUIURL == "" {
-		t.Fatalf("expected CloudflaredActive=true and DisplayUIURL set, got %+v", stCF)
-	}
-
-	// Explicit StopCloudflaredTunnel clears CloudflaredActive and DisplayUIURL
-	svcComfy.StopCloudflaredTunnel(acc.ID)
-	if stStopped := svcComfy.StateFor(acc.ID); stStopped.CloudflaredActive || stStopped.DisplayUIURL != "" {
-		t.Fatalf("expected StopCloudflaredTunnel to clear active flag and URL, got %+v", stStopped)
-	}
-
-	// When user explicitly enables EnableCloudflared=true, auto-fallback works when SSH fails
-	accCFOn := acc
-	accCFOn.EnableCloudflared = true
-	svcComfy.Settings.Accounts = []core.AccountProfile{accCFOn}
-	openedMu.Lock()
-	openedURLs = nil
-	openedMu.Unlock()
-	svcComfy.OpenComfyUI(acc.ID)
-	openedMu.Lock()
-	hasAutoCF := len(openedURLs) > 0 && openedURLs[len(openedURLs)-1] == "https://auto-rescue-comfy.trycloudflare.com"
-	openedMu.Unlock()
-	if !hasAutoCF {
-		t.Fatalf("expected EnableCloudflared=true to allow fallback URL, got %+v", openedURLs)
 	}
 }
 
@@ -1387,60 +1275,33 @@ func TestRequestConfirmStopAndResolveLifecycle(t *testing.T) {
 	}
 }
 
-func TestUpdateAccountNormalizesManagedOptionsAndSyncsIdle(t *testing.T) {
+func TestUpdateAccountRespectsPersistentHoursAndSyncsIdle(t *testing.T) {
 	svc := NewService(true)
 	acc := core.NewDefaultAccountProfile("Normalize", "norm@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
 	svc.Settings.Accounts = []core.AccountProfile{acc}
 
-	// Simulate legacy/manual disables across all managed options and mismatched idle timers
 	dirty := acc
 	dirty.DeployRecipe = core.RecipeH3Video
 	dirty.EnableLLMModule = false
-	dirty.AutoOpenComfyUI = false
-	dirty.EnablePoliteQueue = false
-	dirty.EnableHardwareIdle = false
-	dirty.H3EnableSolAttn = false
 	dirty.UseGoogleDrive = true
-	dirty.CacheBaseToDrive = false
 	dirty.QueuePersistentMode = true
 	dirty.QueuePersistentMaxHours = 12
 	dirty.AutoShutdownEnabled = false
 	dirty.IdleTimeoutMinutes = 15
-	dirty.QueueDrainMinutes = 40
-	dirty.StopAfterQueueDrained = false
 
 	svc.UpdateAccount(dirty)
 	got, ok := svc.accountByID(acc.ID)
 	if !ok {
 		t.Fatal("expected account to exist after UpdateAccount")
 	}
-	if !got.AutoOpenComfyUI || !got.EnablePoliteQueue || !got.EnableHardwareIdle || !got.H3EnableSolAttn || !got.CacheBaseToDrive {
-		t.Fatalf("expected all managed technical options normalized to true, got %+v", got)
+	if got.QueuePersistentMaxHours != 12 || !got.AutoShutdownEnabled {
+		t.Fatalf("expected persistent mode to preserve maxHours=12 and enable AutoShutdownEnabled, got maxHours=%d autoShut=%v", got.QueuePersistentMaxHours, got.AutoShutdownEnabled)
 	}
-	if got.QueuePersistentMaxHours != 8 || !got.AutoShutdownEnabled {
-		t.Fatalf("expected persistent mode normalized to maxHours=8 and AutoShutdownEnabled=true, got maxHours=%d autoShut=%v", got.QueuePersistentMaxHours, got.AutoShutdownEnabled)
+	if got.IdleTimeoutMinutes != 15 {
+		t.Fatalf("expected IdleTimeoutMinutes=15, got %d", got.IdleTimeoutMinutes)
 	}
-	if got.IdleTimeoutMinutes != 15 || got.QueueDrainMinutes != 15 || !got.StopAfterQueueDrained {
-		t.Fatalf("expected unified idle sync (15/15/true), got idle=%d drain=%d stopDrain=%v", got.IdleTimeoutMinutes, got.QueueDrainMinutes, got.StopAfterQueueDrained)
-	}
-	rtBusy := core.NewAccountRuntimeState()
-	rtBusy.SawQueueBusyThisRun = true
-	if eff := core.EffectiveIdleTimeoutMinutes(got, rtBusy); eff != 15 {
-		t.Fatalf("expected EffectiveIdleTimeoutMinutes=15 after sync, got %d", eff)
-	}
-
-	// Without UseGoogleDrive, CacheBaseToDrive should not be forced true
-	noDrive := got
-	noDrive.UseGoogleDrive = false
-	noDrive.CacheBaseToDrive = false
-	noDrive.IdleTimeoutMinutes = 40
-	svc.UpdateAccount(noDrive)
-	got2, _ := svc.accountByID(acc.ID)
-	if got2.CacheBaseToDrive {
-		t.Fatal("CacheBaseToDrive must stay false when UseGoogleDrive is false")
-	}
-	if got2.QueueDrainMinutes != 40 {
-		t.Fatalf("expected QueueDrainMinutes synced to 40, got %d", got2.QueueDrainMinutes)
+	if eff := core.EffectiveIdleTimeoutMinutes(got); eff != 15 {
+		t.Fatalf("expected EffectiveIdleTimeoutMinutes=15, got %d", eff)
 	}
 }
 
@@ -1968,7 +1829,6 @@ func TestV0320SafetyGuardsLedgerRecoveryAndDriveOutputs(t *testing.T) {
 	acc2Mod.EnableLLMModule = false
 	acc2Mod.AutoShutdownEnabled = true
 	acc2Mod.IdleTimeoutMinutes = 10
-	acc2Mod.QueueDrainMinutes = 10
 	svc.Settings.Accounts = []core.AccountProfile{acc1, acc2Mod}
 	rt2Guard := svc.Runtime[acc2.ID]
 	rt2Guard.Phase = core.InstancePhase{Kind: core.PhaseRunning}
@@ -1989,45 +1849,49 @@ func TestV0320SafetyGuardsLedgerRecoveryAndDriveOutputs(t *testing.T) {
 		t.Fatalf("expected PromptTempOutputGuard, got %+v", p)
 	}
 
-	// 6. Active session ledger recovery on restart (resume live endpoint + backfill dead endpoint)
+	// 6. Single HistoryStore InFlight recovery on restart (resume live endpoint + backfill dead endpoint)
 	dir := t.TempDir()
-	ledgerPath := filepath.Join(dir, "active_sessions.json")
+	histPath := filepath.Join(dir, "history.json")
 	started := now.Add(-30 * time.Minute)
-	if err := core.SaveActiveLedger(ledgerPath, map[string]core.ActiveSessionLedgerEntry{
-		"acc-live": {
-			AccountID:          "acc-live",
-			AccountName:        "Live",
-			SessionName:        "s-live",
-			Endpoint:           "ep-live-keep",
-			Hardware:           "A100",
-			StartedAt:          started,
-			StartBalance:       200.0,
-			StartBalanceValid:  true,
-			MeasuredSingleRate: 12.0,
-			EstimatedCU:        6.0,
-			LastSampleAt:       now.Add(-5 * time.Minute),
-			LastUptimeSec:      1500,
-		},
-		"acc-dead": {
-			AccountID:          "acc-dead",
-			AccountName:        "Dead",
-			SessionName:        "s-dead",
-			Endpoint:           "ep-dead-gone",
-			Hardware:           "L4",
-			StartedAt:          started,
-			MeasuredSingleRate: 2.0,
-			EstimatedCU:        1.0,
-			LastSampleAt:       now.Add(-2 * time.Minute),
-			LastUptimeSec:      1680,
-		},
+	sampleLive := now.Add(-5 * time.Minute)
+	sampleDead := now.Add(-2 * time.Minute)
+	store := core.LoadHistoryStore(histPath)
+	if err := store.UpsertInFlight(core.HistoryRecord{
+		ID:                 "sess-live-1",
+		AccountID:          "acc-live",
+		AccountName:        "Live",
+		SessionName:        "s-live",
+		Endpoint:           "ep-live-keep",
+		Hardware:           "A100",
+		StartedAt:          started,
+		ConsumedCU:         6.0,
+		StartBalance:       200.0,
+		StartBalanceValid:  true,
+		MeasuredSingleRate: 12.0,
+		LastSampleAt:       &sampleLive,
+		LastUptimeSec:      1500,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertInFlight(core.HistoryRecord{
+		ID:                 "sess-dead-1",
+		AccountID:          "acc-dead",
+		AccountName:        "Dead",
+		SessionName:        "s-dead",
+		Endpoint:           "ep-dead-gone",
+		Hardware:           "L4",
+		StartedAt:          started,
+		ConsumedCU:         1.0,
+		MeasuredSingleRate: 2.0,
+		LastSampleAt:       &sampleDead,
+		LastUptimeSec:      1680,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	svcR := NewService(true)
 	defer svcR.Shutdown()
-	svcR.persistChanges = true
-	svcR.activeLedgerPath = ledgerPath
-	svcR.pendingLedger = core.LoadActiveLedger(ledgerPath)
+	svcR.History = core.LoadHistoryStore(histPath)
+	inFlightMap := svcR.History.InFlightByAccount()
 	aLive := core.NewDefaultAccountProfile("Live", "live@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
 	aLive.ID = "acc-live"
 	aLive.SessionName = "s-live"
@@ -2038,19 +1902,21 @@ func TestV0320SafetyGuardsLedgerRecoveryAndDriveOutputs(t *testing.T) {
 	svcR.Runtime[aLive.ID] = core.NewAccountRuntimeState()
 	svcR.Runtime[aDead.ID] = core.NewAccountRuntimeState()
 
+	liveIF := inFlightMap[aLive.ID]
+	deadIF := inFlightMap[aDead.ID]
 	svcR.mu.Lock()
-	_, isLiveRun, closedLive := svcR.applyServerSnapshotLocked(aLive.ID, aLive, &colab.UsageSnapshot{Balance: 193.0, RatePerHour: 12.0, ActiveAssignments: 1}, []core.ColabSessionItem{{Name: "s-live", Endpoint: "ep-live-keep", Hardware: "A100"}}, now, false, "")
-	_, isDeadRun, closedDead := svcR.applyServerSnapshotLocked(aDead.ID, aDead, &colab.UsageSnapshot{Balance: 98.0, RatePerHour: 0, ActiveAssignments: 0}, nil, now, false, "")
+	_, isLiveRun, closedLive, nextLiveIF := svcR.applyServerSnapshotLocked(aLive.ID, aLive, &colab.UsageSnapshot{Balance: 193.0, RatePerHour: 12.0, ActiveAssignments: 1}, []core.ColabSessionItem{{Name: "s-live", Endpoint: "ep-live-keep", Hardware: "A100"}}, &liveIF, now, false, "")
+	_, isDeadRun, closedDead, _ := svcR.applyServerSnapshotLocked(aDead.ID, aDead, &colab.UsageSnapshot{Balance: 98.0, RatePerHour: 0, ActiveAssignments: 0}, nil, &deadIF, now, false, "")
 	svcR.mu.Unlock()
-	if !isLiveRun || closedLive != nil {
-		t.Fatalf("expected live endpoint resumed without closing, isLiveRun=%v closed=%+v", isLiveRun, closedLive)
+	if !isLiveRun || closedLive != nil || nextLiveIF == nil {
+		t.Fatalf("expected live endpoint resumed without closing, isLiveRun=%v closed=%+v nextIF=%+v", isLiveRun, closedLive, nextLiveIF)
 	}
 	resumedRT := svcR.StateFor(aLive.ID)
 	if resumedRT.SessionEstimatedCU < 6.9 || resumedRT.SessionStartBalance != 200.0 || resumedRT.SessionAdopted {
-		t.Fatalf("expected seamless ledger resumption, got estCU=%.2f startBal=%.2f adopted=%v", resumedRT.SessionEstimatedCU, resumedRT.SessionStartBalance, resumedRT.SessionAdopted)
+		t.Fatalf("expected seamless HistoryStore InFlight resumption, got estCU=%.2f startBal=%.2f adopted=%v", resumedRT.SessionEstimatedCU, resumedRT.SessionStartBalance, resumedRT.SessionAdopted)
 	}
 	if isDeadRun || closedDead == nil || closedDead.Endpoint != "ep-dead-gone" || closedDead.ConsumedCU < 0.99 || closedDead.BillingBasis != core.BillingEstimated {
-		t.Fatalf("expected dead ledger entry backfilled as BillingEstimated, got run=%v rec=%+v", isDeadRun, closedDead)
+		t.Fatalf("expected dead in-flight record backfilled as BillingEstimated, got run=%v rec=%+v", isDeadRun, closedDead)
 	}
 }
 
@@ -2065,7 +1931,6 @@ func TestV0320CodexReviewFixesStopGuardPromptIDAndTempDir(t *testing.T) {
 	acc.UseGoogleDrive = true
 	acc.AutoShutdownEnabled = true
 	acc.IdleTimeoutMinutes = 10
-	acc.QueueDrainMinutes = 10
 	svc.Settings.Accounts = []core.AccountProfile{acc}
 	svc.Settings.SelectedAccountID = acc.ID
 
@@ -2234,5 +2099,124 @@ func TestRequestWebStopGuideAndOpenColabWebHome(t *testing.T) {
 	case v := <-waitCh:
 		t.Fatalf("expected driveAuthResultCh NOT triggered when web stop guide defers, got %v", v)
 	default:
+	}
+}
+
+func TestLLMDeployUsesBuiltinScriptAndHonorsCustomDriveOverride(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	acc := core.NewDefaultAccountProfile("LLMUser", "llm@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeLLMProxy
+	acc.WorkloadKind = core.WorkloadLLM
+	acc.EnableLLMModule = true
+	acc.UseGoogleDrive = false
+	acc.LLMHFRepo = "bartowski/Qwen2.5-14B-Instruct-GGUF"
+	acc.LLMModelAlias = "qwen2.5-14b-custom"
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-llm-builtin"
+	svc.Runtime[acc.ID] = rt
+
+	var mu sync.Mutex
+	var pushedEnv map[string]string
+	pushedBuiltin := false
+	fr := &fakeRunner{}
+	fr.onShellOpts = func(cmd string, opts runner.RunOptions) runner.Result {
+		if strings.Contains(cmd, "exec") && strings.Contains(opts.Stdin, "DEPLOY_LAUNCHED") {
+			re := regexp.MustCompile(`extra = json\.loads\(base64\.b64decode\("([^"]+)"\)\.decode\("utf-8"\)\)`)
+			if m := re.FindStringSubmatch(opts.Stdin); len(m) == 2 {
+				if rawEnv, err := base64.StdEncoding.DecodeString(m[1]); err == nil {
+					var envMap map[string]string
+					if json.Unmarshal(rawEnv, &envMap) == nil {
+						mu.Lock()
+						pushedEnv = envMap
+						pushedBuiltin = true
+						mu.Unlock()
+					}
+				}
+			}
+			return runner.Result{ExitCode: 0, Stdout: "DEPLOY_LAUNCHED=1\n"}
+		}
+		return runner.Result{ExitCode: 0, Stdout: "HEALTH=\nDEPLOY_ALIVE=1\n"}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	svc.launchLLMDeployFlow(acc)
+	svc.cancelDeployWatcher(acc.ID)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !pushedBuiltin {
+		t.Fatal("expected built-in LLMProxyScript pushed when no custom Drive script exists")
+	}
+	if pushedEnv["HF_REPO"] != "bartowski/Qwen2.5-14B-Instruct-GGUF" || pushedEnv["MODEL_ALIAS"] != "qwen2.5-14b-custom" {
+		t.Fatalf("expected parameterized LLM env vars, got %+v", pushedEnv)
+	}
+}
+
+func TestStopVerificationRejectsStillAliveOrphanEndpointAndPreservesVideoGuard(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	acc := core.NewDefaultAccountProfile("GuardUser", "guard@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.UseGoogleDrive = true
+	acc.AutoShutdownEnabled = true
+	acc.IdleTimeoutMinutes = 10
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	now := time.Now()
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-still-billing"
+	rt.ActiveHardware = "A100"
+	rt.SessionIsVideoComfy = true
+	rt.DriveMountedKnown = true
+	rt.DriveActuallyMounted = false
+	rt.TempOutputScanKnown = true
+	rt.TempOutputVideos = 2
+	rt.IdleSeconds = 40 * 60
+	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
+	svc.Runtime[acc.ID] = rt
+
+	// Switching task preset for next run to LLM Proxy must NOT strip temp-output guard from the live video session
+	svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
+	svc.handleOneSecondTick(now)
+	if !svc.StateFor(acc.ID).WatchdogDeferredForTempOutputs {
+		t.Fatal("switching task to LLM while video ComfyUI session has temp outputs must NOT bypass WatchdogDeferredForTempOutputs")
+	}
+
+	// Stop verification: even if session name turns into [?], matching endpoint still present MUST return false (not confirmed stopped)
+	flushed := false
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		switch {
+		case strings.Contains(cmd, "exec"):
+			flushed = true
+			return runner.Result{ExitCode: 0, Stdout: "FLUSH_OK workflows=1 snapshot_nodes=0\n"}
+		case strings.Contains(cmd, "stop"):
+			return runner.Result{ExitCode: 0, Stdout: "Stopped.\n"}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.0 compute units\nUsage rate: 8.88/hr\nActive assignments: 1\n"}
+		case strings.Contains(cmd, "sessions"):
+			return runner.Result{ExitCode: 0, Stdout: "[?] ep-still-billing | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	ok := svc.stopAccountSessionVerified(acc.ID, acc.SessionName, "测试停机")
+	if ok {
+		t.Fatal("expected stopAccountSessionVerified to return false when original endpoint still appears as orphan [?]")
+	}
+	if !flushed {
+		t.Fatal("expected pre-stop workflow flush to still run for live video ComfyUI session even after user switched next-run recipe to LLM")
 	}
 }

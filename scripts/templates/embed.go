@@ -2,8 +2,8 @@ package templates
 
 import _ "embed"
 
-//go:embed h3-video.sh
-var H3VideoScript string
+//go:embed comfyui-deploy.sh
+var ComfyUIDeployScript string
 
-//go:embed comfyui-video.sh
-var ComfyUIVideoScript string
+//go:embed llm-proxy.sh
+var LLMProxyScript string

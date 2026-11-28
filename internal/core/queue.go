@@ -9,13 +9,11 @@ import (
 )
 
 const (
-	QueueMaxAttempts                  = 5
-	QueueMaxTotalWait                 = 40 * time.Minute
-	QueuePersistentDefaultHours       = 8
-	QueueMinProvisionBudget           = 15 * time.Second
-	QueueScheduledGraceWindow         = 10 * time.Minute
-	QueueCircuitBreakerCooldown       = 15 * time.Minute
-	QueueNonLLMPostAllocateReminder   = 10 * time.Minute
+	QueueMaxAttempts            = 5
+	QueueMaxTotalWait           = 40 * time.Minute
+	QueuePersistentDefaultHours = 8
+	QueueMinProvisionBudget     = 15 * time.Second
+	QueueCircuitBreakerCooldown = 15 * time.Minute
 )
 
 var QueueRoundBaseDelays = []time.Duration{
@@ -46,19 +44,6 @@ type ProvisionOutcome struct {
 	Code      string
 	Message   string
 	RawDetail string
-}
-
-type ScheduleDecisionKind string
-
-const (
-	ScheduleWaiting       ScheduleDecisionKind = "waiting"
-	ScheduleTriggerNow    ScheduleDecisionKind = "trigger_now"
-	ScheduleMissedExpired ScheduleDecisionKind = "missed_expired"
-)
-
-type ScheduleDecision struct {
-	Kind       ScheduleDecisionKind
-	NextFireAt *time.Time
 }
 
 // SanitizedQueueTargets filters and deduplicates against legal subscription tier while preserving user priority order.
@@ -132,37 +117,6 @@ func DefaultFallbackTarget(excluding []AcceleratorOption, tier SubscriptionTier)
 		return AccL4
 	}
 	return AccT4
-}
-
-func NextScheduledFireDate(hour, minute int, now time.Time) time.Time {
-	h := clampInt(hour, 0, 23)
-	m := clampInt(minute, 0, 59)
-	loc := now.Location()
-	today := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, loc)
-	if today.After(now) {
-		return today
-	}
-	tomorrow := now.AddDate(0, 0, 1)
-	return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), h, m, 0, 0, loc)
-}
-
-func EvaluateSchedule(fireAt time.Time, repeatDaily bool, hour, minute int, now time.Time) ScheduleDecision {
-	if now.Before(fireAt) {
-		return ScheduleDecision{Kind: ScheduleWaiting}
-	}
-	var nextDaily *time.Time
-	if repeatDaily {
-		anchor := now
-		if plusMin := fireAt.Add(time.Minute); plusMin.After(anchor) {
-			anchor = plusMin
-		}
-		nf := NextScheduledFireDate(hour, minute, anchor)
-		nextDaily = &nf
-	}
-	if now.Sub(fireAt) <= QueueScheduledGraceWindow {
-		return ScheduleDecision{Kind: ScheduleTriggerNow, NextFireAt: nextDaily}
-	}
-	return ScheduleDecision{Kind: ScheduleMissedExpired, NextFireAt: nextDaily}
 }
 
 // EffectivePersistentHours 返回持续守候模式的有效最大守候时长（<=0 默认 8 小时，范围限制在 1..24 小时）。

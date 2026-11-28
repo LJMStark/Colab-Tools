@@ -128,7 +128,7 @@ func (m *MainUI) renderHistoryPage(c *ui.Context, pal Palette) {
 					{core.HistoryKindAllocation, "抢卡记录"},
 				} {
 					k, lbl := opt.kind, opt.label
-					segmentedOptionPill(c, pal, lbl, m.HistoryKindFilter == k, func() {
+					ChipToggle(c, pal, lbl, m.HistoryKindFilter == k, false, func() {
 						m.HistoryKindFilter = k
 						m.HistoryPageLimit = 60
 					})
@@ -146,7 +146,7 @@ func (m *MainUI) renderHistoryPage(c *ui.Context, pal Palette) {
 					{0, "全部"},
 				} {
 					d, lbl := opt.days, opt.label
-					segmentedOptionPill(c, pal, lbl, days == d, func() {
+					ChipToggle(c, pal, lbl, days == d, false, func() {
 						m.HistoryDaysFilter = d
 						m.HistoryPageLimit = 60
 					})

@@ -101,9 +101,32 @@ func (b BillingBasis) DisplayName() string {
 	}
 }
 
+func NormalizeHardwareKey(raw string) string {
+	u := strings.ToUpper(raw)
+	switch {
+	case strings.Contains(u, "G4") || strings.Contains(u, "6000"):
+		return "G4"
+	case strings.Contains(u, "H100"):
+		return "H100"
+	case strings.Contains(u, "A100"):
+		return "A100"
+	case strings.Contains(u, "L4"):
+		return "L4"
+	case strings.Contains(u, "T4"):
+		return "T4"
+	case strings.Contains(u, "V6E"):
+		return "v6e-1"
+	case strings.Contains(u, "V5E"):
+		return "v5e-1"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
 type HistoryRecord struct {
 	ID              string               `json:"id"`
 	Kind            HistoryEntryKind     `json:"kind"`
+	InFlight        bool                 `json:"inFlight,omitempty"`
 	AccountID       string               `json:"accountId"`
 	AccountName     string               `json:"accountName"`
 	AccountColor    AccountColorTag      `json:"accountColor,omitempty"`
@@ -124,6 +147,16 @@ type HistoryRecord struct {
 	Rounds          int                  `json:"rounds,omitempty"`
 	AllocOutcome    AllocationOutcomeTag `json:"allocOutcome,omitempty"`
 	Detail          string               `json:"detail,omitempty"`
+
+	// In-flight crash-recovery metadata (only persisted while InFlight == true, stripped on close)
+	StartBalance       float64    `json:"startBalance,omitempty"`
+	StartBalanceValid  bool       `json:"startBalanceValid,omitempty"`
+	Adopted            bool       `json:"adopted,omitempty"`
+	MaxAssignments     int        `json:"maxAssignments,omitempty"`
+	MeasuredSingleRate float64    `json:"measuredSingleRate,omitempty"`
+	LastSampleAt       *time.Time `json:"lastSampleAt,omitempty"`
+	LastUptimeSec      int        `json:"lastUptimeSec,omitempty"`
+	UsedStandardRAM    bool       `json:"usedStandardRAM,omitempty"`
 }
 
 type HistoryFilter struct {
@@ -232,18 +265,26 @@ func cloneRecord(rec HistoryRecord) HistoryRecord {
 		t := *rec.EndedAt
 		rec.EndedAt = &t
 	}
+	if rec.LastSampleAt != nil {
+		t := *rec.LastSampleAt
+		rec.LastSampleAt = &t
+	}
 	return rec
 }
 
-func (s *HistoryStore) sanitizeAndPruneLocked(now time.Time) {
+func normalizeHistoryRecords(records []HistoryRecord, now time.Time) []HistoryRecord {
+	if now.IsZero() {
+		now = time.Now()
+	}
 	cutoff := now.Add(-time.Duration(HistoryMaxAgeDays) * 24 * time.Hour)
-	kept := make([]HistoryRecord, 0, len(s.records))
-	for _, rec := range s.records {
+	inFlight := make([]HistoryRecord, 0, 4)
+	kept := make([]HistoryRecord, 0, len(records))
+	for _, rec := range records {
+		if rec.Kind != HistoryKindSession && rec.Kind != HistoryKindAllocation {
+			continue
+		}
 		if rec.StartedAt.IsZero() {
 			rec.StartedAt = now
-		}
-		if rec.StartedAt.Before(cutoff) {
-			continue
 		}
 		if rec.ID == "" {
 			rec.ID = uuid.New().String()
@@ -254,6 +295,19 @@ func (s *HistoryStore) sanitizeAndPruneLocked(now time.Time) {
 		if rec.ConsumedCU < 0 {
 			rec.ConsumedCU = 0
 		}
+		if rec.LastUptimeSec < 0 {
+			rec.LastUptimeSec = 0
+		}
+		if rec.InFlight {
+			if strings.TrimSpace(rec.AccountID) == "" || strings.TrimSpace(rec.Endpoint) == "" {
+				continue
+			}
+			inFlight = append(inFlight, cloneRecord(rec))
+			continue
+		}
+		if rec.StartedAt.Before(cutoff) {
+			continue
+		}
 		kept = append(kept, cloneRecord(rec))
 	}
 	sort.SliceStable(kept, func(i, j int) bool {
@@ -262,10 +316,14 @@ func (s *HistoryStore) sanitizeAndPruneLocked(now time.Time) {
 	if len(kept) > HistoryMaxRecords {
 		kept = kept[:HistoryMaxRecords]
 	}
-	s.records = kept
+	return append(inFlight, kept...)
 }
 
-func (s *HistoryStore) saveLocked() error {
+func (s *HistoryStore) sanitizeAndPruneLocked(now time.Time) {
+	s.records = normalizeHistoryRecords(s.records, now)
+}
+
+func (s *HistoryStore) saveRecordsLocked(recs []HistoryRecord) error {
 	if s.memoryOnly || s.path == "" {
 		return nil
 	}
@@ -279,7 +337,6 @@ func (s *HistoryStore) saveLocked() error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	recs := s.records
 	if recs == nil {
 		recs = []HistoryRecord{}
 	}
@@ -301,11 +358,25 @@ func (s *HistoryStore) saveLocked() error {
 	return nil
 }
 
+func (s *HistoryStore) saveLocked() error {
+	return s.saveRecordsLocked(s.records)
+}
+
 func (s *HistoryStore) AddRecord(rec HistoryRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now()
+	rec.InFlight = false
+	rec.StartBalance = 0
+	rec.StartBalanceValid = false
+	rec.Adopted = false
+	rec.MaxAssignments = 0
+	rec.MeasuredSingleRate = 0
+	rec.LastSampleAt = nil
+	rec.LastUptimeSec = 0
+	rec.UsedStandardRAM = false
+
 	if rec.ID == "" {
 		rec.ID = uuid.New().String()
 	}
@@ -318,21 +389,242 @@ func (s *HistoryStore) AddRecord(rec HistoryRecord) error {
 	if rec.ConsumedCU < 0 {
 		rec.ConsumedCU = 0
 	}
-	// Idempotent upsert by deterministic ID so ledger-to-history recovery never creates duplicates.
+	// Idempotent upsert by deterministic ID; also close any matching in-flight session for same account+endpoint.
 	replaced := false
-	for i := range s.records {
-		if s.records[i].ID == rec.ID {
-			s.records[i] = cloneRecord(rec)
-			replaced = true
-			break
+	next := make([]HistoryRecord, 0, len(s.records)+1)
+	for _, cur := range s.records {
+		if cur.ID == rec.ID {
+			if !replaced {
+				next = append(next, cloneRecord(rec))
+				replaced = true
+			}
+			continue
 		}
+		if cur.InFlight && rec.Kind == HistoryKindSession && cur.AccountID == rec.AccountID && cur.Endpoint == rec.Endpoint {
+			continue
+		}
+		next = append(next, cur)
 	}
 	if !replaced {
 		// Prepend so records with identical StartedAt keep newest-first order.
-		s.records = append([]HistoryRecord{cloneRecord(rec)}, s.records...)
+		next = append([]HistoryRecord{cloneRecord(rec)}, next...)
 	}
-	s.sanitizeAndPruneLocked(now)
-	return s.saveLocked()
+	candidate := normalizeHistoryRecords(next, now)
+	if err := s.saveRecordsLocked(candidate); err != nil {
+		return err
+	}
+	s.records = candidate
+	return nil
+}
+
+// UpsertInFlight persists the single active in-flight session snapshot for an account inside HistoryStore.
+// Rejects stale updates: never resurrects a settled record with the same ID, never regresses sample time/uptime,
+// and never lets an older session overwrite a newer active session for the same account.
+func (s *HistoryStore) UpsertInFlight(rec HistoryRecord) error {
+	if strings.TrimSpace(rec.AccountID) == "" || strings.TrimSpace(rec.Endpoint) == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	rec.Kind = HistoryKindSession
+	rec.InFlight = true
+	if rec.ID == "" {
+		rec.ID = uuid.New().String()
+	}
+	if rec.StartedAt.IsZero() {
+		rec.StartedAt = now
+	}
+	if rec.ConsumedCU < 0 {
+		rec.ConsumedCU = 0
+	}
+	if rec.LastUptimeSec < 0 {
+		rec.LastUptimeSec = 0
+	}
+	if rec.LastSampleAt == nil || rec.LastSampleAt.IsZero() {
+		t := now
+		rec.LastSampleAt = &t
+	}
+
+	for _, cur := range s.records {
+		// 1. Never resurrect a session that has already been settled.
+		if !cur.InFlight && cur.ID == rec.ID {
+			return nil
+		}
+		if !cur.InFlight && cur.Kind == HistoryKindSession &&
+			cur.AccountID == rec.AccountID && cur.Endpoint == rec.Endpoint &&
+			!cur.StartedAt.Before(rec.StartedAt) {
+			return nil
+		}
+		// 2. Reject stale sample for the same in-flight session.
+		if cur.InFlight && cur.ID == rec.ID {
+			if cur.LastSampleAt != nil && rec.LastSampleAt != nil && cur.LastSampleAt.After(*rec.LastSampleAt) {
+				return nil
+			}
+			if cur.LastUptimeSec > rec.LastUptimeSec && cur.ConsumedCU >= rec.ConsumedCU {
+				return nil
+			}
+		}
+		// 3. Never let an older session snapshot displace a newer in-flight session of the same account.
+		if cur.InFlight && cur.AccountID == rec.AccountID && cur.ID != rec.ID && cur.StartedAt.After(rec.StartedAt) {
+			return nil
+		}
+	}
+
+	next := make([]HistoryRecord, 0, len(s.records)+1)
+	next = append(next, cloneRecord(rec))
+	for _, cur := range s.records {
+		if cur.InFlight && cur.AccountID == rec.AccountID {
+			continue
+		}
+		if cur.ID == rec.ID && cur.InFlight {
+			continue
+		}
+		next = append(next, cur)
+	}
+	candidate := normalizeHistoryRecords(next, now)
+	if err := s.saveRecordsLocked(candidate); err != nil {
+		return err
+	}
+	s.records = candidate
+	return nil
+}
+
+// InFlightByAccount returns a snapshot map of persisted in-flight sessions keyed by account ID.
+func (s *HistoryStore) InFlightByAccount() map[string]HistoryRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]HistoryRecord{}
+	for _, rec := range s.records {
+		if !rec.InFlight || strings.TrimSpace(rec.AccountID) == "" || strings.TrimSpace(rec.Endpoint) == "" {
+			continue
+		}
+		if _, exists := out[rec.AccountID]; !exists {
+			out[rec.AccountID] = cloneRecord(rec)
+		}
+	}
+	return out
+}
+
+// DeleteInFlight removes an in-flight session snapshot for accountID (and optionally matching sessionID if non-empty).
+func (s *HistoryStore) DeleteInFlight(accountID, sessionID string) error {
+	if strings.TrimSpace(accountID) == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	next := make([]HistoryRecord, 0, len(s.records))
+	for _, cur := range s.records {
+		if cur.InFlight && cur.AccountID == accountID && (sessionID == "" || cur.ID == sessionID) {
+			changed = true
+			continue
+		}
+		next = append(next, cur)
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.saveRecordsLocked(next); err != nil {
+		return err
+	}
+	s.records = next
+	return nil
+}
+
+// ImportLegacyActiveSessions migrates any unsettled sessions from a legacy v0.3.20-v0.3.23 active_sessions.json
+// into HistoryStore as InFlight records, then archives the legacy file once persisted.
+func (s *HistoryStore) ImportLegacyActiveSessions(legacyPath string) error {
+	if s.memoryOnly || strings.TrimSpace(legacyPath) == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(legacyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	type legacyActiveSession struct {
+		AccountID          string    `json:"accountId"`
+		AccountName        string    `json:"accountName"`
+		AccountColor       string    `json:"accountColor"`
+		SessionName        string    `json:"sessionName"`
+		Endpoint           string    `json:"endpoint"`
+		Hardware           string    `json:"hardware"`
+		HighMem            bool      `json:"highMem"`
+		RecipeLabel        string    `json:"recipeLabel"`
+		StartedAt          time.Time `json:"startedAt"`
+		LastSampleAt       time.Time `json:"lastSampleAt"`
+		LastUptimeSec      int       `json:"lastUptimeSec"`
+		StartBalance       float64   `json:"startBalance"`
+		StartBalanceValid  bool      `json:"startBalanceValid"`
+		Adopted            bool      `json:"adopted"`
+		MaxAssignments     int       `json:"maxAssignments"`
+		MeasuredSingleRate float64   `json:"measuredSingleRate"`
+		EstimatedCU        float64   `json:"estimatedCU"`
+		FallbackUsed       bool      `json:"fallbackUsed"`
+		ModelDowngraded    bool      `json:"modelDowngraded"`
+		UsedStandardRAM    bool      `json:"usedStandardRAM"`
+	}
+	var payload struct {
+		Sessions map[string]legacyActiveSession `json:"sessions"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	for accID, item := range payload.Sessions {
+		if strings.TrimSpace(item.AccountID) == "" {
+			item.AccountID = accID
+		}
+		if strings.TrimSpace(item.AccountID) == "" || strings.TrimSpace(item.Endpoint) == "" {
+			continue
+		}
+		started := item.StartedAt
+		if started.IsZero() {
+			started = item.LastSampleAt
+		}
+		if started.IsZero() {
+			started = time.Now()
+		}
+		sample := item.LastSampleAt
+		if sample.IsZero() {
+			sample = started
+		}
+		id := fmt.Sprintf("legacy-%s-%s-%d", item.AccountID, item.Endpoint, started.UTC().Unix())
+		rec := HistoryRecord{
+			ID:                 id,
+			Kind:               HistoryKindSession,
+			InFlight:           true,
+			AccountID:          item.AccountID,
+			AccountName:        item.AccountName,
+			AccountColor:       AccountColorTag(item.AccountColor),
+			SessionName:        item.SessionName,
+			Endpoint:           item.Endpoint,
+			StartedAt:          started,
+			DurationSec:        item.LastUptimeSec,
+			Hardware:           NormalizeHardwareKey(item.Hardware),
+			HighMem:            item.HighMem,
+			RecipeLabel:        item.RecipeLabel,
+			ConsumedCU:         item.EstimatedCU,
+			FallbackUsed:       item.FallbackUsed,
+			ModelDowngraded:    item.ModelDowngraded,
+			StartBalance:       item.StartBalance,
+			StartBalanceValid:  item.StartBalanceValid,
+			Adopted:            item.Adopted,
+			MaxAssignments:     item.MaxAssignments,
+			MeasuredSingleRate: item.MeasuredSingleRate,
+			LastSampleAt:       &sample,
+			LastUptimeSec:      item.LastUptimeSec,
+			UsedStandardRAM:    item.UsedStandardRAM,
+		}
+		if err := s.UpsertInFlight(rec); err != nil {
+			return err
+		}
+	}
+	_ = os.Rename(legacyPath, legacyPath+".migrated")
+	return nil
 }
 
 func (s *HistoryStore) Query(filter HistoryFilter, now time.Time) ([]HistoryRecord, HistorySummary) {
@@ -359,6 +651,9 @@ func (s *HistoryStore) Query(filter HistoryFilter, now time.Time) ([]HistoryReco
 	var latestWatchdog *HistoryRecord
 
 	for _, rec := range s.records {
+		if rec.InFlight {
+			continue
+		}
 		if filter.Kind != "" && rec.Kind != filter.Kind {
 			continue
 		}
@@ -548,6 +843,15 @@ func (s *HistoryStore) Clear() error {
 		}
 		return fmt.Errorf("历史账单处于只读保护状态，拒绝清空原文件")
 	}
-	s.records = []HistoryRecord{}
-	return s.saveLocked()
+	kept := make([]HistoryRecord, 0)
+	for _, cur := range s.records {
+		if cur.InFlight {
+			kept = append(kept, cur)
+		}
+	}
+	if err := s.saveRecordsLocked(kept); err != nil {
+		return err
+	}
+	s.records = kept
+	return nil
 }

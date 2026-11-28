@@ -2,11 +2,11 @@
 # Colab Tools Starter Template — Gradio Audio / Speech / Music Studio
 # Compatible with CosyVoice, Fish Speech, F5-TTS, Whisper WebUI, ACE-Step, YuE, etc.
 # Copy to Google Drive (e.g. /content/drive/MyDrive/colab-tools/gradio-audio-music.sh),
-# set LAUNCH_CMD to your model's Gradio entrypoint, and choose "音频 / 语音" or "音乐生成".
+# set LAUNCH_CMD to your model's Gradio entrypoint, and configure it under Settings -> Advanced -> Custom Startup Script.
 set -euo pipefail
 
 SERVICE_PORT="${SERVICE_PORT:-7860}"
-WORKLOAD_KIND="${WORKLOAD_KIND:-music}"
+WORKLOAD_KIND="${WORKLOAD_KIND:-general}"
 WORKLOAD_NAME="${WORKLOAD_NAME:-Gradio Audio/Music Studio}"
 APP_DIR="${APP_DIR:-/content/audio-studio}"
 LAUNCH_CMD="${LAUNCH_CMD:-python3 app.py --server-name 127.0.0.1 --server-port ${SERVICE_PORT}}"

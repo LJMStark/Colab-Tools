@@ -3,6 +3,21 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.24] - 2026-11-28
+
+### Refactored & Simplified
+- **全仓聚焦 macOS 纯净架构与模块减负**：彻底移除历史遗留 Windows/WSL2 死分支、`image`/`audio`/`music` 空壳枚举、假开关及清晨定时预约，聚焦「视频（H3 / ComfyUI）+ 大模型代理（LLM Proxy）」双主线；
+- **账本与云端脚本合一**：合并独立活跃账本为单一 `HistoryStore`（内置 `InFlight` 崩溃恢复与一次性旧账本迁移），移除 60 秒落盘协程与过时分析模块；合并 `h3-video.sh` + `comfyui-video.sh` 为单一 `comfyui-deploy.sh` 并将工作流同步降维为「开机拷入 + `flock` 加锁单向增量备份 + 关机前 `FLUSH_OK` 冲刷」；泛化并内置 `llm-proxy.sh` 支持免手动上传开箱即用（Drive 自定义脚本仍优先覆盖）；拆分 5,200+ 行 `service.go` 为 6 个职责清晰的同包文件；
+- **界面大扫除与操作收口**：合并首页底部两张重复表为单一「账号与运行机器」总览表（嵌套呈现网页端开启机器与 3 步关机指引）；进阶任务入口归位至主页「当前任务」卡片；新手引导精简为 2 步直达；修复菜单栏 Popover 多账号「启」绕过参数校验并移除重复导航行；收敛分散的按钮与芯片原语至 `theme.go`。
+
+### Fixed & Hardened
+- **安全边界与计费防线加固**：
+  - 视频模式彻底停用无认证 `cloudflared` 公网通道并主动回收升级前残留的视频隧道，全走本机加密 SSH 隧道（LLM 代理继续保留强随机 API Key 鉴权通道）；
+  - 修复远端遥测脚本缺 `import os` 导致的目录扫描异常，并将临时盘护片扫描升级为递归查找（读取异常/超预算返回未知而不误撤保护）；
+  - 严格化关机前工作流备份错误传递与 `FLUSH_OK` 整行回执校验；停机二次核验按原始 `endpoint` 覆盖识别，防止原机器转为 `[?]` 后误判已停机；
+  - 绑定实时会话视频属性 `SessionIsVideoComfy`，防止运行中切换下次任务预设后绕过当前临时盘护片与工作流最终同步；
+  - 修复 `llm-proxy.sh` 后台子进程继承 `flock` FD 9 与失败残留进程问题、增强随机密钥生成校验与 JSON 元数据安全转义；加固 `HistoryStore` 先写盘后提交与防过期快照复活机制，并兑现持续守候 90 秒无人授权自动切纯云端逻辑。
+
 ## [0.3.23] - 2026-11-28
 
 ### Added

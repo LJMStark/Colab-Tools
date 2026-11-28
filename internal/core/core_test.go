@@ -43,19 +43,17 @@ func TestSubscriptionTierAndOfflineHoursEstimation(t *testing.T) {
 
 	acc := core.NewDefaultAccountProfile("Ultra", "u@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
 	acc.GPUStrategy = core.GPUStrategyCustom
-	acc.EnablePoliteQueue = false
-	acc.PreferredAccelerator = core.AccAutoBest
+	acc.QueueTargets = []core.AcceleratorOption{core.AccL4}
 	rt := core.NewAccountRuntimeState()
 	rt.CUBalance = 2362.2
 
-	// Offline custom single-launch auto preset uses L4 baseline (2.33 CU/h -> ~1014h), never CPU 0.1 CU/h (23622h)
+	// Offline custom queue targeting L4 uses L4 baseline (2.33 CU/h -> ~1014h), never CPU 0.1 CU/h (23622h)
 	hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
 	if !ok || basis != "L4" || int(hrs+0.5) != 1014 {
 		t.Fatalf("unexpected offline estimate: hrs=%.1f basis=%s ok=%v", hrs, basis, ok)
 	}
 
 	// Custom queue targeting G4 first uses G4 (7.0 CU/h -> ~337h)
-	acc.EnablePoliteQueue = true
 	acc.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccH100}
 	hrs, basis, ok = rt.EstimatedHoursRemaining(acc)
 	if !ok || basis != "G4" || int(hrs+0.5) != 337 {
@@ -168,21 +166,6 @@ func TestPoliteQueueEqualJitterFallbackAndScheduleGrace(t *testing.T) {
 	if core.ClassifyProvisionFailure(1, false, "", "Your account is blocked from accessing Colab due to abusive usage", "G4").Kind != core.OutcomeRateLimited {
 		t.Fatal("abuse warning must trigger rate-limit cooldown")
 	}
-
-	// Schedule grace window & missed one-shot expiry
-	fireAt := now
-	decOK := core.EvaluateSchedule(fireAt, false, 7, 0, fireAt.Add(5*time.Minute))
-	if decOK.Kind != core.ScheduleTriggerNow || decOK.NextFireAt != nil {
-		t.Fatalf("expected triggerNow within 10m grace, got %+v", decOK)
-	}
-	decExpired := core.EvaluateSchedule(fireAt, false, 7, 0, fireAt.Add(15*time.Minute))
-	if decExpired.Kind != core.ScheduleMissedExpired || decExpired.NextFireAt != nil {
-		t.Fatalf("expected missedExpired past 10m grace, got %+v", decExpired)
-	}
-	decDaily := core.EvaluateSchedule(fireAt, true, 7, 0, fireAt.Add(15*time.Minute))
-	if decDaily.Kind != core.ScheduleMissedExpired || decDaily.NextFireAt == nil || !decDaily.NextFireAt.After(fireAt) {
-		t.Fatalf("expected daily rollover next day, got %+v", decDaily)
-	}
 }
 
 func TestWatchdogDualLowLoadAndMultiSlotAggregation(t *testing.T) {
@@ -245,29 +228,9 @@ func TestWatchdogDualLowLoadAndMultiSlotAggregation(t *testing.T) {
 	}
 }
 
-func TestAllocationInsightsAndLegacyOnboardingMigration(t *testing.T) {
-	ins := core.NewAllocationInsights()
-	morning := time.Date(2026, 11, 25, 6, 30, 0, 0, time.Local)
-	evening := time.Date(2026, 11, 25, 21, 0, 0, 0, time.Local)
-	ins.Record("NVIDIA RTX PRO 6000", true, morning)
-	ins.Record("G4", true, morning)
-	ins.Record("G4", true, morning)
-	ins.Record("G4", false, evening)
-
-	slots := ins.SixSlotHeatmap("G4")
-	if slots[1].Attempts != 3 || slots[1].Successes != 3 {
-		t.Fatalf("unexpected 04-08 slot: %+v", slots[1])
-	}
-	if sum := ins.RecommendedWindowSummary("G4"); sum == "" {
-		t.Fatal("expected golden hour summary")
-	}
-
-	// Corrupt counts clamp safely
-	ins.BucketsByHardware["G4"]["7"] = core.AllocationBucket{Attempts: -5, Successes: 999}
-	ins.BucketsByHardware["G4"]["99"] = core.AllocationBucket{Attempts: 10, Successes: 5}
-	ins.Sanitize()
-	if _, exists := ins.BucketsByHardware["G4"]["99"]; exists {
-		t.Fatal("invalid hour 99 must be stripped")
+func TestLegacyOnboardingMigrationAndNormalizeHardwareKey(t *testing.T) {
+	if got := core.NormalizeHardwareKey("NVIDIA RTX PRO 6000"); got != "G4" {
+		t.Fatalf("expected G4, got %q", got)
 	}
 
 	// Legacy config migration skips onboarding for existing account users, shows for fresh users
@@ -310,9 +273,6 @@ func TestAllocationInsightsAndLegacyOnboardingMigration(t *testing.T) {
 	if s3.Accounts[0].AuthMode != core.AuthIsolatedVaultADC {
 		t.Fatalf("legacy isolated_adc must migrate to %q, got %q", core.AuthIsolatedVaultADC, s3.Accounts[0].AuthMode)
 	}
-	if s3.Accounts[0].ScheduledNextFireAt == nil || !s3.Accounts[0].ScheduledNextFireAt.After(time.Now()) {
-		t.Fatalf("Swift reference-date scheduledNextFireAt must decode into future time, got %+v", s3.Accounts[0].ScheduledNextFireAt)
-	}
 	if cd, ok := s3.QueueCooldownsByAccount["22222222-2222-2222-2222-222222222222"]; !ok || !cd.After(time.Now()) {
 		t.Fatalf("legacy circuitBreakUntilByAccount cooldown must survive upgrade: %+v", s3.QueueCooldownsByAccount)
 	}
@@ -342,8 +302,16 @@ func TestH3DeployEnvValidationAndSanitization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for original variant: %v", err)
 	}
-	if env["H3_VARIANT"] != "original" || env["USE_GOOGLE_DRIVE"] != "1" || env["ENABLE_CLOUDFLARED"] != "0" || env["RESTORE_CUSTOM_NODES_SNAPSHOT"] != "0" {
+	if _, hasCF := env["ENABLE_CLOUDFLARED"]; hasCF {
+		t.Fatalf("video deploy env must not expose ENABLE_CLOUDFLARED: %+v", env)
+	}
+	if env["COMFY_RECIPE"] != "h3" || env["H3_VARIANT"] != "original" || env["USE_GOOGLE_DRIVE"] != "1" || env["RESTORE_CUSTOM_NODES_SNAPSHOT"] != "0" || env["IDLE_AUTO_STOP_MINUTES"] != "30" {
 		t.Fatalf("unexpected deploy env: %+v", env)
+	}
+	accGeneral := acc
+	accGeneral.DeployRecipe = core.RecipeComfyUIGeneral
+	if envGen, err := core.BuildDeployEnv(accGeneral); err != nil || envGen["COMFY_RECIPE"] != "general" {
+		t.Fatalf("expected COMFY_RECIPE=general for general recipe, got %+v err=%v", envGen, err)
 	}
 	acc.RestoreCustomNodesSnapshot = true
 	if envSnap, err := core.BuildDeployEnv(acc); err != nil || envSnap["RESTORE_CUSTOM_NODES_SNAPSHOT"] != "1" {
@@ -381,18 +349,15 @@ func TestH3DeployEnvValidationAndSanitization(t *testing.T) {
 		t.Fatalf("built-in H3 preset must force H3_DRIVE_ONLY=0, got %+v err=%v", env4, err)
 	}
 
-	// EffectiveIdleTimeoutMinutes stays consistent between UI display and watchdog execution
-	rt := core.NewAccountRuntimeState()
-	acc.IdleTimeoutMinutes = 40
-	acc.QueueDrainMinutes = 10
-	acc.StopAfterQueueDrained = true
+	// EffectiveIdleTimeoutMinutes uses unified IdleTimeoutMinutes
+	acc.IdleTimeoutMinutes = 15
 	acc.EnableLLMModule = false
-	if got := core.EffectiveIdleTimeoutMinutes(acc, rt); got != 40 {
-		t.Fatalf("before queue busy, expected 40m, got %d", got)
+	if got := core.EffectiveIdleTimeoutMinutes(acc); got != 15 {
+		t.Fatalf("expected unified 15m idle timeout, got %d", got)
 	}
-	rt.SawQueueBusyThisRun = true
-	if got := core.EffectiveIdleTimeoutMinutes(acc, rt); got != 10 {
-		t.Fatalf("after queue drained, expected 10m, got %d", got)
+	acc.IdleTimeoutMinutes = 0
+	if got := core.EffectiveIdleTimeoutMinutes(acc); got != 40 {
+		t.Fatalf("expected fallback 40m idle timeout when <5, got %d", got)
 	}
 
 	// Drive subpath sanitizer blocks traversal & shell metacharacters
@@ -604,7 +569,7 @@ func TestNextQueueDelayForModeAndPersistentHours(t *testing.T) {
 	}
 }
 
-func TestSettingsSchemaVersionAndActiveLedgerPersistence(t *testing.T) {
+func TestSettingsSchemaVersionAndHistoryInFlightPersistence(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
 
@@ -625,38 +590,89 @@ func TestSettingsSchemaVersionAndActiveLedgerPersistence(t *testing.T) {
 		t.Fatalf("expected persisted schemaVersion=1, got %q err=%v", string(rawSaved), err)
 	}
 
-	// ActiveSessionLedger round-trip and corrupt fallback
-	ledgerPath := filepath.Join(dir, "active_sessions.json")
+	// Single HistoryStore InFlight round-trip: hidden from Query(), persisted across reloads, closed idempotently by AddRecord()
+	histPath := filepath.Join(dir, "history.json")
+	store := core.LoadHistoryStore(histPath)
 	started := time.Now().Add(-25 * time.Minute).UTC().Truncate(time.Second)
-	entries := map[string]core.ActiveSessionLedgerEntry{
-		"acc-1": {
-			AccountID:          "acc-1",
-			AccountName:        "Ultra",
-			SessionName:        "colab-tools",
-			Endpoint:           "m-s-ledger-1",
-			Hardware:           "A100",
-			StartedAt:          started,
-			StartBalance:       400.0,
-			StartBalanceValid:  true,
-			MeasuredSingleRate: 12.0,
-			EstimatedCU:        5.0,
-			LastSampleAt:       started.Add(25 * time.Minute),
-			LastUptimeSec:      1500,
-		},
+	sampleAt := started.Add(25 * time.Minute)
+	if err := store.UpsertInFlight(core.HistoryRecord{
+		ID:                 "sess-inflight-1",
+		AccountID:          "acc-1",
+		AccountName:        "Ultra",
+		SessionName:        "colab-tools",
+		Endpoint:           "m-s-ledger-1",
+		Hardware:           "A100",
+		StartedAt:          started,
+		ConsumedCU:         5.0,
+		StartBalance:       400.0,
+		StartBalanceValid:  true,
+		MeasuredSingleRate: 12.0,
+		LastSampleAt:       &sampleAt,
+		LastUptimeSec:      1500,
+	}); err != nil {
+		t.Fatalf("UpsertInFlight failed: %v", err)
 	}
-	if err := core.SaveActiveLedger(ledgerPath, entries); err != nil {
-		t.Fatalf("SaveActiveLedger failed: %v", err)
+	if recs, _ := store.Query(core.HistoryFilter{}, time.Now()); len(recs) != 0 {
+		t.Fatalf("InFlight record must NOT appear in closed Query() results, got %d", len(recs))
 	}
-	got := core.LoadActiveLedger(ledgerPath)
-	if len(got) != 1 || got["acc-1"].Endpoint != "m-s-ledger-1" || got["acc-1"].EstimatedCU != 5.0 {
-		t.Fatalf("unexpected loaded active ledger: %+v", got)
+	reloaded := core.LoadHistoryStore(histPath)
+	inFlight := reloaded.InFlightByAccount()
+	if len(inFlight) != 1 || inFlight["acc-1"].Endpoint != "m-s-ledger-1" || inFlight["acc-1"].ConsumedCU != 5.0 {
+		t.Fatalf("unexpected reloaded in-flight map: %+v", inFlight)
+	}
+	ended := time.Now().UTC()
+	if err := reloaded.AddRecord(core.HistoryRecord{
+		ID:             "sess-inflight-1",
+		Kind:           core.HistoryKindSession,
+		AccountID:      "acc-1",
+		AccountName:    "Ultra",
+		Endpoint:       "m-s-ledger-1",
+		StartedAt:      started,
+		EndedAt:        &ended,
+		DurationSec:    1500,
+		Hardware:       "A100",
+		ConsumedCU:     5.2,
+		BillingBasis:   core.BillingMeasured,
+		ShutdownReason: core.ShutdownManual,
+	}); err != nil {
+		t.Fatalf("closing in-flight record via AddRecord failed: %v", err)
+	}
+	if left := reloaded.InFlightByAccount(); len(left) != 0 {
+		t.Fatalf("expected 0 in-flight records after closing, got %+v", left)
+	}
+	if recs, _ := reloaded.Query(core.HistoryFilter{}, time.Now()); len(recs) != 1 || recs[0].ConsumedCU != 5.2 {
+		t.Fatalf("expected 1 closed record after AddRecord, got %+v", recs)
 	}
 
-	// Corrupt ledger is backed up and returns empty map safely
-	if err := os.WriteFile(ledgerPath, []byte("{broken json"), 0o600); err != nil {
+	// Late UpsertInFlight for an already settled session ID must NEVER resurrect it
+	if err := reloaded.UpsertInFlight(core.HistoryRecord{
+		ID:            "sess-inflight-1",
+		AccountID:     "acc-1",
+		Endpoint:      "m-s-ledger-1",
+		StartedAt:     started,
+		ConsumedCU:    5.0,
+		LastUptimeSec: 1500,
+	}); err != nil {
+		t.Fatalf("late UpsertInFlight should be ignored without error, got %v", err)
+	}
+	if left := reloaded.InFlightByAccount(); len(left) != 0 {
+		t.Fatalf("settled session must NOT be resurrected by late UpsertInFlight: %+v", left)
+	}
+
+	// Legacy active_sessions.json one-time migration into HistoryStore InFlight
+	legacyActivePath := filepath.Join(dir, "active_sessions.json")
+	legacyActiveJSON := `{"sessions":{"acc-legacy":{"accountId":"acc-legacy","accountName":"Legacy","sessionName":"colab-tools","endpoint":"m-s-old","hardware":"A100","startedAt":"2026-11-28T06:00:00Z","lastSampleAt":"2026-11-28T06:30:00Z","lastUptimeSec":1800,"estimatedCU":4.5}}}`
+	if err := os.WriteFile(legacyActivePath, []byte(legacyActiveJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if gotCorrupt := core.LoadActiveLedger(ledgerPath); len(gotCorrupt) != 0 {
-		t.Fatalf("expected empty map on corrupt ledger, got %+v", gotCorrupt)
+	if err := reloaded.ImportLegacyActiveSessions(legacyActivePath); err != nil {
+		t.Fatalf("ImportLegacyActiveSessions failed: %v", err)
+	}
+	migrated := reloaded.InFlightByAccount()
+	if rec, ok := migrated["acc-legacy"]; !ok || rec.Endpoint != "m-s-old" || rec.ConsumedCU != 4.5 {
+		t.Fatalf("expected legacy active session migrated into InFlight, got %+v", migrated)
+	}
+	if _, err := os.Stat(legacyActivePath + ".migrated"); err != nil {
+		t.Fatalf("expected legacy file renamed to .migrated, err=%v", err)
 	}
 }

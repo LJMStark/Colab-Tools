@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -104,11 +103,9 @@ func DetectInstalledTools() DetectionSnapshot {
 		if _, err := exec.LookPath(name); err == nil {
 			return true
 		}
-		if runtime.GOOS != "windows" {
-			for _, d := range []string{filepath.Join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"} {
-				if st, err := os.Stat(filepath.Join(d, name)); err == nil && !st.IsDir() {
-					return true
-				}
+		for _, d := range []string{filepath.Join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"} {
+			if st, err := os.Stat(filepath.Join(d, name)); err == nil && !st.IsDir() {
+				return true
 			}
 		}
 		return false
@@ -403,6 +400,11 @@ func SyncCCSwitch(
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 
+	// Verify expected CC Switch providers schema before writing so upstream schema changes never corrupt user data.
+	if err := verifyCCSwitchSchema(db); err != nil {
+		return "", err
+	}
+
 	// Daily WAL-safe online backup via SQLite VACUUM INTO (includes committed WAL pages cleanly without CGO)
 	dayPrefix := "cc-switch.db.bak-colabtools-" + time.Now().Format("20060102")
 	entries, _ := os.ReadDir(backupDir)
@@ -516,6 +518,45 @@ func SyncCCSwitch(
 	}
 	committed = true
 	return "已新增 CC Switch 待机渠道（官方订阅保持激活）", nil
+}
+
+func verifyCCSwitchSchema(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(providers)")
+	if err != nil {
+		return fmt.Errorf("%w: 无法读取 CC Switch 表结构：%v", ErrMalformedConfig, err)
+	}
+	defer rows.Close()
+
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("%w: 解析 CC Switch 表结构失败：%v", ErrMalformedConfig, err)
+		}
+		cols[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: 校验 CC Switch 表结构失败：%v", ErrMalformedConfig, err)
+	}
+	required := []string{
+		"id", "app_type", "name", "settings_config", "website_url", "category",
+		"created_at", "sort_index", "notes", "icon", "icon_color", "meta",
+		"is_current", "in_failover_queue", "cost_multiplier", "provider_type",
+	}
+	var missing []string
+	for _, col := range required {
+		if !cols[col] {
+			missing = append(missing, col)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: CC Switch 数据库结构已变更（缺少列 %s），已中止写入以保护配置", ErrMalformedConfig, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // ExportEnvSnippet builds safe-by-default shell export templates (never leaks raw secret unless includeRawSecret=true).

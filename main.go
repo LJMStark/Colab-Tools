@@ -180,7 +180,7 @@ func main() {
 			flyout.Hide()
 		}
 		svc.ReopenOnboarding()
-		openMainWindow(app.SectionStatus, true)
+		openMainWindow(app.SectionHome, true)
 	}
 	popUI.OnRequestStop = func(accountID string) {
 		if flyout != nil && !flyout.IsDestroyed() {
@@ -204,7 +204,7 @@ func main() {
 			return
 		}
 		mygo.App.OnSecondInstance(func(_ []string, _ string) {
-			openMainWindow(app.SectionStatus, false)
+			openMainWindow(app.SectionHome, false)
 		})
 		mygo.App.OnActivate(func(hasVisibleWindows bool) {
 			if !hasVisibleWindows {
@@ -249,7 +249,7 @@ func main() {
 				{
 					ID:    "open-main",
 					Label: "打开主控制台…",
-					Click: func(_ *mygo.MenuItem, _ *mygo.Window) { openMainWindow(app.SectionStatus, false) },
+					Click: func(_ *mygo.MenuItem, _ *mygo.Window) { openMainWindow(app.SectionHome, false) },
 				},
 				{
 					ID:    "refresh-all",
@@ -261,7 +261,7 @@ func main() {
 					Label: "环境体检与开箱向导…",
 					Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
 						svc.ReopenOnboarding()
-						openMainWindow(app.SectionStatus, true)
+						openMainWindow(app.SectionHome, true)
 					},
 				},
 				mygo.Separator(),
@@ -292,7 +292,7 @@ func main() {
 						flyout.Focus()
 					}
 				} else {
-					openMainWindow(app.SectionStatus, false)
+					openMainWindow(app.SectionHome, false)
 				}
 			})
 			tray.OnRightClick(func() {
@@ -305,7 +305,7 @@ func main() {
 		updateTray()
 		svc.StartBackgroundServices()
 		// Open main console on initial launch for immediate visibility
-		openMainWindow(app.SectionStatus, svc.ViewState().ShowingOnboarding)
+		openMainWindow(app.SectionHome, svc.ViewState().ShowingOnboarding)
 	})
 
 	if err := mygo.App.Run(); err != nil {

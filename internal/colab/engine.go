@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,20 +62,13 @@ type RemoteTelemetry struct {
 	DriveMounted       *bool
 	EffectiveOutputDir string
 	TempOutputVideos   *int
-	CloudflaredActive  bool
 }
 
 var ErrSessionParseFailed = errors.New("colab sessions 输出格式异常，已保留上次状态防止误判离线")
 
-type ProbeAttemptRecord struct {
-	Hardware  string
-	Succeeded bool
-}
-
 type ProvisionRoundResult struct {
 	Outcome           core.ProvisionOutcome
 	UnsupportedValues map[string]bool
-	ProbeRecords      []ProbeAttemptRecord
 	UsedStandardRAM   bool
 }
 
@@ -101,25 +93,12 @@ func NewEngine(r runner.Runner, v *vault.Vault) *Engine {
 	return &Engine{Runner: r, Vault: v}
 }
 
-func (e *Engine) useWindowsNativeExec() bool {
-	if runtime.GOOS != "windows" {
-		return false
-	}
-	if osr, ok := e.Runner.(*runner.OSRunner); ok {
-		return !osr.UseWSLOnWindows
-	}
-	return false
-}
-
-func (e *Engine) colabPrefixArgs(profile core.AccountProfile, useWSLPaths bool) ([]string, error) {
+func (e *Engine) colabPrefixArgs(profile core.AccountProfile) ([]string, error) {
 	switch profile.AuthMode {
 	case core.AuthIsolatedVaultADC:
 		args := []string{"--auth=adc"}
 		if cfg := profile.IsolatedConfigFilePath(); cfg != "" {
 			_ = os.MkdirAll(filepath.Dir(cfg), 0o700)
-			if useWSLPaths {
-				cfg = runner.WindowsToWSLPath(cfg)
-			}
 			args = append(args, "--config", cfg)
 		}
 		return args, nil
@@ -131,9 +110,7 @@ func (e *Engine) colabPrefixArgs(profile core.AccountProfile, useWSLPaths bool) 
 }
 
 func (e *Engine) RunColab(ctx context.Context, profile core.AccountProfile, subArgs []string, stdin string, timeout time.Duration) runner.Result {
-	nativeWin := e.useWindowsNativeExec()
-	useWSLPaths := runtime.GOOS == "windows" && !nativeWin
-	prefix, err := e.colabPrefixArgs(profile, useWSLPaths)
+	prefix, err := e.colabPrefixArgs(profile)
 	if err != nil {
 		return runner.Result{ExitCode: -1, Stderr: err.Error()}
 	}
@@ -141,9 +118,6 @@ func (e *Engine) RunColab(ctx context.Context, profile core.AccountProfile, subA
 
 	execWithEnv := func(extraEnv map[string]string) runner.Result {
 		opts := runner.RunOptions{Stdin: stdin, ExtraEnv: extraEnv, Timeout: timeout}
-		if nativeWin {
-			return e.Runner.Run(ctx, "colab", cliArgs, opts)
-		}
 		allArgs := append([]string{"colab"}, cliArgs...)
 		escaped := make([]string, len(allArgs))
 		for i, a := range allArgs {
@@ -217,9 +191,13 @@ func ParseUsage(stdout string) (*UsageSnapshot, bool) {
 }
 
 func isExplicitEmptySessionsLine(lower string) bool {
-	return strings.Contains(lower, "no active sessions") ||
-		strings.Contains(lower, "no sessions") ||
-		strings.Contains(lower, "0 active")
+	if strings.Contains(lower, "no active sessions") || strings.Contains(lower, "no sessions") {
+		return true
+	}
+	return lower == "0 active sessions" ||
+		strings.HasPrefix(lower, "0 active ") ||
+		strings.Contains(lower, ": 0 active") ||
+		strings.Contains(lower, "(0 active")
 }
 
 func isSessionHeaderOrDecorLine(lower string) bool {
@@ -324,11 +302,6 @@ func ParseSessionsStrict(stdout string) ([]core.ColabSessionItem, error) {
 	return items, nil
 }
 
-func ParseSessions(stdout string) []core.ColabSessionItem {
-	items, _ := ParseSessionsStrict(stdout)
-	return items
-}
-
 func (e *Engine) Whoami(ctx context.Context, profile core.AccountProfile) (*WhoamiInfo, bool) {
 	r := e.RunColab(ctx, profile, []string{"whoami"}, "", 20*time.Second)
 	if r.ExitCode != 0 {
@@ -370,7 +343,7 @@ func (e *Engine) FetchUsageAndSessions(ctx context.Context, profile core.Account
 
 func (e *Engine) FetchRemoteTelemetry(ctx context.Context, profile core.AccountProfile) *RemoteTelemetry {
 	port := profile.RemoteServicePort
-	py := fmt.Sprintf(`import subprocess, json, pathlib, time, urllib.request, re
+	py := fmt.Sprintf(`import os, subprocess, json, pathlib, time, urllib.request, re
 def sh(cmd):
     r = subprocess.run(["bash", "-c", cmd], text=True, capture_output=True)
     return r.stdout.strip()
@@ -459,47 +432,62 @@ if pid_p.exists():
 print("DEPLOY_ALIVE=" + ("1" if deploy_alive else "0"))
 drive_mounted = pathlib.Path("/content/drive/MyDrive").is_dir()
 print("DRIVE_MOUNTED=" + ("1" if drive_mounted else "0"))
-def has_cloudflared():
-    cf_pid_p = pathlib.Path("/tmp/colab-tools-cloudflared.pid")
-    if cf_pid_p.exists():
-        try:
-            cfpid = int(cf_pid_p.read_text().strip())
-            cf_cmd = pathlib.Path(f"/proc/{cfpid}/cmdline")
-            if cf_cmd.exists() and "cloudflared" in cf_cmd.read_bytes().decode("utf-8", errors="ignore"):
-                return True
-        except Exception:
-            pass
-    try:
-        for proc_d in pathlib.Path("/proc").iterdir():
-            if not proc_d.name.isdigit():
-                continue
-            try:
-                cmd = (proc_d / "cmdline").read_bytes().decode("utf-8", errors="ignore")
-                if "cloudflared" in cmd and "tunnel" in cmd and "127.0.0.1:" in cmd:
-                    return True
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return False
-print("CLOUDFLARED_ACTIVE=" + ("1" if has_cloudflared() else "0"))
 video_exts = (".mp4", ".webm", ".mov", ".mkv", ".gif")
-def count_videos_recursive(root_p):
+def scan_temp_videos(roots, max_files=2000):
+    cnt = 0
+    seen = 0
+    had_err = False
+    truncated = False
+    for r in roots:
+        rp = pathlib.Path(r)
+        if not rp.is_dir():
+            continue
+        def _on_err(_e):
+            nonlocal had_err
+            had_err = True
+        for cur_root, dirs, files in os.walk(rp, topdown=True, onerror=_on_err, followlinks=False):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                seen += 1
+                if seen > max_files:
+                    truncated = True
+                    break
+                if fn.startswith("."):
+                    continue
+                if fn.lower().endswith(video_exts):
+                    cnt += 1
+            if truncated:
+                break
+        if truncated:
+            break
+    if cnt > 0:
+        return str(cnt)
+    if had_err or truncated:
+        return "unknown"
+    return "0"
+def count_videos_display(root_p, max_entries=400, max_depth=2):
     if not root_p.is_dir():
         return 0
     cnt = 0
-    err = False
-    def on_err(_e):
-        nonlocal err
-        err = True
-    for dp, dns, fns in os.walk(root_p, onerror=on_err):
-        dns[:] = [d for d in dns if not d.startswith(".")]
-        for fn in fns:
+    seen = 0
+    base_parts = len(root_p.parts)
+    for cur_root, dirs, files in os.walk(root_p, topdown=True, followlinks=False):
+        depth = len(pathlib.Path(cur_root).parts) - base_parts
+        if depth >= max_depth:
+            dirs[:] = []
+        else:
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            seen += 1
+            if seen > max_entries:
+                return cnt
+            if fn.startswith("."):
+                continue
             if fn.lower().endswith(video_exts):
                 cnt += 1
-    return -1 if (err and cnt == 0) else cnt
-temp_out_cnt = count_videos_recursive(pathlib.Path("/content/output"))
-print(f"TEMP_OUT_VIDEOS={temp_out_cnt}")
+    return cnt
+temp_out_val = scan_temp_videos(["/content/output", "/content/ComfyUI/output"])
+print(f"TEMP_OUT_VIDEOS={temp_out_val}")
 out_count = 0
 eff_out_dir = ""
 cand_dirs = [%q, "/content/drive/MyDrive/ColabTools/outputs", "/content/output"] if drive_mounted else ["/content/output"]
@@ -510,7 +498,7 @@ for odir in cand_dirs:
     if op.is_dir():
         if not eff_out_dir:
             eff_out_dir = odir
-        c_num = count_videos_recursive(op)
+        c_num = count_videos_display(op)
         if c_num > 0:
             out_count = c_num
             eff_out_dir = odir
@@ -578,8 +566,6 @@ else:
 		case strings.HasPrefix(raw, "DRIVE_MOUNTED="):
 			val := strings.TrimSpace(strings.TrimPrefix(raw, "DRIVE_MOUNTED=")) == "1"
 			t.DriveMounted = &val
-		case strings.HasPrefix(raw, "CLOUDFLARED_ACTIVE="):
-			t.CloudflaredActive = strings.TrimSpace(strings.TrimPrefix(raw, "CLOUDFLARED_ACTIVE=")) == "1"
 		case strings.HasPrefix(raw, "EFFECTIVE_OUT_DIR="):
 			t.EffectiveOutputDir = strings.TrimSpace(strings.TrimPrefix(raw, "EFFECTIVE_OUT_DIR="))
 		case strings.HasPrefix(raw, "TEMP_OUT_VIDEOS="):
@@ -639,29 +625,30 @@ else:
 }
 
 func (e *Engine) FetchRemoteAPIKeySafely(ctx context.Context, profile core.AccountProfile) string {
-	tmp, err := e.Vault.WriteEphemeralFile("keydl", "txt", nil)
+	tmpDir, err := e.Vault.MkdirEphemeral("keydl")
 	if err != nil {
 		return ""
 	}
-	defer vault.ShredAndRemove(tmp)
-	_ = os.Remove(tmp)
-	dlTarget := tmp
-	if runtime.GOOS == "windows" {
-		dlTarget = runner.WindowsToWSLPath(tmp)
+	tmp := filepath.Join(tmpDir, "api_key.txt")
+	defer func() {
+		vault.ShredAndRemove(tmp)
+		_ = os.RemoveAll(tmpDir)
+	}()
+	for _, remotePath := range []string{"/tmp/colab-tools-api-key.txt", "/content/drive/MyDrive/colab-llm/api_key.txt"} {
+		r := e.RunColab(ctx, profile, []string{"download", "-s", profile.SessionName, remotePath, tmp}, "", 25*time.Second)
+		if r.ExitCode != 0 {
+			continue
+		}
+		raw, err := os.ReadFile(tmp)
+		if err != nil {
+			continue
+		}
+		key := strings.TrimSpace(string(raw))
+		if key != "" && !strings.ContainsAny(key, " \t\r\n") {
+			return key
+		}
 	}
-	r := e.RunColab(ctx, profile, []string{"download", "-s", profile.SessionName, "/content/drive/MyDrive/colab-llm/api_key.txt", dlTarget}, "", 25*time.Second)
-	if r.ExitCode != 0 {
-		return ""
-	}
-	raw, err := os.ReadFile(tmp)
-	if err != nil {
-		return ""
-	}
-	key := strings.TrimSpace(string(raw))
-	if key == "" || strings.ContainsAny(key, " \t\r\n") {
-		return ""
-	}
-	return key
+	return ""
 }
 
 func originKey(u *url.URL) string {
@@ -807,7 +794,6 @@ func (e *Engine) ProvisionSession(
 		}
 		r := e.RunColab(ctx, profile, args, "", stepTimeout)
 		if r.ExitCode == 0 {
-			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
 			res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeAllocated, Hardware: target.Display}
 			return res
 		}
@@ -821,7 +807,6 @@ func (e *Engine) ProvisionSession(
 						if hw == "" {
 							hw = target.Display
 						}
-						res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: hw, Succeeded: true})
 						if standardRAM {
 							res.UsedStandardRAM = true
 						}
@@ -829,7 +814,6 @@ func (e *Engine) ProvisionSession(
 						return true, false
 					}
 				}
-				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
 				if !sawCapacity {
 					lastOutcome = toOutcome
 				}
@@ -848,7 +832,6 @@ func (e *Engine) ProvisionSession(
 			// Check active sessions on server: if check fails or 0 active sessions, treat this card as unavailable and try the next card!
 			_, activeSessions, checkErr := e.FetchUsageAndSessions(ctx, profile)
 			if checkErr != nil {
-				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
 				sawCapacity = true
 				lastOutcome = core.ProvisionOutcome{
 					Kind:      core.OutcomeCapacity503,
@@ -863,7 +846,6 @@ func (e *Engine) ProvisionSession(
 				return false, true
 			}
 			if len(activeSessions) == 0 {
-				res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
 				sawCapacity = true
 				lastOutcome = core.ProvisionOutcome{
 					Kind:      core.OutcomeCapacity503,
@@ -883,7 +865,6 @@ func (e *Engine) ProvisionSession(
 		}
 		switch outcome.Kind {
 		case core.OutcomeAllocated:
-			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
 			res.Outcome = outcome
 			return res
 		case core.OutcomeRateLimited, core.OutcomeAuthError, core.OutcomeBudgetExhausted:
@@ -928,7 +909,6 @@ func (e *Engine) ProvisionSession(
 					}
 					stdR := e.RunColab(ctx, profile, stdArgs, "", stdTimeout)
 					if stdR.ExitCode == 0 {
-						res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
 						res.UsedStandardRAM = true
 						res.Outcome = core.ProvisionOutcome{Kind: core.OutcomeAllocated, Hardware: target.Display}
 						return res
@@ -936,7 +916,6 @@ func (e *Engine) ProvisionSession(
 					stdOutcome := core.ClassifyProvisionFailure(stdR.ExitCode, stdR.TimedOut, stdR.Stdout, stdR.Stderr, target.Display)
 					switch stdOutcome.Kind {
 					case core.OutcomeAllocated:
-						res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: true})
 						res.UsedStandardRAM = true
 						res.Outcome = stdOutcome
 						return res
@@ -978,7 +957,6 @@ func (e *Engine) ProvisionSession(
 					}
 				}
 			}
-			res.ProbeRecords = append(res.ProbeRecords, ProbeAttemptRecord{Hardware: target.Display, Succeeded: false})
 			sawCapacity = true
 			lastOutcome = outcome
 			if onProgress != nil {
@@ -1024,11 +1002,6 @@ func (e *Engine) StopSession(ctx context.Context, profile core.AccountProfile, s
 	return e.RunColab(ctx, profile, []string{"stop", "-s", target}, "", 30*time.Second)
 }
 
-func (e *Engine) EnsureDriveMounted(ctx context.Context, profile core.AccountProfile) bool {
-	ok, _ := e.EnsureDriveMountedWithReason(ctx, profile)
-	return ok
-}
-
 // EnsureDriveMountedWithReason mounts Google Drive with a bounded wait and returns a plain-Chinese hint on failure.
 func (e *Engine) EnsureDriveMountedWithReason(ctx context.Context, profile core.AccountProfile) (bool, string) {
 	checkPy := "import os\nprint('DRIVE_MOUNTED=1' if os.path.isdir('/content/drive/MyDrive') else 'DRIVE_MOUNTED=0')\n"
@@ -1054,198 +1027,21 @@ func (e *Engine) EnsureDriveMountedWithReason(ctx context.Context, profile core.
 	return false, "Google Drive 暂未完成授权，先直接云端运行（成片请记得保存）"
 }
 
-var (
-	cloudflaredURLRegex = regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
-	driveAuthURLRegex   = regexp.MustCompile(`https://accounts\.google\.com/[^\s"'<>]+`)
-)
+var driveAuthURLRegex = regexp.MustCompile(`https://accounts\.google\.com/[^\s"'<>]+`)
 
-// EnsureCloudflaredFallbackURL 在云端按需安装并后台拉起 cloudflared 临时隧道指向本地端口，最多等待 20 秒提取安全链接。
-func (e *Engine) EnsureCloudflaredFallbackURL(ctx context.Context, profile core.AccountProfile, remotePort int) (string, error) {
-	if !core.IsValidSessionName(profile.SessionName) {
-		return "", errors.New("会话名不合法")
+// RemoteFileExists reports whether a regular file exists at remotePath on the running Colab VM.
+func (e *Engine) RemoteFileExists(ctx context.Context, profile core.AccountProfile, remotePath string) bool {
+	p := strings.TrimSpace(remotePath)
+	if p == "" || !core.IsValidSessionName(profile.SessionName) {
+		return false
 	}
-	if remotePort <= 0 || remotePort > 65535 {
-		remotePort = 8188
+	encoded, err := json.Marshal(p)
+	if err != nil {
+		return false
 	}
-
-	py := fmt.Sprintf(`import os, pathlib, platform, re, shutil, signal, subprocess, time, urllib.request
-
-port = %d
-log_path = pathlib.Path("/tmp/colab-tools-cloudflared.log")
-pid_path = pathlib.Path("/tmp/colab-tools-cloudflared.pid")
-url_pat = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
-
-def alive_for_port():
-    if not pid_path.exists():
-        return False
-    try:
-        pid = int(pid_path.read_text().strip())
-        cmd_p = pathlib.Path(f"/proc/{pid}/cmdline")
-        if not cmd_p.exists():
-            return False
-        cmd = cmd_p.read_bytes().decode("utf-8", errors="ignore")
-        return "cloudflared" in cmd and f"127.0.0.1:{port}" in cmd
-    except Exception:
-        return False
-
-if alive_for_port() and log_path.exists():
-    m = url_pat.search(log_path.read_text(errors="ignore"))
-    if m:
-        print("CLOUDFLARED_URL=" + m.group(0))
-        raise SystemExit(0)
-
-cf_bin = shutil.which("cloudflared") or ""
-if not cf_bin:
-    cand = pathlib.Path("/tmp/cloudflared")
-    if cand.exists() and os.access(cand, os.X_OK):
-        cf_bin = str(cand)
-    else:
-        arch = platform.machine().lower()
-        suffix = "arm64" if ("aarch64" in arch or "arm64" in arch) else "amd64"
-        dl_url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{suffix}"
-        tmp_dl = pathlib.Path("/tmp/cloudflared.dl")
-        urllib.request.urlretrieve(dl_url, str(tmp_dl))
-        os.chmod(tmp_dl, 0o755)
-        tmp_dl.replace(cand)
-        cf_bin = str(cand)
-
-if pid_path.exists():
-    try:
-        old_pid = int(pid_path.read_text().strip())
-        old_cmd_p = pathlib.Path(f"/proc/{old_pid}/cmdline")
-        if old_cmd_p.exists() and "cloudflared" in old_cmd_p.read_bytes().decode("utf-8", errors="ignore"):
-            os.killpg(old_pid, signal.SIGTERM)
-    except Exception:
-        pass
-
-logf = open(log_path, "wb")
-proc = subprocess.Popen(
-    [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
-    stdout=logf,
-    stderr=subprocess.STDOUT,
-    stdin=subprocess.DEVNULL,
-    start_new_session=True,
-)
-logf.close()
-pid_path.write_text(str(proc.pid))
-
-deadline = time.time() + 20.0
-found = ""
-while time.time() < deadline:
-    if log_path.exists():
-        m = url_pat.search(log_path.read_text(errors="ignore"))
-        if m:
-            found = m.group(0)
-            break
-    if proc.poll() is not None:
-        break
-    time.sleep(0.5)
-
-if found:
-    print("CLOUDFLARED_URL=" + found)
-else:
-    tail = log_path.read_text(errors="ignore")[-400:] if log_path.exists() else ""
-    print("CLOUDFLARED_ERR=" + tail.replace("\n", " "))
-`, remotePort)
-
-	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 50*time.Second)
-	for _, raw := range strings.Split(runner.StripCR(r.Stdout), "\n") {
-		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "CLOUDFLARED_URL=") {
-			u := strings.TrimSpace(strings.TrimPrefix(line, "CLOUDFLARED_URL="))
-			if m := cloudflaredURLRegex.FindString(u); m != "" && core.IsValidEndpointURL(m) {
-				return m, nil
-			}
-		}
-	}
-	errMsg := strings.TrimSpace(r.Stderr)
-	if errMsg == "" {
-		errMsg = strings.TrimSpace(r.Stdout)
-	}
-	if errMsg == "" {
-		errMsg = "未能启动云端临时通道"
-	}
-	return "", errors.New(errMsg)
-}
-
-// StopCloudflaredTunnel terminates any running cloudflared quick tunnel started on the remote Colab VM and verifies exit.
-func (e *Engine) StopCloudflaredTunnel(ctx context.Context, profile core.AccountProfile) error {
-	if !core.IsValidSessionName(profile.SessionName) {
-		return errors.New("会话名不合法")
-	}
-	py := `import os, pathlib, signal, time
-pid_path = pathlib.Path("/tmp/colab-tools-cloudflared.pid")
-log_path = pathlib.Path("/tmp/colab-tools-cloudflared.log")
-pub_path = pathlib.Path("/tmp/public_url.txt")
-
-def find_cf_pids():
-    found = set()
-    if pid_path.exists():
-        try:
-            p = int(pid_path.read_text().strip())
-            cmd_p = pathlib.Path(f"/proc/{p}/cmdline")
-            if cmd_p.exists() and "cloudflared" in cmd_p.read_bytes().decode("utf-8", errors="ignore"):
-                found.add(p)
-        except Exception:
-            pass
-    try:
-        for d in pathlib.Path("/proc").iterdir():
-            if not d.name.isdigit():
-                continue
-            try:
-                cmd = (d / "cmdline").read_bytes().decode("utf-8", errors="ignore")
-                if "cloudflared" in cmd and "tunnel" in cmd and "127.0.0.1:" in cmd:
-                    found.add(int(d.name))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return sorted(found)
-
-for sig in (signal.SIGTERM, signal.SIGKILL):
-    pids = find_cf_pids()
-    if not pids:
-        break
-    for pid in pids:
-        try:
-            os.killpg(pid, sig)
-        except Exception:
-            try:
-                os.kill(pid, sig)
-            except Exception:
-                pass
-    deadline = time.time() + (2.5 if sig == signal.SIGTERM else 1.0)
-    while time.time() < deadline and find_cf_pids():
-        time.sleep(0.2)
-
-remaining = find_cf_pids()
-if remaining:
-    print(f"CLOUDFLARED_STILL_ALIVE={remaining}")
-    raise SystemExit(1)
-
-pid_path.unlink(missing_ok=True)
-log_path.unlink(missing_ok=True)
-if pub_path.exists():
-    try:
-        if "trycloudflare.com" in pub_path.read_text(errors="ignore"):
-            pub_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-print("CLOUDFLARED_STOPPED=1")
-`
-	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 20*time.Second)
-	out := strings.TrimSpace(runner.StripCR(r.Stdout))
-	if r.ExitCode != 0 || !strings.Contains(out, "CLOUDFLARED_STOPPED=1") {
-		msg := strings.TrimSpace(r.Stderr)
-		if msg == "" {
-			msg = out
-		}
-		if msg == "" {
-			msg = "关闭云端临时公网通道失败，未能确认进程退出"
-		}
-		return errors.New(msg)
-	}
-	return nil
+	py := fmt.Sprintf("import os\nprint('FILE_EXISTS=1' if os.path.isfile(%s) else 'FILE_EXISTS=0')\n", string(encoded))
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 15*time.Second)
+	return r.ExitCode == 0 && strings.Contains(r.Stdout, "FILE_EXISTS=1")
 }
 
 // EnsureDriveMountedInteractive 以交互管道运行 `colab drivemount`，遇到 Google Drive 浏览器授权提示时通过回调弹窗引导用户一步完成授权。
@@ -1283,9 +1079,7 @@ func (e *Engine) runInteractiveDriveMount(
 	checkPy string,
 	onAuthRequired func(authURL string) (proceed bool),
 ) (bool, string) {
-	nativeWin := e.useWindowsNativeExec()
-	useWSLPaths := runtime.GOOS == "windows" && !nativeWin
-	prefix, err := e.colabPrefixArgs(profile, useWSLPaths)
+	prefix, err := e.colabPrefixArgs(profile)
 	if err != nil {
 		return false, err.Error()
 	}
@@ -1301,11 +1095,10 @@ func (e *Engine) runInteractiveDriveMount(
 	mountCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var cmd *exec.Cmd
 	extraEnv := map[string]string{
 		"PYTHONUNBUFFERED": "1",
 	}
-	if onAuthRequired != nil && (runtime.GOOS != "windows" || useWSLPaths) {
+	if onAuthRequired != nil {
 		// Suppress google-colab-cli's internal webbrowser.open() so Colab Tools opens the browser exactly once.
 		extraEnv["BROWSER"] = "true"
 	}
@@ -1313,24 +1106,8 @@ func (e *Engine) runInteractiveDriveMount(
 		extraEnv["GOOGLE_APPLICATION_CREDENTIALS"] = adcPath
 	}
 
-	if useWSLPaths {
-		allArgs := append([]string{"colab"}, cliArgs...)
-		escaped := make([]string, len(allArgs))
-		for i, a := range allArgs {
-			escaped[i] = runner.ShellEscapePOSIX(a)
-		}
-		joined := strings.Join(escaped, " ")
-		detachedCmd := "if setsid -w true >/dev/null 2>&1; then exec setsid -w " + joined + "; else exec " + joined + "; fi"
-		distro := ""
-		if osr, ok := e.Runner.(*runner.OSRunner); ok {
-			distro = osr.WSLDistro
-		}
-		exe, wslArgs := runner.BuildWSLCommand(distro, detachedCmd, extraEnv)
-		cmd = exec.CommandContext(mountCtx, exe, wslArgs...)
-	} else {
-		cmd = exec.CommandContext(mountCtx, colabExe, cliArgs...)
-		cmd.Env = runner.BaseEnvironment(extraEnv)
-	}
+	cmd := exec.CommandContext(mountCtx, colabExe, cliArgs...)
+	cmd.Env = runner.BaseEnvironment(extraEnv)
 	runner.DetachControllingTTY(cmd)
 	cmd.Cancel = func() error {
 		runner.KillProcessGroup(cmd)
@@ -1652,7 +1429,15 @@ raise SystemExit(r.returncode)
 	if strings.Contains(out, "FLUSH_NO_DRIVE=1") {
 		return errors.New("Google Drive 未挂载，工作流未能同步到 Drive")
 	}
-	if r.ExitCode != 0 || !strings.Contains(out, "FLUSH_OK") {
+	hasFlushOK := false
+	for _, rawLine := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "FLUSH_OK" || strings.HasPrefix(line, "FLUSH_OK ") {
+			hasFlushOK = true
+			break
+		}
+	}
+	if r.ExitCode != 0 || !hasFlushOK {
 		msg := strings.TrimSpace(r.Stderr)
 		if msg == "" {
 			msg = out
@@ -1703,29 +1488,45 @@ func (e *Engine) StartBuiltinDeployScript(ctx context.Context, profile core.Acco
 	}
 	envB64 := base64.StdEncoding.EncodeToString(envJSON)
 
-	py := fmt.Sprintf(`import base64, json, os, pathlib, signal, subprocess
+	py := fmt.Sprintf(`import base64, fcntl, json, os, pathlib, signal, subprocess, time
+lock_path = pathlib.Path("/tmp/colab-tools-launcher.lock")
 script_path = pathlib.Path("/tmp/colab-tools-deploy.sh")
 pid_path = pathlib.Path("/tmp/colab-tools-deploy.pid")
 status_path = pathlib.Path("/tmp/colab-tools-status.json")
-if pid_path.exists():
-    try:
-        old_pid = int(pid_path.read_text().strip())
-        old_cmd_p = pathlib.Path(f"/proc/{old_pid}/cmdline")
-        if old_cmd_p.exists() and "colab-tools-deploy.sh" in old_cmd_p.read_bytes().decode("utf-8", errors="ignore"):
-            os.killpg(old_pid, signal.SIGTERM)
-    except Exception:
-        pass
-status_path.unlink(missing_ok=True)
-script_path.write_bytes(base64.b64decode("%s"))
-os.chmod(script_path, 0o700)
-extra = json.loads(base64.b64decode("%s").decode("utf-8"))
-env = os.environ.copy()
-for k, v in extra.items():
-    env[str(k)] = str(v)
-logf = open("/tmp/colab-tools-deploy.log", "wb")
-proc = subprocess.Popen(["bash", "/tmp/colab-tools-deploy.sh"], stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
-logf.close()
-pid_path.write_text(str(proc.pid))
+with lock_path.open("w") as lock_fh:
+    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    if pid_path.exists():
+        try:
+            old_pid = int(pid_path.read_text().strip())
+            old_cmd_p = pathlib.Path(f"/proc/{old_pid}/cmdline")
+            if old_cmd_p.exists() and "colab-tools-deploy.sh" in old_cmd_p.read_bytes().decode("utf-8", errors="ignore"):
+                os.killpg(old_pid, signal.SIGTERM)
+                for _ in range(15):
+                    if not pathlib.Path(f"/proc/{old_pid}").exists():
+                        break
+                    time.sleep(0.2)
+                if pathlib.Path(f"/proc/{old_pid}").exists():
+                    try:
+                        os.killpg(old_pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    status_path.unlink(missing_ok=True)
+    tmp_script = pathlib.Path(f"/tmp/colab-tools-deploy.{os.getpid()}.tmp")
+    tmp_script.write_bytes(base64.b64decode("%s"))
+    os.chmod(tmp_script, 0o700)
+    os.replace(tmp_script, script_path)
+    extra = json.loads(base64.b64decode("%s").decode("utf-8"))
+    env = os.environ.copy()
+    for k, v in extra.items():
+        env[str(k)] = str(v)
+    logf = open("/tmp/colab-tools-deploy.log", "wb")
+    proc = subprocess.Popen(["bash", "/tmp/colab-tools-deploy.sh"], stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, start_new_session=True, close_fds=True)
+    logf.close()
+    tmp_pid = pathlib.Path(f"/tmp/colab-tools-deploy.{os.getpid()}.pid.tmp")
+    tmp_pid.write_text(str(proc.pid))
+    os.replace(tmp_pid, pid_path)
 print("DEPLOY_LAUNCHED=1")
 `, scriptB64, envB64)
 

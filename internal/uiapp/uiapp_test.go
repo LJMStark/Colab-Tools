@@ -73,21 +73,11 @@ func makeDemoService(section app.MainSection, onboarding, idleHome bool) *app.Se
 	acc1.WorkloadKind = core.WorkloadVideo
 	acc1.EnableLLMModule = false
 	acc1.UseGoogleDrive = true
-	acc1.CacheBaseToDrive = true
-	acc1.AutoOpenComfyUI = true
-	acc1.StopAfterQueueDrained = true
-	acc1.QueueDrainMinutes = 10
 	acc1.IdleTimeoutMinutes = 10
-	acc1.EnablePoliteQueue = true
 	acc1.QueueTargets = []core.AcceleratorOption{core.AccG4, core.AccA100}
 	acc1.QueueFallbackEnabled = true
 	acc1.QueueFallbackAfterRounds = 2
 	acc1.QueueFallbackTarget = core.AccL4
-	acc1.ScheduledStartEnabled = true
-	acc1.ScheduledStartHour = 7
-	acc1.ScheduledStartMinute = 0
-	nf := core.NextScheduledFireDate(7, 0, now)
-	acc1.ScheduledNextFireAt = &nf
 	acc1.AutoSyncCCSwitch = true
 	acc1.CCSwitchName = "Colab Qwen3.8-27B"
 	acc1.AutoSyncOpenCode = true
@@ -152,15 +142,6 @@ func makeDemoService(section app.MainSection, onboarding, idleHome bool) *app.Se
 	svc.Runtime[acc1.ID] = rt1
 	svc.Runtime[acc2.ID] = rt2
 	svc.Runtime[acc3.ID] = rt3
-
-	for i := 0; i < 8; i++ {
-		svc.Insights.Record("G4", i < 7, time.Date(2026, 11, 25, 6, 30, 0, 0, time.Local))
-	}
-	for i := 0; i < 6; i++ {
-		svc.Insights.Record("G4", i < 3, time.Date(2026, 11, 25, 2, 0, 0, 0, time.Local))
-		svc.Insights.Record("G4", i < 3, time.Date(2026, 11, 25, 10, 0, 0, 0, time.Local))
-		svc.Insights.Record("G4", i < 2, time.Date(2026, 11, 25, 21, 0, 0, 0, time.Local))
-	}
 
 	if svc.History != nil {
 		e1 := now.Add(-2 * time.Hour)
@@ -284,15 +265,33 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	for _, want := range []string{
 		"CU 余额与速率", "实时负载", "当前任务", "空闲自动关机", "挑卡与守候",
 		"调整策略与进阶选项", "›", "点击开机", "账单 ›", "H3 Flash 极速版",
+		"自定义 H3", "通用 ComfyUI", "纯开机",
 	} {
 		if !cleanIdleTester.HasText(want) {
 			t.Fatalf("missing %q on standby 3x2 dashboard: %q", want, cleanIdleTester.Texts())
 		}
 	}
-	for _, unwanted := range []string{"算力续航", "本机通道", "更多玩法", "账号与活跃会话 (1)"} {
+	for _, unwanted := range []string{"算力续航", "本机通道", "更多玩法", "账号与运行机器", "运行中的云端机器"} {
 		if cleanIdleTester.HasText(unwanted) {
 			t.Fatalf("unexpected redundant element %q on single-account standby dashboard: %q", unwanted, cleanIdleTester.Texts())
 		}
+	}
+
+	// Verify advanced recipes live directly inside Card 3 on Home
+	if err := cleanIdleTester.Click("通用 ComfyUI"); err != nil {
+		t.Fatalf("click 通用 ComfyUI on Card 3 failed: %v", err)
+	}
+	if acc, _ := cleanIdleSvc.SelectedAccount(); acc.DeployRecipe != core.RecipeComfyUIGeneral {
+		t.Fatalf("expected RecipeComfyUIGeneral after clicking Card 3 chip, got %q", acc.DeployRecipe)
+	}
+	if err := cleanIdleTester.Click("自定义 H3"); err != nil {
+		t.Fatalf("click 自定义 H3 on Card 3 failed: %v", err)
+	}
+	if acc, _ := cleanIdleSvc.SelectedAccount(); acc.DeployRecipe != core.RecipeH3Video || acc.H3Variant != core.H3VariantCustom {
+		t.Fatalf("expected H3 custom after clicking Card 3 chip, got recipe=%q variant=%q", acc.DeployRecipe, acc.H3Variant)
+	}
+	if err := cleanIdleTester.Click("H3 Flash 极速版"); err != nil {
+		t.Fatalf("click H3 Flash 极速版 on Card 3 failed: %v", err)
 	}
 
 	// Cooldown clear + task switching + simplified options overlay
@@ -328,7 +327,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("click open overlay options failed: %v", err)
 	}
 	for _, want := range []string{
-		"任务玩法", "其他进阶玩法：", "自定义 HF / 网盘模型", "通用 ComfyUI", "纯开机",
+		"显卡策略与进阶选项",
 		"智能挑卡", "省点模式", "高级自定义", "成片自动存进 Google Drive",
 	} {
 		if !idleTester.HasText(want) {
@@ -336,6 +335,9 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		}
 	}
 	for _, unwanted := range []string{
+		"任务玩法",
+		"其他进阶玩法：",
+		"定时预约",
 		"跑完自动关机省点（全应用统一设置）",
 		"同时生成 cloudflared 跨设备临时链接（可选）",
 		"开启 sol-attn 稀疏加速（推荐）",
@@ -362,8 +364,8 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if idleTester.HasText("目标显卡缺货时自动排队重试") {
 		t.Fatalf("removed EnablePoliteQueue toggle should not appear in custom GPU strategy: %q", idleTester.Texts())
 	}
-	if !idleTester.HasText("定时预约适合明天低峰自动开，持续守候适合现在挂着等卡（错过超 10 分钟自动过期不误启）") {
-		t.Fatalf("missing mutual-exclusion hint next to scheduled start: %q", idleTester.Texts())
+	if idleTester.HasText("清晨错峰定时预约") {
+		t.Fatalf("removed scheduled start toggle should not appear in custom GPU strategy: %q", idleTester.Texts())
 	}
 	if err := idleTester.Click("智能挑卡"); err != nil {
 		t.Fatalf("click 智能挑卡 failed: %v", err)
@@ -387,7 +389,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("expected 2轮保底 L4 badge on Bento strategy card: %q", idleTester.Texts())
 	}
 
-	// 1b. 31B shortage error banner offers one-click "改用 L4 轻量版" and "预约 07:00 抢卡"
+	// 1b. 31B shortage error banner offers one-click "改用 L4 轻量版" and "开启 8h 持续守候"
 	shortSvc := makeDemoService(app.SectionHome, false, true)
 	shortAccID := shortSvc.Settings.SelectedAccountID
 	shortAcc := shortSvc.Settings.Accounts[0]
@@ -402,7 +404,7 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	shortUI := uiapp.NewMainUI(shortSvc)
 	shortUI.ForceTheme = "dark"
 	shortTester := ui.NewTester(shortUI.View, 1160, 760)
-	if !shortTester.HasText("改用 L4 轻量版") || !shortTester.HasText("预约 07:00 抢卡") {
+	if !shortTester.HasText("改用 L4 轻量版") || !shortTester.HasText("开启 8h 持续守候") {
 		t.Fatalf("missing 31B shortage fallback recovery actions: %q", shortTester.Texts())
 	}
 
@@ -415,13 +417,13 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	for _, want := range []string{
 		"2374.8", "Personal", "G4 → A100", "2轮保底 L4", "开 ComfyUI", "后台",
 		"CU 余额与速率", "实时负载", "当前任务", "空闲自动关机", "挑卡与守候",
-		"调整策略与进阶选项", "点此关机", "账单 ›", "账号与活跃会话 (3)",
+		"调整策略与进阶选项", "点此关机", "账单 ›", "账号与运行机器 (3 账号 · 2 台运行中)",
 	} {
 		if !tt.HasText(want) {
 			t.Fatalf("missing %q on running 3x2 dashboard: %q", want, tt.Texts())
 		}
 	}
-	for _, unwanted := range []string{"算力续航", "本机通道", "更多玩法"} {
+	for _, unwanted := range []string{"算力续航", "本机通道", "更多玩法", "账号与活跃会话", "运行中的云端机器 (2)"} {
 		if tt.HasText(unwanted) {
 			t.Fatalf("unexpected removed element %q on running dashboard: %q", unwanted, tt.Texts())
 		}
@@ -429,8 +431,8 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if err := tt.Click("40m"); err != nil {
 		t.Fatalf("click 40m failed: %v", err)
 	}
-	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 40 || acc.QueueDrainMinutes != 40 {
-		t.Fatalf("expected 40m after click, got idle=%d drain=%d", acc.IdleTimeoutMinutes, acc.QueueDrainMinutes)
+	if acc, _ := svc.SelectedAccount(); acc.IdleTimeoutMinutes != 40 {
+		t.Fatalf("expected 40m after click, got idle=%d", acc.IdleTimeoutMinutes)
 	}
 	if err := tt.Click("点此关机"); err != nil {
 		t.Fatalf("click 点此关机 failed: %v", err)
@@ -513,16 +515,42 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		t.Fatalf("click tab 主页 failed: %v", err)
 	}
 
-	// 3. Onboarding wizard renders cleanly
+	// 3. Onboarding wizard renders cleanly as a 2-step flow (no Step 3 tour)
 	obSvc := makeDemoService(app.SectionHome, true, false)
 	obUI := uiapp.NewMainUI(obSvc)
 	obUI.ForceTheme = "dark"
 	obTester := ui.NewTester(obUI.View, 1160, 720)
-	if !obTester.HasText("欢迎使用 Colab Tools") || !obTester.HasText("一键安装 google-colab-cli") {
+	if !obTester.HasText("欢迎使用 Colab Tools") || !obTester.HasText("一键安装 google-colab-cli") || !obTester.HasText("2. 绑定 Google 账号") {
 		t.Fatalf("missing onboarding elements: %q", obTester.Texts())
 	}
+	if obTester.HasText("3. 30 秒快速上手") {
+		t.Fatalf("removed Step 3 tour must not appear in 2-step onboarding: %q", obTester.Texts())
+	}
 
-	// 4. Popover companion HUD renders cleanly (idle hides 0% cards; running shows 续命 only when AutoShutdownEnabled; zero SSH/Browser/大屏)
+	// 4. Popover companion HUD renders cleanly (idle hides 0% cards; multi overview removes duplicate nav row and routes 启 via DeployNow)
+	multiPopSvc := makeDemoService(app.SectionHome, false, false)
+	labAcc := multiPopSvc.Settings.Accounts[2]
+	labAcc.DeployRecipe = core.RecipeH3Video
+	labAcc.H3Variant = core.H3VariantCustom
+	labAcc.H3DriveOnly = false
+	labAcc.H3CustomHFRepo = "bad; rm -rf /"
+	multiPopSvc.Settings.Accounts[2] = labAcc
+	multiPop := uiapp.NewPopoverUI(multiPopSvc)
+	multiPop.OverviewMode = true
+	multiPop.ForceTheme = "dark"
+	multiPopTester := ui.NewTester(multiPop.View, 420, 620)
+	for _, unwanted := range []string{"打开主页", "管理账号", "偏好设置"} {
+		if multiPopTester.HasText(unwanted) {
+			t.Fatalf("unexpected duplicate nav button %q in multi-account popover: %q", unwanted, multiPopTester.Texts())
+		}
+	}
+	if err := multiPopTester.Click("启"); err != nil {
+		t.Fatalf("click 启 on multi-account popover failed: %v", err)
+	}
+	if gotToast := multiPopSvc.ViewState().ToastMessage; gotToast == "" {
+		t.Fatalf("expected DeployNow parameter validation toast when clicking 启 with invalid custom HF repo")
+	}
+
 	idlePop := uiapp.NewPopoverUI(cleanIdleSvc)
 	idlePop.ForceTheme = "dark"
 	idlePopTester := ui.NewTester(idlePop.View, 420, 560)
@@ -807,7 +835,7 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	idleUI.ForceTheme = "dark"
 	renderPNG(t, idleUI.View, 1160, 760, filepath.Join(outDir, "preview-deploy-h3.png"))
 
-	// 3. Centered Overlay options inspector over 4x2 Bento
+	// 3. Centered Overlay options inspector over 3x2 Bento
 	customSvc := makeDemoService(app.SectionHome, false, true)
 	cAcc := customSvc.Settings.Accounts[0]
 	cAcc.GPUStrategy = core.GPUStrategyCustom
@@ -815,11 +843,6 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	cAcc.QueueFallbackEnabled = true
 	cAcc.QueueFallbackAfterRounds = 2
 	cAcc.QueueFallbackTarget = core.AccL4
-	cAcc.ScheduledStartEnabled = true
-	cAcc.ScheduledStartHour = 7
-	cAcc.ScheduledStartMinute = 0
-	nf := core.NextScheduledFireDate(7, 0, time.Now())
-	cAcc.ScheduledNextFireAt = &nf
 	customSvc.Settings.Accounts[0] = cAcc
 	customUI := uiapp.NewMainUI(customSvc)
 	customUI.PreviewMode = true
@@ -827,189 +850,19 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	customUI.ShowHomeOptions = true
 	renderPNG(t, customUI.View, 1160, 760, filepath.Join(outDir, "preview-settings-queue.png"))
 
-	// 4. LLM Proxy mode with centered Overlay integrations inspector (1160x760)
-	llmSvc := makeDemoService(app.SectionHome, false, true)
-	llmSvc.ApplyDeployRecipe(llmSvc.Settings.Accounts[0].ID, core.RecipeLLMProxy)
-	llmUI := uiapp.NewMainUI(llmSvc)
-	llmUI.PreviewMode = true
-	llmUI.ForceTheme = "dark"
-	llmUI.ShowHomeOptions = true
-	renderPNG(t, llmUI.View, 1160, 760, filepath.Join(outDir, "preview-settings-integrations.png"))
-
-	// 5. Onboarding wizard
+	// 4. Onboarding wizard
 	obSvc := makeDemoService(app.SectionHome, true, false)
 	obUI := uiapp.NewMainUI(obSvc)
 	obUI.PreviewMode = true
 	obUI.ForceTheme = "dark"
 	renderPNG(t, obUI.View, 1160, 720, filepath.Join(outDir, "preview-onboarding.png"))
 
-	// 5b. History & Consumption Ledger tab (dark 1160x760)
-	histSvc := makeDemoService(app.SectionHistory, false, false)
-	histUI := uiapp.NewMainUI(histSvc)
-	histUI.PreviewMode = true
-	histUI.ForceTheme = "dark"
-	renderPNG(t, histUI.View, 1160, 760, filepath.Join(outDir, "preview-history.png"))
-
-	// 6. Popover single + multi-account
+	// 5. Popover single-account HUD
 	singleSvc := makeDemoService(app.SectionHome, false, false)
 	singleSvc.Settings.Accounts = singleSvc.Settings.Accounts[:1]
 	popSingle := uiapp.NewPopoverUI(singleSvc)
 	popSingle.ForceTheme = "dark"
 	renderPNG(t, popSingle.View, 420, 620, filepath.Join(outDir, "preview-dashboard.png"))
-
-	multiSvc := makeDemoService(app.SectionHome, false, false)
-	popMulti := uiapp.NewPopoverUI(multiSvc)
-	popMulti.ForceTheme = "dark"
-	popMulti.OverviewMode = true
-	renderPNG(t, popMulti.View, 420, 540, filepath.Join(outDir, "preview-multi-account.png"))
-
-	if qaDir := os.Getenv("COLABTOOLS_EXPORT_QA"); qaDir != "" {
-		idleLight := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, true))
-		idleLight.PreviewMode = true
-		idleLight.ForceTheme = "light"
-		renderPNG(t, idleLight.View, 1160, 760, filepath.Join(qaDir, "qa-home-idle-light.png"))
-
-		setLight := uiapp.NewMainUI(makeDemoService(app.SectionSettings, false, true))
-		setLight.PreviewMode = true
-		setLight.ForceTheme = "light"
-		renderPNG(t, setLight.View, 1160, 760, filepath.Join(qaDir, "qa-settings-light.png"))
-
-		histLight := uiapp.NewMainUI(makeDemoService(app.SectionHistory, false, false))
-		histLight.PreviewMode = true
-		histLight.ForceTheme = "light"
-		renderPNG(t, histLight.View, 1160, 760, filepath.Join(qaDir, "qa-history-light.png"))
-
-		shortSvc := makeDemoService(app.SectionHome, false, true)
-		sAcc := shortSvc.Settings.Accounts[0]
-		sAcc.DeployRecipe = core.RecipeH3Video
-		sAcc.H3Variant = core.H3VariantOriginal
-		shortSvc.Settings.Accounts[0] = sAcc
-		sRT := shortSvc.Runtime[sAcc.ID]
-		sRT.LastErrorTitle = "大卡暂时无货"
-		sRT.LastError = "G4 / A100 当前暂无库存 (503)，已停止排队"
-		sRT.LastAllocHadShortage = true
-		shortSvc.Runtime[sAcc.ID] = sRT
-		shortUI := uiapp.NewMainUI(shortSvc)
-		shortUI.PreviewMode = true
-		shortUI.ForceTheme = "dark"
-		renderPNG(t, shortUI.View, 1160, 760, filepath.Join(qaDir, "qa-shortage-fallback-dark.png"))
-
-		bareSvc := makeDemoService(app.SectionHome, false, false)
-		bAcc := bareSvc.Settings.Accounts[0]
-		bAcc.H3Variant = core.H3VariantOriginal
-		bareSvc.Settings.Accounts[0] = bAcc
-		bRT := bareSvc.Runtime[bAcc.ID]
-		bRT.ActiveHardware = "L4"
-		bRT.GPUName = "NVIDIA L4"
-		bRT.VRAMUsedMB = 0
-		bRT.VRAMTotalMB = 23034
-		bRT.GPUUtilPercent = 0
-		bRT.CURatePerHour = 2.33
-		bRT.ServerHealthy = false
-		bRT.DeployRunning = false
-		bRT.QueueRunning = 0
-		bRT.QueuePending = 0
-		bRT.RenderedVideoCount = 0
-		bRT.WorkloadDetail = ""
-		bRT.DeployLogTail = "=== 云端实时状态 ===\n部署进程: 未运行\n端口 :8188: 未监听\nComfyUI 目录: 尚未安装\nGoogle Drive: 未挂载\n\n云端机器上目前没有任何部署记录。\n这台机器是刚开机或之前启动的裸机，尚未安装 ComfyUI，点击「立即部署」即可开始自动安装。"
-		bareSvc.Runtime[bAcc.ID] = bRT
-
-		bareUI := uiapp.NewMainUI(bareSvc)
-		bareUI.PreviewMode = true
-		bareUI.ForceTheme = "dark"
-		renderPNG(t, bareUI.View, 1160, 760, filepath.Join(qaDir, "qa-bare-l4-dark.png"))
-
-		bareUI.ShowDeployLog = true
-		renderPNG(t, bareUI.View, 1160, 760, filepath.Join(qaDir, "qa-deploy-log-overlay.png"))
-
-		perQSvc := makeDemoService(app.SectionHome, false, true)
-		pAcc := perQSvc.Settings.Accounts[0]
-		pAcc.QueuePersistentMode = true
-		pAcc.QueuePersistentMaxHours = 8
-		perQSvc.Settings.Accounts[0] = pAcc
-		pRT := perQSvc.Runtime[pAcc.ID]
-		nextTry := time.Now().Add(9*time.Minute + 25*time.Second)
-		pRT.Phase = core.InstancePhase{
-			Kind:            core.PhaseQueuing,
-			QueueAttempt:    7,
-			QueueMax:        5,
-			QueuePersistent: true,
-			QueueMaxHours:   8,
-			NextRetryAt:     &nextTry,
-			TargetsSummary:  "G4 → A100",
-		}
-		perQSvc.Runtime[pAcc.ID] = pRT
-		perQUI := uiapp.NewMainUI(perQSvc)
-		perQUI.PreviewMode = true
-		perQUI.ForceTheme = "dark"
-		renderPNG(t, perQUI.View, 1160, 760, filepath.Join(qaDir, "qa-persistent-queue-dark.png"))
-
-		promptSvc := makeDemoService(app.SectionHome, false, false)
-		promptSvc.PresentActionPrompt(&core.UserActionPrompt{
-			ID:             "qa-drive-auth-prep",
-			Kind:           core.PromptDriveAuth,
-			AccountID:      promptSvc.Settings.SelectedAccountID,
-			Title:          "请稍留片刻：即将自动打开浏览器授权 Google Drive",
-			Message:        "授权账号：主账号 AI Ultra（demo-user@example.com）\nGoogle 每次新开机挂载云盘都需确认一次授权，请先别离开电脑：\n第 1 步（进行中）：正在申请云端机器并准备授权链接（约 15 秒），就绪后会自动拉起浏览器…\n第 2 步：在自动弹出的浏览器页面核对上方账号并点击「允许 / Allow」。\n第 3 步：网页提示授权完成后，回到这里点击「我已点完允许，继续」。",
-			SecondaryLabel: "先不挂，纯云端跑",
-			CancelLabel:    "收起提醒",
-		})
-		promptUI := uiapp.NewMainUI(promptSvc)
-		promptUI.PreviewMode = true
-		promptUI.ForceTheme = "dark"
-		renderPNG(t, promptUI.View, 980, 660, filepath.Join(qaDir, "qa-drive-auth-preparing-980x660.png"))
-
-		promptSvc.PresentActionPrompt(&core.UserActionPrompt{
-			ID:             "qa-drive-auth",
-			Kind:           core.PromptDriveAuth,
-			AccountID:      promptSvc.Settings.SelectedAccountID,
-			Title:          "需要你授权 Google Drive（已自动打开浏览器）",
-			Message:        "授权账号：主账号 AI Ultra（demo-user@example.com）\n请按以下 3 步完成授权，完成后模型、工作流与新成片将自动连接 Google Drive：\n第 1 步：切换到刚自动打开的浏览器页面（如未弹出请点下方蓝色按钮）。\n第 2 步：确认页面登录的是上方 Google 账号，点击「允许 / Allow」。\n第 3 步：网页提示授权成功后，切回这里点击「我已点完允许，继续」。",
-			URL:            "https://accounts.google.com/o/oauth2/auth?demo=1",
-			PrimaryLabel:   "我已点完允许，继续",
-			SecondaryLabel: "先不挂，纯云端跑",
-			CancelLabel:    "取消",
-		})
-		renderPNG(t, promptUI.View, 980, 660, filepath.Join(qaDir, "qa-drive-auth-modal-dark.png"))
-
-		reclaimSvc := makeDemoService(app.SectionHome, false, true)
-		rAccID := reclaimSvc.Settings.SelectedAccountID
-		rRT := reclaimSvc.Runtime[rAccID]
-		rRT.LastUnexpectedStopMsg = "刚才的 L4 在 20:48 被 Google 服务端回收停机（非本软件关机），点右侧可立即重开"
-		reclaimSvc.Runtime[rAccID] = rRT
-		reclaimUI := uiapp.NewMainUI(reclaimSvc)
-		reclaimUI.PreviewMode = true
-		reclaimUI.ForceTheme = "dark"
-		renderPNG(t, reclaimUI.View, 1160, 860, filepath.Join(qaDir, "qa-power-strip-offline-dark.png"))
-
-		runHeroQA := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, false))
-		runHeroQA.PreviewMode = true
-		runHeroQA.ForceTheme = "dark"
-		renderPNG(t, runHeroQA.View, 1160, 860, filepath.Join(qaDir, "qa-power-strip-running-dark.png"))
-
-		// v0.3.16 key QA screenshots
-		v0316OffUI := uiapp.NewMainUI(makeDemoService(app.SectionHome, false, true))
-		v0316OffUI.PreviewMode = true
-		v0316OffUI.ForceTheme = "dark"
-		renderPNG(t, v0316OffUI.View, 1160, 760, filepath.Join(qaDir, "qa-v0316-offline-dark.png"))
-
-		v0316RunSvc := makeDemoService(app.SectionHome, false, false)
-		v0316RunUI := uiapp.NewMainUI(v0316RunSvc)
-		v0316RunUI.PreviewMode = true
-		v0316RunUI.ForceTheme = "dark"
-		renderPNG(t, v0316RunUI.View, 1160, 760, filepath.Join(qaDir, "qa-v0316-running-dark.png"))
-
-		v0316ConfirmSvc := makeDemoService(app.SectionHome, false, false)
-		v0316ConfirmSvc.RequestConfirmStop(v0316ConfirmSvc.Settings.SelectedAccountID)
-		v0316ConfirmUI := uiapp.NewMainUI(v0316ConfirmSvc)
-		v0316ConfirmUI.PreviewMode = true
-		v0316ConfirmUI.ForceTheme = "dark"
-		renderPNG(t, v0316ConfirmUI.View, 1160, 760, filepath.Join(qaDir, "qa-v0316-confirm-stop.png"))
-
-		v0316IdlePop := uiapp.NewPopoverUI(makeDemoService(app.SectionHome, false, true))
-		v0316IdlePop.ForceTheme = "dark"
-		renderPNG(t, v0316IdlePop.View, 420, 520, filepath.Join(qaDir, "qa-v0316-popover-idle.png"))
-	}
 }
 
 func TestConcurrentBackgroundMutationsAndUIRenderNoRace(t *testing.T) {
@@ -1031,7 +884,7 @@ func TestConcurrentBackgroundMutationsAndUIRenderNoRace(t *testing.T) {
 			default:
 				svc.ShowToast("并发状态更新测试")
 				svc.SetShowingOnboarding(step%2 == 0)
-				svc.SetOnboardingStep((step % 3) + 1)
+				svc.SetOnboardingStep((step % 2) + 1)
 				svc.SetSection(app.MainSection(step % 4))
 				svc.UpdateSettings(func(s *core.AppSettings) {
 					if step%2 == 0 {
@@ -1095,8 +948,6 @@ func TestV0320PopoverScrollOnboardingAndMinHeightOverlays(t *testing.T) {
 	rt.DriveMountedKnown = true
 	rt.DriveActuallyMounted = false
 	rt.RenderedVideoCount = 2
-	rt.CloudflaredActive = true
-	rt.DisplayUIURL = "https://demo.trycloudflare.com"
 	minSvc.Runtime[accID] = rt
 
 	m := uiapp.NewMainUI(minSvc)
@@ -1117,18 +968,6 @@ func TestV0320PopoverScrollOnboardingAndMinHeightOverlays(t *testing.T) {
 		t.Fatal("expected non-nil MainUI render with DeployLog overlay at 980x660")
 	}
 	m.ShowDeployLog = false
-
-	if qaDir := os.Getenv("COLAB_TOOLS_V0320_QA_DIR"); qaDir != "" {
-		_ = os.MkdirAll(qaDir, 0o755)
-		renderPNG(t, pMulti.View, 420, 620, filepath.Join(qaDir, "v0320-popover-multi-scroll.png"))
-		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0320-home-temp-disk-alert-980x660.png"))
-		m.ShowHomeOptions = true
-		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0320-options-overlay-980x660.png"))
-		m.ShowHomeOptions = false
-		m.ShowDeployLog = true
-		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0320-deploy-log-overlay-980x660.png"))
-		m.ShowDeployLog = false
-	}
 
 	for _, kind := range []core.ActionPromptKind{
 		core.PromptConfirmStopAll,
@@ -1199,20 +1038,14 @@ func TestV0323RunningMachinesCardAndWebStopGuideModal(t *testing.T) {
 		}
 	}
 
-	if qaDir := os.Getenv("COLAB_TOOLS_V0323_QA_DIR"); qaDir != "" {
-		_ = os.MkdirAll(qaDir, 0o755)
-		renderPNG(t, m.View, 1160, 880, filepath.Join(qaDir, "v0323-running-machines-mixed-1160x880.png"))
-		renderPNG(t, m.View, 980, 860, filepath.Join(qaDir, "v0323-running-machines-mixed-980x860.png"))
-	}
-
-	// Verify duplicate-bound account with same email deduplicates endpoints & burn rate cleanly
+	// Verify duplicate-bound account with same email deduplicates endpoints & burn rate cleanly in unified multi-account table
 	dupAcc := acc
 	dupAcc.ID = "dup-same-email"
 	svc.Settings.Accounts = append(svc.Settings.Accounts, dupAcc)
 	svc.Runtime[dupAcc.ID] = rt
 	dupTester := ui.NewTester(m.View, 980, 960)
-	if !dupTester.HasText("运行中的云端机器 (2)") || !dupTester.HasText("实时总扣点 13.87 CU/h") {
-		t.Fatalf("expected duplicate email account deduplicated to 2 machines & 13.87 CU/h, got %q", dupTester.Texts())
+	if !dupTester.HasText("账号与运行机器 (2 账号 · 2 台运行中)") || !dupTester.HasText("实时总扣点 13.87 CU/h") || !dupTester.HasText("需去网页关") {
+		t.Fatalf("expected duplicate email account deduplicated to 2 machines & 13.87 CU/h in unified table, got %q", dupTester.Texts())
 	}
 	svc.Settings.Accounts = []core.AccountProfile{acc}
 
@@ -1239,10 +1072,6 @@ func TestV0323RunningMachinesCardAndWebStopGuideModal(t *testing.T) {
 			t.Fatalf("missing %q in web stop guide modal: %q", want, modalTester.Texts())
 		}
 	}
-	if qaDir := os.Getenv("COLAB_TOOLS_V0323_QA_DIR"); qaDir != "" {
-		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0323-web-stop-guide-980x660.png"))
-	}
-
 	if err := modalTester.Click("打开 Colab 网页 ↗"); err != nil {
 		t.Fatalf("click open colab web button failed: %v", err)
 	}

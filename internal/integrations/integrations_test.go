@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -74,10 +73,8 @@ func TestOpenCodeCodexPerAccountIsolationAndBackups(t *testing.T) {
 	if strings.Count(txt, "[model_providers."+id1.CodexTableKey+"]") != 1 {
 		t.Fatalf("expected exactly one managed table, got:\n%s", txt)
 	}
-	if runtime.GOOS != "windows" {
-		if st, err := os.Stat(bakDir); err == nil && st.Mode().Perm() != 0o700 {
-			t.Fatalf("backup dir permissions must be 0700, got %o", st.Mode().Perm())
-		}
+	if st, err := os.Stat(bakDir); err == nil && st.Mode().Perm() != 0o700 {
+		t.Fatalf("backup dir permissions must be 0700, got %o", st.Mode().Perm())
 	}
 }
 
@@ -130,6 +127,21 @@ func TestCCSwitchZeroCGOWALBackupAndActiveProtection(t *testing.T) {
 	entries, _ := os.ReadDir(bakDir)
 	if len(entries) == 0 {
 		t.Fatal("expected VACUUM INTO WAL-safe backup file")
+	}
+
+	// Refuses writing when CC Switch schema changed (missing expected columns)
+	badDBPath := filepath.Join(tmp, "cc-switch-changed.db")
+	badDB, err := sql.Open("sqlite", "file:"+filepath.ToSlash(badDBPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = badDB.Exec(`CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badDB.Close()
+	if _, err := integrations.SyncCCSwitch("colab-standby", "Colab Qwen", "https://demo.trycloudflare.com", "sk-test", "qwen", 262144, "L4", "Acc", badDBPath, bakDir); err == nil {
+		t.Fatal("must refuse writing when CC Switch providers table schema is incompatible")
 	}
 }
 

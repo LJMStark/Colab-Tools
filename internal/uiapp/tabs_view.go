@@ -2,12 +2,10 @@ package uiapp
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/LJMStark/Colab-Tools/internal/app"
 	"github.com/LJMStark/Colab-Tools/internal/core"
@@ -199,149 +197,17 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 			}
 		})
 	}
-
-	ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
-
-	// Off-Peak Scheduled Start
-	schOn := acc.ScheduledStartEnabled
-	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-		ui.Column(c).Grow(1).Gap(2).Children(func() {
-			ui.Text(c, "清晨错峰定时预约（推荐 06:30–07:30）").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
-			ui.Text(c, "定时预约适合明天低峰自动开，持续守候适合现在挂着等卡（错过超 10 分钟自动过期不误启）").FontSize(11.5).TextColor(pal.TextMuted)
-		})
-		if ui.Switch(c, &schOn).Clicked() || schOn != acc.ScheduledStartEnabled {
-			cp := acc
-			cp.ScheduledStartEnabled = schOn
-			if schOn {
-				nf := core.NextScheduledFireDate(cp.ScheduledStartHour, cp.ScheduledStartMinute, time.Now())
-				cp.ScheduledNextFireAt = &nf
-			} else {
-				cp.ScheduledNextFireAt = nil
-			}
-			m.Svc.UpdateAccount(cp)
-		}
-	})
-
-	if acc.ScheduledStartEnabled {
-		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-			for _, hm := range [][2]int{{6, 30}, {7, 0}, {7, 30}} {
-				h, minVal := hm[0], hm[1]
-				var tint *ui.Color
-				if acc.ScheduledStartHour == h && acc.ScheduledStartMinute == minVal {
-					t := pal.Emerald
-					tint = &t
-				}
-				SmallActionButton(c, pal, fmt.Sprintf("%02d:%02d", h, minVal), tint, false, func() {
-					cp := acc
-					cp.ScheduledStartHour = h
-					cp.ScheduledStartMinute = minVal
-					nf := core.NextScheduledFireDate(h, minVal, time.Now())
-					cp.ScheduledNextFireAt = &nf
-					m.Svc.UpdateAccount(cp)
-				})
-			}
-			SmallActionButton(c, pal, "−15分", nil, false, func() {
-				m.adjustScheduleMinutes(acc, -15)
-			})
-			ui.Textf(c, "%02d:%02d", acc.ScheduledStartHour, acc.ScheduledStartMinute).FontSize(13.5).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
-			SmallActionButton(c, pal, "+15分", nil, false, func() {
-				m.adjustScheduleMinutes(acc, 15)
-			})
-			ui.Spacer(c)
-			var onceTint, dailyTint *ui.Color
-			if !acc.ScheduledStartRepeatDaily {
-				t := pal.Amber
-				onceTint = &t
-			} else {
-				t := pal.Emerald
-				dailyTint = &t
-			}
-			SmallActionButton(c, pal, "仅一次", onceTint, false, func() {
-				cp := acc
-				cp.ScheduledStartRepeatDaily = false
-				nf := core.NextScheduledFireDate(cp.ScheduledStartHour, cp.ScheduledStartMinute, time.Now())
-				cp.ScheduledNextFireAt = &nf
-				m.Svc.UpdateAccount(cp)
-			})
-			SmallActionButton(c, pal, "每天重复", dailyTint, false, func() {
-				cp := acc
-				cp.ScheduledStartRepeatDaily = true
-				nf := core.NextScheduledFireDate(cp.ScheduledStartHour, cp.ScheduledStartMinute, time.Now())
-				cp.ScheduledNextFireAt = &nf
-				m.Svc.UpdateAccount(cp)
-			})
-		})
-		if acc.ScheduledNextFireAt != nil {
-			ui.Textf(c, "下次触发：%s", acc.ScheduledNextFireAt.Format("2006年01月02日 15:04")).FontSize(12).FontFeatures("tnum").TextColor(pal.Emerald)
-		}
-	}
-
-	// Local 6-Slot Allocation Hit-Rate Reference
-	hwList := acc.Tier.QueueableAccelerators()
-	selectedHW := m.SelectedInsightHW
-	if selectedHW == "" && len(hwList) > 0 {
-		selectedHW = hwList[0].ShortChipLabel()
-	}
-	totalSamples, slots, recSummary := m.Svc.InsightsSnapshot(selectedHW)
-	if totalSamples > 0 {
-		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
-			ui.Textf(c, "本机时段命中率（共 %d 次记录）", totalSamples).FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted)
-			ui.Spacer(c)
-			for _, hw := range hwList {
-				label := hw.ShortChipLabel()
-				var tint *ui.Color
-				if label == selectedHW {
-					t := pal.Sky
-					tint = &t
-				}
-				SmallActionButton(c, pal, label, tint, false, func() {
-					m.SelectedInsightHW = label
-				})
-			}
-		})
-		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(8).Children(func() {
-			for _, slot := range slots {
-				s := slot
-				ui.Column(c).FillWidth().AlignItems(ui.Center).Gap(4).Children(func() {
-					rate, hasData := s.Rate()
-					pctLabel := "—"
-					if hasData {
-						pctLabel = fmt.Sprintf("%d%%", int(math.Round(rate*100)))
-					}
-					ui.Text(c, pctLabel).FontSize(12).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
-					ui.Box(c).FillWidth().Height(36).Draw(func(p *ui.Painter, r ui.Rect) {
-						p.Fill(r, pal.SubtleBg, 5)
-						if hasData && rate > 0 {
-							h := max(float32(6), r.H*float32(rate))
-							col := pal.Amber
-							if rate >= 0.5 {
-								col = pal.Emerald
-							}
-							p.Fill(ui.Rect{X: r.X, Y: r.Y + r.H - h, W: r.W, H: h}, col, 5)
-						}
-					})
-					ui.Text(c, s.Label).FontSize(11).FontFeatures("tnum").TextColor(pal.TextMuted)
-				})
-			}
-		})
-		if recSummary != "" {
-			ui.Text(c, "✦ "+recSummary).FontSize(12).TextColor(pal.Sky)
-		}
-	}
 }
 
 func (m *MainUI) renderPersistentQueueSection(c *ui.Context, pal Palette, acc core.AccountProfile) {
-	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
 	applyToggle := func(next bool) {
 		cp := acc
 		cp.QueuePersistentMode = next
-		cp.QueuePersistentMaxHours = 8
+		if cp.QueuePersistentMaxHours <= 0 {
+			cp.QueuePersistentMaxHours = 8
+		}
 		if next && !cp.AutoShutdownEnabled {
 			cp.AutoShutdownEnabled = true
-			if isVideo {
-				cp.StopAfterQueueDrained = true
-			}
 		}
 		m.Svc.UpdateAccount(cp)
 	}
@@ -353,24 +219,14 @@ func (m *MainUI) renderPersistentQueueSection(c *ui.Context, pal Palette, acc co
 		}).Children(func() {
 			ui.Text(c, "抢不到就持续守候（低频挂机，最长 8 小时）").FontSize(13).FontWeight(600).TextColor(pal.TextPrimary)
 			ui.Text(c, "前 3 轮快速试，之后每 8–12 分钟探一次防风控；遇限流立刻停，抢到自动开启闲置关机").FontSize(11.5).TextColor(pal.TextMuted)
+			if acc.UseGoogleDrive {
+				ui.Text(c, "提醒：已勾选挂 Google Drive，抢到卡后需在 90 秒内点浏览器「允许」；若人不在电脑前，超时会自动切纯云端继续跑（记得手动下成片）。").FontSize(11.5).TextColor(pal.Amber)
+			}
 		})
 		if ui.Switch(c, &persistentOn).Clicked() || persistentOn != acc.QueuePersistentMode {
 			applyToggle(persistentOn)
 		}
 	})
-}
-
-func (m *MainUI) adjustScheduleMinutes(acc core.AccountProfile, delta int) {
-	total := (acc.ScheduledStartHour*60 + acc.ScheduledStartMinute + delta) % (24 * 60)
-	if total < 0 {
-		total += 24 * 60
-	}
-	cp := acc
-	cp.ScheduledStartHour = total / 60
-	cp.ScheduledStartMinute = total % 60
-	nf := core.NextScheduledFireDate(cp.ScheduledStartHour, cp.ScheduledStartMinute, time.Now())
-	cp.ScheduledNextFireAt = &nf
-	m.Svc.UpdateAccount(cp)
 }
 
 // MARK: - Contextual LLM Integrations Panel (Shown ONLY when user picks "大模型代理")
@@ -382,7 +238,7 @@ func (m *MainUI) renderIntegrationsPanel(c *ui.Context, pal Palette, acc core.Ac
 	SectionCard(c, pal, "编程工具接入（开机后自动安全同步，不改你原本的官方订阅）", "", func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "勾选你平时用的工具，大模型开机后自动写入待机渠道（写前 0600 备份、不存明文密钥）。").FontSize(12).TextColor(pal.TextMuted).Grow(1)
-			neutralPrecisionButton(c, pal, nil, "refresh", "重新检测", false, func() {
+			ActionBtn(c, pal, "重新检测", nil, "refresh", false, false, func() {
 				m.Svc.RefreshClientDetection()
 				m.Svc.ShowToast("已完成本机编程工具探测")
 			})
@@ -611,10 +467,10 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 					ui.Column(c).Grow(1).Gap(2).Children(func() {
 						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 							ui.Text(c, accCopy.DisplayName).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
-							recessedStatusPill(c, pal, nil, accCopy.Tier.DisplayName())
+							StatusPill(c, pal, nil, accCopy.Tier.DisplayName())
 							if isSel {
 								e := pal.Emerald
-								recessedStatusPill(c, pal, &e, "当前使用")
+								StatusPill(c, pal, &e, "当前使用")
 							}
 						})
 						email := accCopy.Email
@@ -820,7 +676,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 			ui.Row(c).Padding(3).Radius(9).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).Gap(2).Shrink(0).Children(func() {
 				for _, o := range [][2]string{{"system", "跟随系统"}, {"dark", "深色"}, {"light", "浅色"}} {
 					k, lbl := o[0], o[1]
-					segmentedOptionPill(c, pal, lbl, vs.ThemePreference == k, func() {
+					ChipToggle(c, pal, lbl, vs.ThemePreference == k, false, func() {
 						m.Svc.UpdateSettings(func(s *core.AppSettings) { s.ThemePreference = k })
 					})
 				}
@@ -848,7 +704,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 					{core.StatusBarDetailed, "详细"},
 				} {
 					k, lbl := o.mode, o.lbl
-					segmentedOptionPill(c, pal, lbl, cur == k, func() {
+					ChipToggle(c, pal, lbl, cur == k, false, func() {
 						m.Svc.UpdateSettings(func(s *core.AppSettings) { s.StatusBarMode = k })
 					})
 				}
@@ -883,11 +739,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 					if env.ColabVersion != "" {
 						ver = " v" + env.ColabVersion
 					}
-					bridge := ""
-					if env.UsingWSLBridge {
-						bridge = "（WSL2 桥接）"
-					}
-					detail = fmt.Sprintf("已就绪%s%s · %s", ver, bridge, env.ColabPath)
+					detail = fmt.Sprintf("已就绪%s · %s", ver, env.ColabPath)
 				} else if env.ColabBrokenReason != "" {
 					detail = env.ColabBrokenReason
 				}
@@ -896,12 +748,12 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 			})
 			if vs.CLIInstalled {
 				e := pal.Emerald
-				recessedStatusPill(c, pal, &e, "正常")
+				StatusPill(c, pal, &e, "正常")
 			} else {
 				a := pal.Amber
-				recessedStatusPill(c, pal, &a, "需安装")
+				StatusPill(c, pal, &a, "需安装")
 			}
-			neutralPrecisionButton(c, pal, nil, "refresh", "重新体检", vs.IsCheckingEnv, func() {
+			ActionBtn(c, pal, "重新体检", nil, "refresh", false, vs.IsCheckingEnv, func() {
 				go m.Svc.RefreshEnvironmentCheck()
 			})
 			SmallActionButton(c, pal, "开箱向导", nil, false, func() {
@@ -915,7 +767,7 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 		SectionCard(c, pal, "高级选项与一键重置", "平时不用动，折腾自定义脚本或目录时再展开", func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
 				e := pal.Emerald
-				neutralPrecisionButton(c, pal, &e, "", "恢复小白推荐默认", false, func() {
+				ActionBtn(c, pal, "恢复小白推荐默认", &e, "", false, false, func() {
 					m.Svc.ResetAccountToRecommendedDefaults(acc.ID)
 					m.DraftAccountID = ""
 				})
@@ -1019,9 +871,9 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, "Colab Tools").FontSize(16).Bold().TextColor(pal.TextPrimary)
 					a := pal.Amber
-					recessedStatusPill(c, pal, &a, "v"+app.AppVersion)
+					StatusPill(c, pal, &a, "v"+app.AppVersion)
 					s := pal.Sky
-					recessedStatusPill(c, pal, &s, "macOS")
+					StatusPill(c, pal, &s, "macOS")
 				})
 				ui.Text(c, "全调用 Google 官方 google-colab-cli · 纯 Go 零依赖 macOS 桌面控制台").FontSize(12).TextColor(pal.TextMuted)
 			})
@@ -1039,101 +891,5 @@ func (m *MainUI) renderSettingsPage(c *ui.Context, pal Palette) {
 				m.Svc.OpenColabPayPage()
 			})
 		})
-	})
-}
-
-func recessedStatusPill(c *ui.Context, pal Palette, dotCol *ui.Color, label string) {
-	ui.Row(c).
-		Padding(4, 9).
-		Radius(7).
-		Background(pal.RecessedBg).
-		Border(1, pal.RecessedBorder).
-		InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).
-		Gap(5).
-		AlignItems(ui.Center).
-		Shrink(0).
-		Children(func() {
-			if dotCol != nil {
-				DrawPrecisionLED(c, *dotCol, 9)
-			}
-			ui.Text(c, label).FontSize(11.5).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
-		})
-}
-
-func neutralPrecisionButton(c *ui.Context, pal Palette, dotCol *ui.Color, iconName, label string, disabled bool, onClick func()) {
-	el := ui.Row(c).
-		Padding(6, 12).
-		Radius(8).
-		Gap(6).
-		AlignItems(ui.Center).
-		Justify(ui.Center).
-		Shrink(0)
-
-	fg := pal.TextPrimary
-	if disabled {
-		fg = pal.TextFaint
-		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
-	} else {
-		top := pal.CardTop
-		bot := pal.RecessedBg
-		if el.Hovered() {
-			top = top.Mix(ui.RGB(255, 255, 255), 0.06)
-			bot = bot.Mix(pal.CardTop, 0.35)
-		}
-		el.LinearGradient(ui.LinearGradient{From: top, To: bot, Angle: 180}).
-			Border(1, pal.SubtleBorder).
-			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
-			Shadow(0, 1, 3, 0, pal.CardShadow).
-			Cursor(ui.CursorPointer)
-		if onClick != nil {
-			el.OnClick(onClick)
-		}
-	}
-
-	el.Children(func() {
-		if dotCol != nil && !disabled {
-			DrawPrecisionLED(c, *dotCol, 10)
-		}
-		if iconName != "" {
-			icCol := pal.TextMuted
-			if disabled {
-				icCol = pal.TextFaint
-			}
-			ToolbarIcon(c, iconName, 13, icCol)
-		}
-		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
-	})
-}
-
-func segmentedOptionPill(c *ui.Context, pal Palette, label string, active bool, onClick func()) {
-	el := ui.Row(c).
-		Padding(5, 11).
-		Radius(6.5).
-		Gap(5).
-		AlignItems(ui.Center).
-		Justify(ui.Center).
-		Shrink(0)
-
-	fg := pal.TextMuted
-	weight := 500
-	if active {
-		fg = pal.TextPrimary
-		weight = 600
-		el.Background(pal.CardTop).
-			Border(1, pal.SubtleBorder).
-			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
-			Shadow(0, 1, 2, 0, pal.CardShadow)
-	} else if el.Hovered() {
-		fg = pal.TextPrimary
-		el.Background(WithAlpha(pal.CardTop, 0.45))
-	}
-	if onClick != nil {
-		el.Cursor(ui.CursorPointer).OnClick(onClick)
-	}
-	el.Children(func() {
-		if active {
-			DrawPrecisionLED(c, pal.Amber, 8)
-		}
-		ui.Text(c, label).FontSize(12).FontWeight(weight).TextColor(fg).MaxLines(1)
 	})
 }

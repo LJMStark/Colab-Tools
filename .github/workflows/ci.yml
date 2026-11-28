@@ -22,11 +22,25 @@ jobs:
       - name: Verify Go toolchain
         run: go version
 
-      - name: Lint shell scripts
+      - name: Lint shell scripts & embedded Python
         run: |
-          bash -n scripts/package.sh
-          bash -n scripts/remote/start_server.sh
-          for f in scripts/templates/*.sh; do bash -n "$f"; done
+          cmp -s scripts/templates/llm-proxy.sh scripts/remote/start_server.sh
+          for f in scripts/package.sh scripts/remote/start_server.sh scripts/templates/*.sh docs/examples/*.sh; do
+            bash -n "$f" || exit 1
+          done
+          python3 - <<'PY'
+          import pathlib, re, tempfile, py_compile
+          for path in ['scripts/templates/comfyui-deploy.sh', 'scripts/templates/llm-proxy.sh', 'scripts/remote/start_server.sh']:
+              text = pathlib.Path(path).read_text(encoding='utf-8')
+              blocks = re.findall(r"<<'?(PY|PYTHON|EOF_PY)'?\n(.*?)\n\1", text, re.S)
+              assert blocks, f"no python heredoc found in {path}"
+              for _, code in blocks:
+                  with tempfile.NamedTemporaryFile('w', suffix='.py', delete=True) as tf:
+                      tf.write(code)
+                      tf.flush()
+                      py_compile.compile(tf.name, doraise=True)
+          print("Embedded Python syntax check OK")
+          PY
 
       - name: Vet and run race-checked tests
         run: |

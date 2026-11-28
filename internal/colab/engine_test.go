@@ -2,7 +2,9 @@ package colab_test
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,28 +18,37 @@ import (
 )
 
 type mockRunner struct {
-	mu       sync.Mutex
-	onShell  func(cmd string) runner.Result
-	commands []string
+	mu          sync.Mutex
+	onShell     func(cmd string) runner.Result
+	onShellOpts func(cmd string, opts runner.RunOptions) runner.Result
+	commands    []string
 }
 
-func (m *mockRunner) Run(_ context.Context, name string, args []string, _ runner.RunOptions) runner.Result {
+func (m *mockRunner) Run(_ context.Context, name string, args []string, opts runner.RunOptions) runner.Result {
 	cmd := name + " " + strings.Join(args, " ")
 	m.mu.Lock()
 	m.commands = append(m.commands, cmd)
 	fn := m.onShell
+	fnOpts := m.onShellOpts
 	m.mu.Unlock()
+	if fnOpts != nil {
+		return fnOpts(cmd, opts)
+	}
 	if fn != nil {
 		return fn(cmd)
 	}
 	return runner.Result{}
 }
 
-func (m *mockRunner) RunShell(_ context.Context, shellCmd string, _ runner.RunOptions) runner.Result {
+func (m *mockRunner) RunShell(_ context.Context, shellCmd string, opts runner.RunOptions) runner.Result {
 	m.mu.Lock()
 	m.commands = append(m.commands, shellCmd)
 	fn := m.onShell
+	fnOpts := m.onShellOpts
 	m.mu.Unlock()
+	if fnOpts != nil {
+		return fnOpts(shellCmd, opts)
+	}
 	if fn != nil {
 		return fn(shellCmd)
 	}
@@ -73,9 +84,9 @@ func TestStrictParsersHandleNamedSessionsAndRejectPartialUsage(t *testing.T) {
 [colab] m-s-abc123 | Hardware: L4 | Shape: Standard | Variant: GPU
 [?] m-s-orphan99 | Hardware: A100 | Shape: High-RAM | Variant: GPU
 `
-	sessions := colab.ParseSessions(out)
-	if len(sessions) != 2 {
-		t.Fatalf("expected 2 sessions, got %d", len(sessions))
+	sessions, err := colab.ParseSessionsStrict(out)
+	if err != nil || len(sessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d err=%v", len(sessions), err)
 	}
 	if sessions[0].Name != "colab" || sessions[0].IsOrphan {
 		t.Fatalf("unexpected first session: %+v", sessions[0])
@@ -116,9 +127,6 @@ func TestProvisionSession_412CheckErrorContinuesQueue(t *testing.T) {
 	})
 	if res.Outcome.Kind != core.OutcomeAllocated || res.Outcome.Hardware != "L4" {
 		t.Fatalf("expected 412 with usage checkErr to continue to L4 and allocate, got %+v", res.Outcome)
-	}
-	if len(res.ProbeRecords) != 2 || res.ProbeRecords[0].Succeeded || !res.ProbeRecords[1].Succeeded {
-		t.Fatalf("unexpected probe records: %+v", res.ProbeRecords)
 	}
 
 	// Only when checkErr == nil && len(activeSessions) > 0 should 412 abort early
@@ -285,23 +293,10 @@ func (d *driveTestRunner) LookPath(name string) string {
 	return ""
 }
 
-func TestEnsureCloudflaredFallbackURLAndDriveMountInteractive(t *testing.T) {
-	// 1. EnsureCloudflaredFallbackURL extracts valid trycloudflare URL
-	mr := &mockRunner{}
-	mr.onShell = func(cmd string) runner.Result {
-		if strings.Contains(cmd, "exec") {
-			return runner.Result{ExitCode: 0, Stdout: "CLOUDFLARED_URL=https://comfy-fallback-demo.trycloudflare.com\n"}
-		}
-		return runner.Result{ExitCode: 0}
-	}
-	eng := colab.NewEngine(mr, vault.New(vault.NewMemoryBackend()))
+func TestDriveMountInteractive(t *testing.T) {
 	acc := core.NewDefaultAccountProfile("CF", "cf@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
-	cfURL, err := eng.EnsureCloudflaredFallbackURL(context.Background(), acc, 8188)
-	if err != nil || cfURL != "https://comfy-fallback-demo.trycloudflare.com" {
-		t.Fatalf("expected trycloudflare URL, got %q err=%v", cfURL, err)
-	}
 
-	// 2. EnsureDriveMountedInteractive triggers auth callback, writes Enter on proceed=true, and verifies mount
+	// 1. EnsureDriveMountedInteractive triggers auth callback, writes Enter on proceed=true, and verifies mount
 	tmpDir := t.TempDir()
 	fakeColab := filepath.Join(tmpDir, "colab")
 	script := `#!/bin/sh
@@ -393,6 +388,7 @@ func TestParseSessionsStrictFlushValidationAndTelemetryDriveState(t *testing.T) 
 		wantErr bool
 	}{
 		{"ok", "FLUSH_OK workflows=2 snapshot_nodes=1\n", false},
+		{"substring_false_positive", "ERROR: NOT_FLUSH_OK\n", true},
 		{"skip", "FLUSH_SKIP=1\n", true},
 		{"no_drive", "FLUSH_NO_DRIVE=1\n", true},
 		{"empty", "\n", true},
@@ -412,28 +408,57 @@ func TestParseSessionsStrictFlushValidationAndTelemetryDriveState(t *testing.T) 
 		}
 	}
 
-	// 3. FetchRemoteTelemetry parses DRIVE_MOUNTED, EFFECTIVE_OUT_DIR, TEMP_OUT_VIDEOS, CLOUDFLARED_ACTIVE
+	// 3. FetchRemoteTelemetry parses DRIVE_MOUNTED, EFFECTIVE_OUT_DIR, TEMP_OUT_VIDEOS
 	mrTel := &mockRunner{
 		onShell: func(_ string) runner.Result {
 			return runner.Result{
 				ExitCode: 0,
-				Stdout:   "NV=NVIDIA L4, 1200, 23034, 5\nDRIVE_MOUNTED=0\nCLOUDFLARED_ACTIVE=1\nTEMP_OUT_VIDEOS=4\nEFFECTIVE_OUT_DIR=/content/output\nOUT_VIDEOS=3\nHEALTH=ok\n",
+				Stdout:   "NV=NVIDIA L4, 1200, 23034, 5\nDRIVE_MOUNTED=0\nTEMP_OUT_VIDEOS=4\nEFFECTIVE_OUT_DIR=/content/output\nOUT_VIDEOS=3\nHEALTH=ok\n",
 			}
 		},
 	}
 	engTel := colab.NewEngine(mrTel, vault.New(vault.NewMemoryBackend()))
 	tel := engTel.FetchRemoteTelemetry(context.Background(), acc)
-	if tel == nil || tel.DriveMounted == nil || *tel.DriveMounted != false || tel.TempOutputVideos == nil || *tel.TempOutputVideos != 4 || tel.EffectiveOutputDir != "/content/output" || !tel.CloudflaredActive || tel.RenderedVideoCount != 3 {
+	if tel == nil || tel.DriveMounted == nil || *tel.DriveMounted != false || tel.TempOutputVideos == nil || *tel.TempOutputVideos != 4 || tel.EffectiveOutputDir != "/content/output" || tel.RenderedVideoCount != 3 {
 		t.Fatalf("unexpected telemetry parsed: %+v", tel)
 	}
 
-	// 4. StopCloudflaredTunnel requires CLOUDFLARED_STOPPED=1 verification
-	mrStopBad := &mockRunner{onShell: func(_ string) runner.Result { return runner.Result{ExitCode: 0, Stdout: ""} }}
-	if err := colab.NewEngine(mrStopBad, vault.New(vault.NewMemoryBackend())).StopCloudflaredTunnel(context.Background(), acc); err == nil {
-		t.Fatal("StopCloudflaredTunnel must fail when CLOUDFLARED_STOPPED=1 is missing")
+	// 4. ParseSessionsStrict must NOT treat "10 active sessions" as empty
+	if _, err := colab.ParseSessionsStrict("10 active sessions\n"); err == nil {
+		t.Fatal("expected ParseSessionsStrict to reject malformed '10 active sessions' line instead of treating it as empty")
 	}
-	mrStopOK := &mockRunner{onShell: func(_ string) runner.Result { return runner.Result{ExitCode: 0, Stdout: "CLOUDFLARED_STOPPED=1\n"} }}
-	if err := colab.NewEngine(mrStopOK, vault.New(vault.NewMemoryBackend())).StopCloudflaredTunnel(context.Background(), acc); err != nil {
-		t.Fatalf("StopCloudflaredTunnel failed: %v", err)
+
+	// 5. Execute the embedded Python telemetry scanner for real (verifies import os + recursive temp scan)
+	var capturedPy string
+	mrCap := &mockRunner{
+		onShellOpts: func(_ string, opts runner.RunOptions) runner.Result {
+			capturedPy = opts.Stdin
+			return runner.Result{ExitCode: 0, Stdout: "HEALTH=ok\n"}
+		},
+	}
+	colab.NewEngine(mrCap, vault.New(vault.NewMemoryBackend())).FetchRemoteTelemetry(context.Background(), acc)
+	if !strings.Contains(capturedPy, "import os,") {
+		t.Fatalf("embedded telemetry Python must explicitly import os")
+	}
+	if _, err := exec.LookPath("python3"); err == nil {
+		tmpScan := t.TempDir()
+		nested := filepath.Join(tmpScan, "scene_01")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(nested, "clip.mp4"), []byte("mp4"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		probeScript := strings.ReplaceAll(capturedPy, `"/content/output"`, fmt.Sprintf("%q", tmpScan))
+		probeScript = strings.ReplaceAll(probeScript, `"/content/ComfyUI/output"`, fmt.Sprintf("%q", filepath.Join(tmpScan, "none")))
+		cmd := exec.Command("python3", "-")
+		cmd.Stdin = strings.NewReader(probeScript)
+		outBytes, runErr := cmd.CombinedOutput()
+		if runErr != nil {
+			t.Fatalf("real python3 execution of embedded telemetry script failed: %v\noutput:\n%s", runErr, string(outBytes))
+		}
+		if !strings.Contains(string(outBytes), "TEMP_OUT_VIDEOS=1") {
+			t.Fatalf("expected recursive temp video scan to detect nested clip.mp4, got:\n%s", string(outBytes))
+		}
 	}
 }

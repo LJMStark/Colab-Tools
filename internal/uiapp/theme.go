@@ -2,6 +2,7 @@ package uiapp
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/draw"
 	"image/png"
@@ -12,19 +13,31 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-var appIconBitmap *ui.Bitmap
+var (
+	appIconBitmap     *ui.Bitmap
+	svgToolbarRefresh *ui.SVG
+	svgToolbarPlay    *ui.SVG
+)
 
 func init() {
 	if img, err := png.Decode(bytes.NewReader(assets.AppIconPNG)); err == nil {
 		appIconBitmap = ui.NewBitmap(img)
 	}
+	svgToolbarRefresh = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M20 11A8.1 8.1 0 0 0 6.5 5.3L4 7.8"/>
+  <path d="M4 3.5V7.8H8.3"/>
+  <path d="M4 13A8.1 8.1 0 0 0 17.5 18.7L20 16.2"/>
+  <path d="M20 20.5V16.2H15.7"/>
+</svg>`))
+	svgToolbarPlay = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+  <path d="M7.5 5.4C7.5 4.55 8.43 4.03 9.15 4.48L19.45 10.98C20.12 11.4 20.12 12.38 19.45 12.8L9.15 19.3C8.43 19.75 7.5 19.23 7.5 18.38V5.4Z"/>
+</svg>`))
 }
 
-// TrayIconPNG generates a crisp 36x36 monochrome template PNG for macOS menu bar & Windows notification tray.
+// TrayIconPNG generates a crisp 36x36 monochrome template PNG for the macOS menu bar.
 func TrayIconPNG(running bool) []byte {
 	const sz = 36
 	img := image.NewRGBA(image.Rect(0, 0, sz, sz))
-	// Draw clean infinity/compute rings icon (template black on transparent)
 	draw.Draw(img, img.Bounds(), image.Transparent, image.Point{}, draw.Src)
 	drawRing := func(cx, cy, rOuter, rInner float64, alpha uint8) {
 		for y := 0; y < sz; y++ {
@@ -45,7 +58,6 @@ func TrayIconPNG(running bool) []byte {
 	drawRing(12.5, 18, 8.5, 4.5, 245)
 	drawRing(23.5, 18, 8.5, 4.5, 245)
 	if running {
-		// Solid center core dot indicates active cloud GPU session
 		drawRing(18, 18, 3.2, 0, 255)
 	}
 	var buf bytes.Buffer
@@ -60,7 +72,6 @@ type Palette struct {
 	CardBg                 ui.Color
 	CardTop                ui.Color
 	CardBottom             ui.Color
-	CardBorder             ui.Color
 	CardBorderTop          ui.Color
 	CardBorderBottom       ui.Color
 	CardInnerTopLight      ui.Color
@@ -105,7 +116,6 @@ func PaletteFor(dark bool) Palette {
 			CardBg:                 ui.RGB(40, 38, 34),
 			CardTop:                ui.RGB(45, 42, 37),
 			CardBottom:             ui.RGB(36, 34, 30),
-			CardBorder:             ui.RGBA(255, 255, 255, 0.095),
 			CardBorderTop:          ui.RGBA(255, 255, 255, 0.14),
 			CardBorderBottom:       ui.RGBA(255, 255, 255, 0.04),
 			CardInnerTopLight:      ui.RGBA(255, 255, 255, 0.09),
@@ -148,7 +158,6 @@ func PaletteFor(dark bool) Palette {
 		CardBg:                 ui.RGBA(252, 251, 248, 0.95),
 		CardTop:                ui.RGBA(255, 254, 251, 0.96),
 		CardBottom:             ui.RGBA(248, 247, 243, 0.94),
-		CardBorder:             ui.RGBA(24, 22, 18, 0.11),
 		CardBorderTop:          ui.RGBA(255, 255, 255, 0.92),
 		CardBorderBottom:       ui.RGBA(24, 22, 18, 0.12),
 		CardInnerTopLight:      ui.RGBA(255, 255, 255, 0.90),
@@ -212,15 +221,181 @@ func WorkloadColor(pal Palette, w core.WorkloadKind) ui.Color {
 		return pal.Sky
 	case core.WorkloadVideo:
 		return pal.Violet
-	case core.WorkloadImage:
-		return pal.Amber
-	case core.WorkloadAudio:
-		return pal.Cyan
-	case core.WorkloadMusic:
-		return pal.Emerald
 	default:
 		return pal.TextMuted
 	}
+}
+
+// AccountDisplayStatus returns the shared human-readable status label and semantic color
+// for an account across MainUI and PopoverUI.
+func AccountDisplayStatus(acc core.AccountProfile, rt core.AccountRuntimeState, pal Palette) (string, ui.Color) {
+	if rt.Phase.IsRunning() {
+		if rt.DeployRunning {
+			return "部署中", pal.Amber
+		}
+		if rt.DeployFailed {
+			return "部署中断", pal.Coral
+		}
+		if !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() && !rt.ServerHealthy {
+			return "未部署", pal.Amber
+		}
+		return "运行良好", pal.Emerald
+	}
+	if rt.Phase.IsQueuing() {
+		if rt.Phase.QueuePersistent {
+			return fmt.Sprintf("守候 第%d轮", max(1, rt.Phase.QueueAttempt)), pal.Amber
+		}
+		return fmt.Sprintf("排队 %d/%d", max(1, rt.Phase.QueueAttempt), max(1, rt.Phase.QueueMax)), pal.Amber
+	}
+	if rt.Phase.Kind == core.PhaseStarting {
+		return "正在开机", pal.Amber
+	}
+	if rt.Phase.Kind == core.PhaseStopping {
+		return "正在关机", pal.Coral
+	}
+	return "待机中", pal.TextMuted
+}
+
+// Core UI Primitives (consolidated from legacy scattered button/pill helpers)
+
+// PrimaryBtn renders an amber metallic or coral danger primary action button.
+func PrimaryBtn(c *ui.Context, pal Palette, label, iconName string, danger, disabled bool, onClick func()) {
+	el := ui.Row(c).
+		Height(35).
+		Padding(0, 16).
+		Radius(9).
+		Gap(6).
+		Shrink(0).
+		AlignItems(ui.Center).
+		Justify(ui.Center)
+
+	fg := pal.PrimaryBtnFg
+	if disabled {
+		fg = pal.TextFaint
+		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
+	} else if danger {
+		topCol := pal.Coral
+		botCol := pal.Coral.Mix(ui.RGB(0, 0, 0), 0.14)
+		shadowBlur := float32(14)
+		shadowAlpha := float32(0.34)
+		if el.Hovered() {
+			topCol = topCol.Mix(ui.RGB(255, 255, 255), 0.08)
+			botCol = botCol.Mix(ui.RGB(255, 255, 255), 0.06)
+			shadowBlur = 18
+			shadowAlpha = 0.44
+		}
+		el.LinearGradient(ui.LinearGradient{From: topCol, To: botCol, Angle: 180}).
+			Border(1, WithAlpha(pal.Coral, 0.85)).
+			InsetShadow(0, 1, 0, 0, ui.RGBA(255, 255, 255, 0.28)).
+			Shadow(0, 5, shadowBlur, -3, WithAlpha(pal.Coral, shadowAlpha)).
+			Cursor(ui.CursorPointer)
+		fg = ui.RGB(255, 255, 255)
+		if onClick != nil {
+			el.OnClick(onClick)
+		}
+	} else {
+		styleAmberMetallicButton(el, pal, false)
+		if onClick != nil {
+			el.OnClick(onClick)
+		}
+	}
+
+	el.Children(func() {
+		if iconName != "" {
+			ToolbarIcon(c, iconName, 11, fg)
+		}
+		ui.Text(c, label).FontSize(13).FontWeight(600).TextColor(fg).MaxLines(1)
+	})
+}
+
+// ActionBtn renders a unified secondary/accent action button for cards, toolbars, and drawers.
+func ActionBtn(c *ui.Context, pal Palette, label string, tint *ui.Color, iconName string, grow, disabled bool, onClick func()) {
+	bg := pal.SubtleBg
+	border := pal.SubtleBorder
+	fg := pal.TextPrimary
+	icCol := pal.TextMuted
+	if disabled {
+		bg = pal.DisabledBg
+		border = pal.DisabledBorder
+		fg = pal.TextFaint
+		icCol = pal.TextFaint
+	} else if tint != nil {
+		bg = WithAlpha(*tint, 0.14)
+		border = WithAlpha(*tint, 0.38)
+		fg = *tint
+		icCol = *tint
+	}
+	el := ui.Row(c).Padding(6, 11).Radius(8).Gap(5).Background(bg).Border(1, border).
+		AlignItems(ui.Center).Justify(ui.Center)
+	if grow {
+		el.Grow(1)
+	} else {
+		el.Shrink(0)
+	}
+	if !disabled && onClick != nil {
+		el.Cursor(ui.CursorPointer).OnClick(onClick)
+	}
+	el.Children(func() {
+		if iconName != "" {
+			ToolbarIcon(c, iconName, 13, icCol)
+		}
+		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
+	})
+}
+
+// ChipToggle renders a unified selectable chip or segmented option pill.
+func ChipToggle(c *ui.Context, pal Palette, label string, active, fill bool, onClick func()) {
+	bg := pal.SubtleBg
+	border := pal.SubtleBorder
+	borderW := float32(1)
+	fg := pal.TextMuted
+	fw := 500
+	if fill {
+		fg = pal.TextPrimary
+	}
+	if active {
+		bg = WithAlpha(pal.Amber, 0.15)
+		border = WithAlpha(pal.Amber, 0.62)
+		borderW = 1.2
+		fg = pal.TextPrimary
+		fw = 600
+	}
+	el := ui.Row(c).Padding(6, 9).Radius(8).Gap(5).Background(bg).Border(borderW, border).
+		AlignItems(ui.Center).Justify(ui.Center)
+	if fill {
+		el.FillWidth()
+	} else {
+		el.Shrink(0)
+	}
+	if !active && el.Hovered() {
+		el.Background(pal.CardTop).Border(1, pal.CardBorderBottom)
+		fg = pal.TextPrimary
+	}
+	if onClick != nil {
+		el.Cursor(ui.CursorPointer).OnClick(onClick)
+	}
+	el.Children(func() {
+		ui.Text(c, label).FontSize(11.5).FontWeight(fw).TextColor(fg).MaxLines(1).Ellipsis("…")
+	})
+}
+
+// StatusPill renders a recessed metadata pill with an optional leading LED dot.
+func StatusPill(c *ui.Context, pal Palette, dotCol *ui.Color, label string) {
+	ui.Row(c).
+		Padding(4, 9).
+		Radius(7).
+		Background(pal.RecessedBg).
+		Border(1, pal.RecessedBorder).
+		InsetShadow(0, 1, 1, 0, pal.RecessedInnerShadow).
+		Gap(5).
+		AlignItems(ui.Center).
+		Shrink(0).
+		Children(func() {
+			if dotCol != nil {
+				DrawPrecisionLED(c, *dotCol, 9)
+			}
+			ui.Text(c, label).FontSize(11.5).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+		})
 }
 
 func Badge(c *ui.Context, pal Palette, text string, tint *ui.Color) {
@@ -236,50 +411,155 @@ func Badge(c *ui.Context, pal Palette, text string, tint *ui.Color) {
 }
 
 func PillButton(c *ui.Context, pal Palette, label string, primary bool, disabled bool, onClick func()) {
+	if primary {
+		PrimaryBtn(c, pal, label, "", false, disabled, onClick)
+		return
+	}
 	bg := pal.SubtleBg
 	border := pal.SubtleBorder
 	fg := pal.TextPrimary
-	weight := 500
-	if primary {
-		if disabled {
-			bg = pal.SubtleBg
-			fg = pal.TextFaint
-		} else {
-			bg = pal.PrimaryBtnBg
-			border = WithAlpha(pal.PrimaryBtnBg, 0.6)
-			fg = pal.PrimaryBtnFg
-			weight = 600
-		}
-	} else if disabled {
+	if disabled {
+		bg = pal.DisabledBg
+		border = pal.DisabledBorder
 		fg = pal.TextFaint
 	}
-	el := ui.Row(c).Padding(8, 15).Radius(9).Background(bg).Border(1, border).AlignItems(ui.Center).Justify(ui.Center)
+	el := ui.Row(c).Padding(8, 15).Radius(9).Background(bg).Border(1, border).AlignItems(ui.Center).Justify(ui.Center).Shrink(0)
 	if !disabled && onClick != nil {
-		el.OnClick(onClick)
+		el.Cursor(ui.CursorPointer).OnClick(onClick)
 	}
 	el.Children(func() {
-		ui.Text(c, label).FontSize(13).FontWeight(weight).TextColor(fg).MaxLines(1)
+		ui.Text(c, label).FontSize(13).FontWeight(500).TextColor(fg).MaxLines(1)
 	})
 }
 
 func SmallActionButton(c *ui.Context, pal Palette, label string, tint *ui.Color, disabled bool, onClick func()) {
-	bg := pal.SubtleBg
-	border := pal.SubtleBorder
-	fg := pal.TextPrimary
-	if tint != nil && !disabled {
-		bg = WithAlpha(*tint, 0.14)
-		border = WithAlpha(*tint, 0.34)
-		fg = *tint
-	} else if disabled {
-		fg = pal.TextFaint
+	ActionBtn(c, pal, label, tint, "", false, disabled, onClick)
+}
+
+// Precision Surfaces, Icons & Micro-Charts (merged from components.go)
+
+// PrecisionCard renders a CNC anodized metallic container with gradient fill,
+// bevel border gradient, 1px inner top highlight, and subtle contact shadow.
+func PrecisionCard(c *ui.Context, pal Palette, radius, pad float32, fn func()) ui.Element {
+	el := ui.Column(c).FillWidth().Padding(pad).Gap(10).Radius(radius).
+		LinearGradient(ui.LinearGradient{
+			From: pal.CardTop, To: pal.CardBottom, Angle: 180,
+		}).
+		Border(1, ui.Color{}).
+		BorderLinearGradient(ui.LinearGradient{
+			From: pal.CardBorderTop, To: pal.CardBorderBottom, Angle: 180,
+		}).
+		InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
+		Shadow(0, 8, 24, -6, pal.CardShadow)
+	if fn != nil {
+		el.Children(fn)
 	}
-	el := ui.Row(c).Padding(5, 11).Radius(7).Background(bg).Border(1, border).AlignItems(ui.Center).Justify(ui.Center).Shrink(0)
-	if !disabled && onClick != nil {
-		el.OnClick(onClick)
+	return el
+}
+
+// ToolbarIcon renders a precompiled vector toolbar/popover icon ("refresh" or "play").
+func ToolbarIcon(c *ui.Context, name string, size float32, tint ui.Color) {
+	svg := svgToolbarRefresh
+	if name == "play" {
+		svg = svgToolbarPlay
 	}
-	el.Children(func() {
-		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
+	if size <= 0 {
+		size = 16
+	}
+	ui.Icon(c, svg).Width(size).Height(size).TextColor(tint)
+}
+
+// DrawPrecisionLED renders a hardware status LED with radial glow halo,
+// solid core, and top-left specular highlight.
+func DrawPrecisionLED(c *ui.Context, col ui.Color, size float32) {
+	if size <= 0 {
+		size = 14
+	}
+	ui.Box(c).Width(size).Height(size).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
+		cx, cy := r.X+r.W/2, r.Y+r.H/2
+		p.FillRadialGradient(r, ui.RadialGradient{
+			Center: ui.Point{X: 0.5, Y: 0.5},
+			Radius: r.W * 0.5,
+			Stops: []ui.GradientStop{
+				{Color: WithAlpha(col, 0.38), At: 0.0},
+				{Color: WithAlpha(col, 0.12), At: 0.55},
+				{Color: WithAlpha(col, 0.0), At: 1.0},
+			},
+		}, r.W/2)
+
+		core := max(float32(4.0), size*0.43)
+		p.Fill(ui.Rect{
+			X: cx - core/2,
+			Y: cy - core/2,
+			W: core,
+			H: core,
+		}, col, core/2)
+
+		spec := max(float32(1.2), size*0.11)
+		p.Fill(ui.Rect{
+			X: cx - core*0.26,
+			Y: cy - core*0.26,
+			W: spec,
+			H: spec,
+		}, ui.RGBA(255, 255, 255, 0.65), spec/2)
 	})
+}
+
+func styleAmberMetallicButton(el ui.Element, pal Palette, disabled bool) {
+	if disabled {
+		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
+		return
+	}
+	topCol := pal.PrimaryBtnTop
+	botCol := pal.PrimaryBtnBottom
+	shadowBlur := float32(18)
+	shadowAlpha := float32(0.42)
+	if el.Hovered() {
+		topCol = topCol.Mix(ui.RGB(255, 255, 255), 0.08)
+		botCol = botCol.Mix(ui.RGB(255, 255, 255), 0.06)
+		shadowBlur = 22
+		shadowAlpha = 0.52
+	}
+	el.LinearGradient(ui.LinearGradient{
+		From: topCol, To: botCol, Angle: 180,
+	}).
+		Border(1, ui.Color{}).
+		BorderLinearGradient(ui.LinearGradient{
+			From: pal.PrimaryBtnBorderTop, To: pal.PrimaryBtnBorderBottom, Angle: 180,
+		}).
+		InsetShadow(0, 1, 0, 0, ui.RGBA(255, 255, 255, 0.48)).
+		Shadow(0, 6, shadowBlur, -3, ui.RGBA(235, 148, 14, shadowAlpha)).
+		Cursor(ui.CursorPointer)
+}
+
+// DrawPrecisionBackdrop paints a soft warm-amber ambient glow behind the console
+// and a subtle 28px coordinate dot matrix across the canvas.
+func DrawPrecisionBackdrop(p *ui.Painter, r ui.Rect, pal Palette) {
+	if r.W <= 0 || r.H <= 0 {
+		return
+	}
+	glowAlpha := float32(0.055)
+	dotCol := ui.RGBA(24, 22, 18, 0.035)
+	if pal.Dark {
+		glowAlpha = 0.075
+		dotCol = ui.RGBA(255, 255, 255, 0.035)
+	}
+	p.FillRadialGradient(r, ui.RadialGradient{
+		Center: ui.Point{X: 0.22, Y: 0.44},
+		Radius: max(r.W, r.H) * 0.55,
+		Stops: []ui.GradientStop{
+			{Color: WithAlpha(pal.Amber, glowAlpha), At: 0.0},
+			{Color: WithAlpha(pal.Amber, glowAlpha*0.35), At: 0.5},
+			{Color: WithAlpha(pal.Amber, 0.0), At: 1.0},
+		},
+	}, 0)
+
+	const step = float32(28)
+	for y := r.Y + 14; y < r.Y+r.H-8; y += step {
+		for x := r.X + 14; x < r.X+r.W-8; x += step {
+			p.Fill(ui.Rect{X: x, Y: y, W: 1.2, H: 1.2}, dotCol, 0.6)
+		}
+	}
 }
 
 func BentoCard(c *ui.Context, pal Palette, height float32, fn func()) {
@@ -321,59 +601,6 @@ func TileHeader(c *ui.Context, pal Palette, dot ui.Color, title, badge string, b
 }
 
 // Vector Micro-Charts
-
-func DrawAuraOrb(c *ui.Context, pal Palette, phase core.InstancePhase, billingWarning bool, size float32) {
-	ui.Box(c).Width(size).Height(size).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
-		cx, cy := r.X+r.W/2, r.Y+r.H/2
-		switch {
-		case phase.IsRunning():
-			p.FillRadialGradient(r, ui.RadialGradient{
-				Center: ui.Point{X: 0.5, Y: 0.5},
-				Radius: r.W * 0.52,
-				Stops: []ui.GradientStop{
-					{Color: ui.RGBA(56, 232, 165, 0.96), At: 0.0},
-					{Color: ui.RGBA(28, 198, 134, 0.86), At: 0.56},
-					{Color: ui.RGBA(28, 198, 134, 0.22), At: 0.84},
-					{Color: ui.RGBA(28, 198, 134, 0.0), At: 1.0},
-				},
-			}, r.W/2)
-			bolt := &ui.Path{}
-			s := size / 46.0
-			bolt.MoveTo(cx+1.5*s, cy-8.5*s)
-			bolt.LineTo(cx-5.5*s, cy+1.0*s)
-			bolt.LineTo(cx-0.5*s, cy+1.0*s)
-			bolt.LineTo(cx-2.0*s, cy+8.5*s)
-			bolt.LineTo(cx+5.5*s, cy-1.0*s)
-			bolt.LineTo(cx+0.5*s, cy-1.0*s)
-			bolt.Close()
-			p.FillPath(bolt, ui.RGB(255, 255, 255))
-		case phase.IsQueuing() || billingWarning:
-			p.FillRadialGradient(r, ui.RadialGradient{
-				Center: ui.Point{X: 0.5, Y: 0.5},
-				Radius: r.W * 0.52,
-				Stops: []ui.GradientStop{
-					{Color: ui.RGBA(250, 185, 62, 0.94), At: 0.0},
-					{Color: ui.RGBA(235, 148, 22, 0.80), At: 0.56},
-					{Color: ui.RGBA(235, 148, 22, 0.16), At: 0.84},
-					{Color: ui.RGBA(235, 148, 22, 0.0), At: 1.0},
-				},
-			}, r.W/2)
-			p.Fill(ui.Rect{X: cx - 2, Y: cy - 6, W: 4, H: 8}, ui.RGB(255, 255, 255), 2)
-			p.Fill(ui.Rect{X: cx - 2, Y: cy + 4, W: 4, H: 4}, ui.RGB(255, 255, 255), 2)
-		default:
-			p.FillRadialGradient(r, ui.RadialGradient{
-				Center: ui.Point{X: 0.5, Y: 0.5},
-				Radius: r.W * 0.48,
-				Stops: []ui.GradientStop{
-					{Color: ui.RGBA(148, 154, 166, 0.42), At: 0.0},
-					{Color: ui.RGBA(120, 126, 138, 0.20), At: 0.72},
-					{Color: ui.RGBA(120, 126, 138, 0.0), At: 1.0},
-				},
-			}, r.W/2)
-			p.Stroke(ui.Rect{X: r.X + 4, Y: r.Y + 4, W: r.W - 8, H: r.H - 8}, pal.SubtleBorder, (r.W-8)/2, 1)
-		}
-	})
-}
 
 func DrawVRAMSegments(c *ui.Context, pal Palette, ratio float64, tint ui.Color, height float32) {
 	ui.Box(c).FillWidth().Height(height).Draw(func(p *ui.Painter, r ui.Rect) {
@@ -439,24 +666,5 @@ func DrawHorizonBar(c *ui.Context, pal Palette, progress float64, tint ui.Color,
 			w := max(r.H, r.W*ratio)
 			p.Fill(ui.Rect{X: r.X, Y: r.Y, W: w, H: r.H}, tint, rad)
 		}
-	})
-}
-
-func DrawRingGauge(c *ui.Context, pal Palette, progress float64, tint ui.Color, size float32) {
-	prog := float32(math.Min(1, math.Max(0.02, progress)))
-	ui.Box(c).Width(size).Height(size).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
-		cx, cy := r.X+r.W/2, r.Y+r.H/2
-		rad := r.W/2 - 4
-		bgCircle := (&ui.Path{}).Circle(cx, cy, rad)
-		p.StrokePath(bgCircle, 4.0, pal.SubtleBg)
-
-		arc := (&ui.Path{}).Circle(cx, cy, rad).Trim(0, prog).Cap(ui.RoundCap)
-		p.Transform(ui.Rotation(-90), cx, cy, func() {
-			p.StrokePath(arc, 4.0, tint)
-		})
-		inner := size * 0.42
-		p.Fill(ui.Rect{X: cx - inner/2, Y: cy - inner/2, W: inner, H: inner}, tint, inner/2)
-		p.Line(cx, cy, cx, cy-inner*0.24, 1.7, pal.BgTop)
-		p.Line(cx, cy, cx+inner*0.20, cy, 1.7, pal.BgTop)
 	})
 }

@@ -5,12 +5,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -39,11 +37,8 @@ type Runner interface {
 	LookPath(name string) string
 }
 
-// OSRunner executes commands on the host OS (and via WSL2 on Windows when requested).
-type OSRunner struct {
-	UseWSLOnWindows bool
-	WSLDistro       string
-}
+// OSRunner executes commands on the host OS.
+type OSRunner struct{}
 
 func NewOSRunner() *OSRunner {
 	return &OSRunner{}
@@ -64,28 +59,26 @@ func BaseEnvironment(extra map[string]string) []string {
 	delete(envMap, "ALL_PROXY")
 	envMap["COLAB_CLI_ASSIGN_RETRIES"] = "0"
 
-	if runtime.GOOS != "windows" {
-		home, _ := os.UserHomeDir()
-		extras := []string{
-			filepath.Join(home, ".local", "bin"),
-			"/opt/homebrew/bin",
-			"/usr/local/bin",
-			"/usr/bin",
-			"/bin",
-			"/usr/sbin",
-			"/sbin",
-		}
-		cur := envMap["PATH"]
-		seen := make(map[string]bool)
-		var merged []string
-		for _, p := range append(extras, strings.Split(cur, ":")...) {
-			if p != "" && !seen[p] {
-				seen[p] = true
-				merged = append(merged, p)
-			}
-		}
-		envMap["PATH"] = strings.Join(merged, ":")
+	home, _ := os.UserHomeDir()
+	extras := []string{
+		filepath.Join(home, ".local", "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
 	}
+	cur := envMap["PATH"]
+	seen := make(map[string]bool)
+	var merged []string
+	for _, p := range append(extras, strings.Split(cur, ":")...) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			merged = append(merged, p)
+		}
+	}
+	envMap["PATH"] = strings.Join(merged, ":")
 
 	for k, v := range extra {
 		envMap[k] = v
@@ -101,62 +94,22 @@ func ShellEscapePOSIX(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// StripCR normalizes Windows / WSL CRLF outputs cleanly to LF.
+// StripCR normalizes CRLF outputs cleanly to LF.
 func StripCR(s string) string {
 	return strings.ReplaceAll(s, "\r\n", "\n")
 }
 
-// WindowsToWSLPath converts `C:\Users\name\file` into `/mnt/c/Users/name/file`.
-func WindowsToWSLPath(winPath string) string {
-	p := strings.TrimSpace(winPath)
-	if len(p) >= 2 && p[1] == ':' {
-		drive := strings.ToLower(string(p[0]))
-		rest := strings.ReplaceAll(p[2:], "\\", "/")
-		if !strings.HasPrefix(rest, "/") {
-			rest = "/" + rest
-		}
-		return "/mnt/" + drive + rest
-	}
-	return strings.ReplaceAll(p, "\\", "/")
-}
-
-// BuildWSLCommand wraps a POSIX shell command for clean execution under `wsl.exe`,
-// injecting standard user PATH (~/.local/bin), stripping SOCKS proxies, and setting COLAB_CLI_ASSIGN_RETRIES=0.
-func BuildWSLCommand(distro, posixCmd string, extraEnv map[string]string) (string, []string) {
-	var envPrefix strings.Builder
-	envPrefix.WriteString(`export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; unset all_proxy ALL_PROXY; export COLAB_CLI_ASSIGN_RETRIES=0; `)
-	for k, v := range extraEnv {
-		if k == "GOOGLE_APPLICATION_CREDENTIALS" {
-			v = WindowsToWSLPath(v)
-		}
-		envPrefix.WriteString("export ")
-		envPrefix.WriteString(k)
-		envPrefix.WriteString("=")
-		envPrefix.WriteString(ShellEscapePOSIX(v))
-		envPrefix.WriteString("; ")
-	}
-	fullScript := envPrefix.String() + posixCmd
-	args := []string{}
-	if strings.TrimSpace(distro) != "" {
-		args = append(args, "-d", distro)
-	}
-	args = append(args, "--", "sh", "-lc", fullScript)
-	return "wsl.exe", args
-}
-
 func (r *OSRunner) LookPath(name string) string {
-	if runtime.GOOS != "windows" {
-		home, _ := os.UserHomeDir()
-		dirs := []string{
-			filepath.Join(home, ".local", "bin"),
-			"/opt/homebrew/bin",
-			"/usr/local/bin",
-		}
-		for _, d := range dirs {
-			cand := filepath.Join(d, name)
-			if st, err := os.Stat(cand); err == nil && !st.IsDir() && (st.Mode()&0o111) != 0 {
-				return cand
-			}
+	home, _ := os.UserHomeDir()
+	dirs := []string{
+		filepath.Join(home, ".local", "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+	}
+	for _, d := range dirs {
+		cand := filepath.Join(d, name)
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() && (st.Mode()&0o111) != 0 {
+			return cand
 		}
 	}
 	if p, err := exec.LookPath(name); err == nil {
@@ -166,46 +119,15 @@ func (r *OSRunner) LookPath(name string) string {
 }
 
 func (r *OSRunner) Run(ctx context.Context, name string, args []string, opts RunOptions) Result {
-	if runtime.GOOS == "windows" && r.UseWSLOnWindows && name != "wsl.exe" && name != "wsl" {
-		parts := make([]string, 0, len(args)+1)
-		parts = append(parts, ShellEscapePOSIX(name))
-		for _, a := range args {
-			parts = append(parts, ShellEscapePOSIX(a))
-		}
-		return r.RunShell(ctx, strings.Join(parts, " "), opts)
-	}
 	return runProcessGroup(ctx, name, args, opts)
 }
 
 func (r *OSRunner) RunShell(ctx context.Context, shellCmd string, opts RunOptions) Result {
-	if runtime.GOOS == "windows" {
-		if r.UseWSLOnWindows {
-			exe, args := BuildWSLCommand(r.WSLDistro, shellCmd, opts.ExtraEnv)
-			return runProcessGroup(ctx, exe, args, RunOptions{
-				Stdin:   opts.Stdin,
-				Timeout: opts.Timeout,
-			})
-		}
-		return runProcessGroup(ctx, "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-Command", shellCmd}, opts)
-	}
 	return runProcessGroup(ctx, "/bin/sh", []string{"-c", shellCmd}, opts)
 }
 
 func (r *OSRunner) RunStreamingShell(ctx context.Context, shellCmd string, timeout time.Duration, onLine func(string)) Result {
-	var name string
-	var args []string
-	if runtime.GOOS == "windows" {
-		if r.UseWSLOnWindows {
-			name, args = BuildWSLCommand(r.WSLDistro, shellCmd, nil)
-		} else {
-			name = "powershell.exe"
-			args = []string{"-NoProfile", "-NonInteractive", "-Command", shellCmd}
-		}
-	} else {
-		name = "/bin/sh"
-		args = []string{"-c", shellCmd}
-	}
-	return runStreamingProcessGroup(ctx, name, args, timeout, onLine)
+	return runStreamingProcessGroup(ctx, "/bin/sh", []string{"-c", shellCmd}, timeout, onLine)
 }
 
 // boundedBuffer caps retained bytes at MaxPipeBytes while still accepting writes so child processes never deadlock.
@@ -424,8 +346,4 @@ func runStreamingProcessGroup(parentCtx context.Context, name string, args []str
 		TimedOut: timedOut,
 		Canceled: canceled,
 	}
-}
-
-func FormatCommandForDisplay(name string, args []string) string {
-	return fmt.Sprintf("%s %s", name, strings.Join(args, " "))
 }

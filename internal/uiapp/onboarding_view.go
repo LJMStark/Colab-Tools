@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/LJMStark/Colab-Tools/internal/core"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -14,6 +15,11 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 	if !m.PreviewMode && runtime.GOOS == "darwin" {
 		topPad = 36
 	}
+	step := vs.OnboardingStep
+	if step != 2 {
+		step = 1
+	}
+
 	content := func() {
 		ui.Column(c).FillWidth().AlignItems(ui.Center).Padding(topPad, 28, 32, 28).Children(func() {
 			ui.Column(c).FillWidth().MaxWidth(840).Gap(18).Children(func() {
@@ -24,19 +30,19 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 					}
 					ui.Column(c).Grow(1).Gap(3).Children(func() {
 						ui.Text(c, "欢迎使用 Colab Tools").FontSize(22).Bold().TextColor(pal.TextPrimary)
-						ui.Text(c, "3 步完成环境体检与 Google 账号绑定，即可在 macOS 上一键管控云端 GPU 与 ComfyUI").FontSize(13).TextColor(pal.TextMuted)
+						ui.Text(c, "2 步完成环境体检与 Google 账号绑定，即可在 macOS 上一键管控云端 GPU 与 ComfyUI").FontSize(13).TextColor(pal.TextMuted)
 					})
 					SmallActionButton(c, pal, "先跳过，直接看界面", nil, false, func() {
 						m.Svc.CompleteOnboarding()
 					})
 				})
 
-				// 3-step indicator pills
-				steps := []string{"1. 环境体检与安装", "2. 绑定 Google 账号", "3. 30 秒快速上手"}
-				ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
+				// 2-step indicator pills
+				steps := []string{"1. 环境体检与安装", "2. 绑定 Google 账号"}
+				ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
 					for i, title := range steps {
 						stepNum := i + 1
-						active := vs.OnboardingStep == stepNum
+						active := step == stepNum
 						bg := pal.RecessedBg
 						border := pal.RecessedBorder
 						fg := pal.TextMuted
@@ -45,7 +51,7 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 							border = WithAlpha(pal.Amber, 0.58)
 							fg = pal.TextPrimary
 						}
-						el := ui.Row(c).FillWidth().Padding(10, 14).Radius(11).Background(bg).Border(1, border).Justify(ui.Center).AlignItems(ui.Center).Gap(8).OnClick(func() {
+						el := ui.Row(c).FillWidth().Padding(10, 14).Radius(11).Background(bg).Border(1, border).Justify(ui.Center).AlignItems(ui.Center).Gap(8).Cursor(ui.CursorPointer).OnClick(func() {
 							m.Svc.SetOnboardingStep(stepNum)
 						})
 						if active {
@@ -64,13 +70,10 @@ func (m *MainUI) renderOnboarding(c *ui.Context, pal Palette) {
 					}
 				})
 
-				switch vs.OnboardingStep {
-				case 1:
+				if step == 1 {
 					m.onboardingStep1Doctor(c, pal)
-				case 2:
+				} else {
 					m.onboardingStep2Accounts(c, pal)
-				default:
-					m.onboardingStep3Tour(c, pal)
 				}
 			})
 		})
@@ -98,7 +101,7 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 			if vs.IsCheckingEnv {
 				lbl = "检测中…"
 			}
-			onboardingRefreshButton(c, pal, lbl, vs.IsCheckingEnv || vs.IsInstallingCLI, func() {
+			ActionBtn(c, pal, lbl, nil, "refresh", false, vs.IsCheckingEnv || vs.IsInstallingCLI, func() {
 				go m.Svc.RefreshEnvironmentCheck()
 			})
 		})
@@ -117,12 +120,8 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 		}
 		m.doctorRow(c, pal, "官方 google-colab-cli", vs.CLIInstalled, cliDetail)
 
-		pkgOK := env.UVPath != "" || env.PipxPath != "" || env.BrewPath != "" || env.UsingWSLBridge
-		pkgTitle := "包管理环境（uv / pipx / Homebrew）"
-		if runtime.GOOS == "windows" {
-			pkgTitle = "Windows 运行环境（WSL2 / uv）"
-		}
-		m.doctorRow(c, pal, pkgTitle, pkgOK, env.PackageManagerSummary())
+		pkgOK := env.UVPath != "" || env.PipxPath != "" || env.BrewPath != ""
+		m.doctorRow(c, pal, "包管理环境（uv / pipx / Homebrew）", pkgOK, env.PackageManagerSummary())
 
 		accDetail := "尚未绑定账号（下一步可一键通过 Google 官方授权登录）"
 		if len(accounts) > 0 {
@@ -158,7 +157,6 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 					} else {
 						installDisabled := env.RecommendedMethod.RequiresRemoteScriptConsent() && !m.AgreedRemoteScript
 						PillButton(c, pal, env.RecommendedMethod.ShortButtonTitle(), true, installDisabled, func() {
-							m.ShowInstallLogs = true
 							m.Svc.InstallColabCLIAutomatically()
 						})
 						PillButton(c, pal, "复制命令自己装", false, false, func() {
@@ -183,12 +181,28 @@ func (m *MainUI) onboardingStep1Doctor(c *ui.Context, pal Palette) {
 				}
 			})
 		} else {
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Padding(6, 0, 0, 0).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Padding(6, 0, 0, 0).Children(func() {
 				ui.Text(c, "✓ 环境已就绪，google-colab-cli 可正常工作").FontSize(13.5).FontWeight(600).TextColor(pal.Emerald)
 				ui.Spacer(c)
-				PillButton(c, pal, "下一步：绑定 Google 账号 →", true, false, func() {
-					m.Svc.SetOnboardingStep(2)
-				})
+				if len(accounts) > 0 {
+					PillButton(c, pal, "进入 Colab Tools 主控制台 →", true, false, func() {
+						m.Svc.CompleteOnboarding()
+					})
+				} else {
+					SmallActionButton(c, pal, "导入终端已登账号并进入", nil, vs.IsImportingDefault, func() {
+						go func() {
+							if m.Svc.TryImportSystemDefaultAccount() {
+								m.Svc.CompleteOnboarding()
+							} else {
+								m.Svc.ShowToast("未检测到终端默认 colab 登录，请点击下一步完成 Google 授权")
+								m.Svc.SetOnboardingStep(2)
+							}
+						}()
+					})
+					PillButton(c, pal, "下一步：绑定 Google 账号 →", true, false, func() {
+						m.Svc.SetOnboardingStep(2)
+					})
+				}
 			})
 		}
 	})
@@ -211,10 +225,7 @@ func (m *MainUI) doctorRow(c *ui.Context, pal Palette, title string, ok bool, de
 			ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 			ui.Text(c, detail).FontSize(12).TextColor(pal.TextMuted)
 		})
-		ui.Row(c).Padding(4, 9).Radius(7).Background(pal.CardTop).Border(1, pal.SubtleBorder).Gap(5).AlignItems(ui.Center).Shrink(0).Children(func() {
-			DrawPrecisionLED(c, dotCol, 8)
-			ui.Text(c, badgeText).FontSize(11.5).FontWeight(600).TextColor(pal.TextMuted).MaxLines(1)
-		})
+		StatusPill(c, pal, &dotCol, badgeText)
 	})
 }
 
@@ -225,7 +236,7 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(3).Children(func() {
 				ui.Text(c, "绑定你的第一个 Google Colab 账号").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
-				ui.Text(c, "凭证仅加密存于本机系统凭据库；支持同时绑定多个 AI Ultra / Pro+ / Pro / Free 账号。").FontSize(12.5).TextColor(pal.TextMuted)
+				ui.Text(c, "凭证仅加密存于本机 macOS 钥匙串；支持同时绑定多个 AI Ultra / Pro+ / Pro / Free 账号。").FontSize(12.5).TextColor(pal.TextMuted)
 			})
 			SmallActionButton(c, pal, "自动导入终端已登账号", nil, !vs.CLIInstalled || vs.IsImportingDefault, func() {
 				go func() {
@@ -251,93 +262,24 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 						}
 						ui.Text(c, email).FontSize(12).TextColor(pal.TextMuted)
 					})
-					ui.Textf(c, "%.1f CU", rt.CUBalance).FontSize(14).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
-					ui.Row(c).Padding(4, 9).Radius(7).Background(pal.CardTop).Border(1, pal.SubtleBorder).Gap(5).AlignItems(ui.Center).Shrink(0).Children(func() {
-						DrawPrecisionLED(c, pal.Emerald, 8)
-						ui.Text(c, "已绑定").FontSize(11.5).FontWeight(600).TextColor(pal.TextMuted).MaxLines(1)
-					})
+					ui.Textf(c, "%s CU", core.FormatCU(rt.CUBalance)).FontSize(14).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
+					e := pal.Emerald
+					StatusPill(c, pal, &e, "已绑定")
 				})
 			}
 			ui.Row(c).FillWidth().Padding(6, 0, 0, 0).Children(func() {
+				PillButton(c, pal, "← 返回体检", false, false, func() {
+					m.Svc.SetOnboardingStep(1)
+				})
 				ui.Spacer(c)
-				PillButton(c, pal, "下一步：30 秒快速上手 →", true, false, func() {
-					m.Svc.SetOnboardingStep(3)
+				PillButton(c, pal, "进入 Colab Tools 主控制台 →", true, false, func() {
+					m.Svc.CompleteOnboarding()
 				})
 			})
 		} else {
 			m.renderEmbeddedOAuthBinder(c, pal, func() {
-				m.Svc.SetOnboardingStep(3)
-			})
-		}
-	})
-}
-
-func (m *MainUI) onboardingStep3Tour(c *ui.Context, pal Palette) {
-	SectionCard(c, pal, "", "", func() {
-		ui.Column(c).FillWidth().Gap(4).Children(func() {
-			ui.Text(c, "一切就绪！30 秒掌握三个最实用的功能").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
-			ui.Text(c, "关闭主窗口后，Colab Tools 会安静常驻在系统菜单栏 / 托盘；随时点击托盘图标或右键菜单唤出大屏。").FontSize(12.5).TextColor(pal.TextMuted)
-		})
-
-		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(12).Children(func() {
-			m.tourTile(c, pal, "original", pal.Violet, "一键部署 H3 视频模型", "默认选「H3 原版」或「H3 Flash 极速版」，也能换轻量 GGUF 或自定义链接；开机自动装好并通过本机加密通道打开 ComfyUI。")
-			m.tourTile(c, pal, "flash", pal.Emerald, "跑完自动关机省点数", "视频队列全部生成完就自动倒计时停卡，并去官网再查一次确认停了——再也不用担心忘关机挂一晚白扣几十点。")
-			m.tourTile(c, pal, "llm", pal.Amber, "顺位抢卡 + 大模型代理", "热门 A100 / G4 没货时按顺位自动排队，还能约清晨低峰开机；想跑大模型给 Claude / OpenCode 用，切一下模式就行。")
-		})
-
-		ui.Row(c).FillWidth().Padding(8, 0, 0, 0).Children(func() {
-			PillButton(c, pal, "← 返回上一步", false, false, func() {
-				m.Svc.SetOnboardingStep(2)
-			})
-			ui.Spacer(c)
-			PillButton(c, pal, "✦ 进入 Colab Tools 主控制台", true, false, func() {
 				m.Svc.CompleteOnboarding()
 			})
-		})
-	})
-}
-
-func (m *MainUI) tourTile(c *ui.Context, pal Palette, iconKind string, tint ui.Color, title, desc string) {
-	PrecisionCard(c, pal, 14, 16, func() {
-		ScenarioIcon(c, pal, iconKind, tint, true)
-		ui.Text(c, title).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
-		ui.Text(c, desc).FontSize(12).TextColor(pal.TextMuted)
-	}).Gap(10)
-}
-
-func onboardingRefreshButton(c *ui.Context, pal Palette, label string, disabled bool, onClick func()) {
-	el := ui.Row(c).
-		Padding(6, 12).
-		Radius(8).
-		Gap(6).
-		AlignItems(ui.Center).
-		Justify(ui.Center).
-		Shrink(0)
-
-	fg := pal.TextPrimary
-	icCol := pal.TextMuted
-	if disabled {
-		fg = pal.TextFaint
-		icCol = pal.TextFaint
-		el.Background(pal.DisabledBg).Border(1, pal.DisabledBorder)
-	} else {
-		top := pal.CardTop
-		bot := pal.RecessedBg
-		if el.Hovered() {
-			top = top.Mix(ui.RGB(255, 255, 255), 0.06)
-			bot = bot.Mix(pal.CardTop, 0.35)
 		}
-		el.LinearGradient(ui.LinearGradient{From: top, To: bot, Angle: 180}).
-			Border(1, pal.SubtleBorder).
-			InsetShadow(0, 1, 0, 0, pal.CardInnerTopLight).
-			Shadow(0, 1, 3, 0, pal.CardShadow).
-			Cursor(ui.CursorPointer)
-		if onClick != nil {
-			el.OnClick(onClick)
-		}
-	}
-	el.Children(func() {
-		ToolbarIcon(c, "refresh", 13, icCol)
-		ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(fg).MaxLines(1)
 	})
 }

@@ -32,8 +32,8 @@ No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (
       <sub><b>One-Click Zero-Config Home</b> · Pre-configured with <b>H3 Flash</b>, smart GPU auto-fallback, Drive backup & 10m post-queue auto-shutdown</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/preview-settings-queue.png" alt="Optional Custom GPU Priority & Morning Schedule" width="420" /><br />
-      <sub><b>Optional Power-User Controls</b> · Quietly collapsed by default; expand anytime for eco mode, custom GPU order, fallback & morning schedule</sub>
+      <img src="docs/images/preview-settings-queue.png" alt="Optional Custom GPU Priority & Persistent Queue" width="420" /><br />
+      <sub><b>Optional Power-User Controls</b> · Quietly collapsed by default; expand anytime for eco mode, custom GPU order, fallback & 8h persistent watch</sub>
     </td>
   </tr>
   <tr>
@@ -62,9 +62,9 @@ Renting A100 / G4 / H100 GPUs through Google Colab is great value for running vi
 2. **Re-installing ComfyUI and uploading bash scripts on every fresh VM gets old fast**
    - **How Colab Tools helps**: Deployment scripts are built straight into the app and sent to the cloud VM automatically. Pick **H3 Original (31B)** or **H3 Flash (13.7B fast)** out of the box — or expand **More Versions** for 24GB-friendly GGUF, any HuggingFace repo, or models already in your Drive. All variants share the exact same 21.5 GB base weights (text encoder + audio/video VAE).
 3. **Symlinking 20GB+ weights straight from Google Drive FUSE causes stalls and disconnects**
-   - **How Colab Tools helps**: When Google Drive is enabled, Colab Tools sequentially copies active H3 base weights onto the VM's fast local NVMe SSD (`rsync -ahW`) with zero double-copy HF downloads, mounts your custom `ColabTools/models/` subfolders zero-copy via `extra_model_paths.yaml`, syncs workflows safely between local NVMe and `ColabTools/workflows/`, pre-installs **ComfyUI-Manager v4** + **Workflow Models Downloader** for in-canvas missing model/node downloads, and **writes every finished video clip straight to Drive `outputs/`**. You can also turn Drive off for quick cloud-only trials.
+   - **How Colab Tools helps**: When Google Drive is enabled, Colab Tools sequentially copies active H3 base weights onto the VM's fast local NVMe SSD (`rsync -ahW`) with zero double-copy HF downloads, mounts your custom `ColabTools/models/` subfolders zero-copy via `extra_model_paths.yaml`, seeds workflows on boot and backs up changes incrementally to `ColabTools/workflows/` (`flock`-guarded, plus pre-shutdown flush), pre-installs **ComfyUI-Manager v4** + **Workflow Models Downloader** for in-canvas missing model/node downloads, and **writes every finished video clip straight to Drive `outputs/`**. You can also turn Drive off for quick cloud-only trials.
 4. **Colab tabs drop connections and native port proxy breaks ComfyUI WebSockets**
-   - **How Colab Tools helps**: Once ComfyUI starts, Colab Tools opens it in your browser through a **local encrypted SSH tunnel (`127.0.0.1:8188`)** using official `colab ssh --proxy-mode` — no public URL exposed and no WebSocket black screens (an optional `cloudflared` link toggle is included if you want to monitor from another device). Built in pure Go with GPU-rendered UI (`~9 MB` zipped, zero Electron), fast and lightweight on **macOS**.
+   - **How Colab Tools helps**: Once ComfyUI starts, Colab Tools opens it in your browser through a **local encrypted SSH tunnel (`127.0.0.1:8188`)** using official `colab ssh --proxy-mode` — zero unauthenticated public URLs exposed and no WebSocket black screens. Built in pure Go with GPU-rendered UI (`~9 MB` zipped, zero Electron), fast and lightweight on **macOS**.
 
 ---
 
@@ -78,15 +78,15 @@ Need a cloud GPU to power your local AI coding tools? Switch the recipe to **大
 
 ## Download & Install
 
-> **Platform focus:** Colab Tools currently focuses on **macOS**. Windows builds have been temporarily unlisted until the macOS experience is fully polished.
+> **Platform focus:** Colab Tools targets **macOS** (`arm64` Apple Silicon prebuilt; Intel Mac builds from source).
 
 ### Prerequisites
 - **macOS 14.0+** (`arm64` Apple Silicon prebuilt; Intel Mac builds from source)
 - **Official Google Colab CLI** (`uv tool install google-colab-cli`, **checked & installable right inside the first-launch wizard**)
 
 ### Option 1: Download Prebuilt App (Recommended)
-1. Download `Colab-Tools-v0.3.19-macOS-arm64.zip` from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest), unzip it, and drag **`Colab Tools.app`** to `/Applications`.
-2. Finish the 3-step setup wizard, then on the **Home** tab simply click the top-center **Power button** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
+1. Download the latest macOS archive (`Colab-Tools-v0.3.24-macOS-arm64.zip`) from [GitHub Releases](https://github.com/LJMStark/Colab-Tools/releases/latest), unzip it, and drag **`Colab Tools.app`** to `/Applications`.
+2. Finish the 2-step setup wizard (environment check + Google account binding), then on the **Home** tab simply click the top-center **Power button** (pre-configured out of the box with **H3 Flash**, smart GPU auto-fallback, Drive backup, and auto-shutdown).
 
 > **Signature note:** Community builds are self-signed. On first launch, right-click → **Open** (or run `xattr -cr "/Applications/Colab Tools.app"`).
 

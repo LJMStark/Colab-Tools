@@ -2,7 +2,6 @@ package runner_test
 
 import (
 	"context"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,43 +11,31 @@ import (
 	"github.com/LJMStark/Colab-Tools/internal/vault"
 )
 
-func TestWindowsWSLPathAndCommandBridge(t *testing.T) {
-	if got := runner.WindowsToWSLPath(`C:\Users\Alex\AppData\Roaming\colab-tools\adc.json`); got != "/mnt/c/Users/Alex/AppData/Roaming/colab-tools/adc.json" {
-		t.Fatalf("unexpected wsl path: %s", got)
-	}
+func TestStripCRAndDoctorMethodSelection(t *testing.T) {
 	if got := runner.StripCR("a\r\nb\r\n"); got != "a\nb\n" {
 		t.Fatalf("unexpected crlf strip: %q", got)
 	}
-	exe, args := runner.BuildWSLCommand("Ubuntu", "colab --auth=adc usage", map[string]string{
-		"GOOGLE_APPLICATION_CREDENTIALS": `D:\tmp\adc.json`,
-	})
-	if exe != "wsl.exe" || len(args) < 4 || !strings.Contains(args[len(args)-1], "/mnt/d/tmp/adc.json") {
-		t.Fatalf("unexpected wsl command: %s %v", exe, args)
-	}
-}
-
-func TestDoctorMethodSelectionAndVersionParsing(t *testing.T) {
 	if doctor.ParseVersionString("Version: 0.8.0\r\n") != "0.8.0" {
 		t.Fatal("failed parsing official colab version output")
 	}
 	if doctor.ParseVersionString("No such option: --version\n") != "" {
 		t.Fatal("error output must not parse as version")
 	}
-	if doctor.ChooseInstallMethod("darwin", "/opt/homebrew/bin/uv", "", "", false) != doctor.MethodUVTool {
-		t.Fatal("expected uvTool on macOS")
+	if doctor.ChooseInstallMethod("/opt/homebrew/bin/uv", "", "") != doctor.MethodUVTool {
+		t.Fatal("expected uvTool when uv is present")
 	}
-	if doctor.ChooseInstallMethod("windows", "", "", "", false) != doctor.MethodWSLRequired {
-		t.Fatal("expected wslRequired when Windows has no WSL")
+	if doctor.ChooseInstallMethod("", "/opt/homebrew/bin/pipx", "") != doctor.MethodPipx {
+		t.Fatal("expected pipx when only pipx is present")
 	}
-	if doctor.ChooseInstallMethod("windows", "/home/u/.local/bin/uv", "", "", true) != doctor.MethodWSLUVTool {
-		t.Fatal("expected wslUvTool when Windows WSL has uv")
+	if doctor.ChooseInstallMethod("", "", "/opt/homebrew/bin/brew") != doctor.MethodHomebrewThenUV {
+		t.Fatal("expected brew_uv when only Homebrew is present")
+	}
+	if doctor.ChooseInstallMethod("", "", "") != doctor.MethodOfficialUVScript {
+		t.Fatal("expected official_uv_script fallback")
 	}
 }
 
 func TestProcessGroupCancellationAndHeavyPipeDrain(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX shell sleep process-group test runs on Unix runners")
-	}
 	r := runner.NewOSRunner()
 
 	// Cancel streaming shell with background child holding stdout open
@@ -108,9 +95,6 @@ func TestVaultMemoryBackendAndCredentialNormalization(t *testing.T) {
 }
 
 func TestStreamingShellHandlesOver600KiBSingleLine(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX shell test runs on Unix runners")
-	}
 	r := runner.NewOSRunner()
 	var lines []string
 	// Emit a >600KiB single line followed by a normal marker line; must neither deadlock nor drop the trailing line

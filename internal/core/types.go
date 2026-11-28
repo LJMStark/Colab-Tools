@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -75,25 +74,6 @@ func (t SubscriptionTier) ShortBadge() string {
 	}
 }
 
-func (t SubscriptionTier) SummaryNote() string {
-	switch t {
-	case TierAIUltra:
-		return "5x (1000 CU) / 20x (2000 CU) · G4 / H100 / A100 · 24h"
-	case TierColabProPlus:
-		return "~600 CU/月 · 优先高阶 GPU + 后台运行 24h"
-	case TierAIPro:
-		return "~100 CU/月 · A100 / L4 / T4 · 24h"
-	case TierColabPro:
-		return "~100 CU/月 · A100 / L4 / T4 · 高内存形态"
-	case TierPayAsYouGo:
-		return "按量购点 · A100 / L4 / T4 · 灵活计费"
-	case TierFree:
-		return "无付费点数 · 仅 T4 / CPU · 最长 ~12h"
-	default:
-		return ""
-	}
-}
-
 func (t SubscriptionTier) MaxSessionHours() int {
 	if t == TierFree {
 		return 12
@@ -103,19 +83,6 @@ func (t SubscriptionTier) MaxSessionHours() int {
 
 func (t SubscriptionTier) SupportsHighMem() bool {
 	return t != TierFree
-}
-
-func (t SubscriptionTier) AllowedAccelerators() []AcceleratorOption {
-	switch t {
-	case TierAIUltra, TierColabProPlus:
-		return []AcceleratorOption{AccAutoBest, AccG4, AccH100, AccA100, AccL4, AccT4, AccTPUV6e1, AccTPUV5e1, AccCPU}
-	case TierAIPro, TierColabPro, TierPayAsYouGo:
-		return []AcceleratorOption{AccAutoPro, AccA100, AccL4, AccT4, AccTPUV5e1, AccCPU}
-	case TierFree:
-		return []AcceleratorOption{AccT4, AccCPU}
-	default:
-		return []AcceleratorOption{AccAutoPro, AccA100, AccL4, AccT4, AccCPU}
-	}
 }
 
 func (t SubscriptionTier) QueueableAccelerators() []AcceleratorOption {
@@ -284,10 +251,6 @@ func (a AcceleratorOption) RoleTag() string {
 	}
 }
 
-func (a AcceleratorOption) IsTPU() bool {
-	return a == AccTPUV6e1 || a == AccTPUV5e1
-}
-
 type ProbeTarget struct {
 	Flag    string // "--gpu", "--tpu", or "" for CPU
 	Value   string
@@ -352,24 +315,18 @@ func EstimatedHourlyCU(rawHardware string) float64 {
 	}
 }
 
-// WorkloadKind represents the 6 universal compute workload profiles.
+// WorkloadKind represents the 3 active compute workload profiles.
 type WorkloadKind string
 
 const (
-	WorkloadLLM     WorkloadKind = "llm"
 	WorkloadVideo   WorkloadKind = "video"
-	WorkloadImage   WorkloadKind = "image"
-	WorkloadAudio   WorkloadKind = "audio"
-	WorkloadMusic   WorkloadKind = "music"
+	WorkloadLLM     WorkloadKind = "llm"
 	WorkloadGeneral WorkloadKind = "general"
 )
 
 var AllWorkloadKinds = []WorkloadKind{
-	WorkloadLLM,
 	WorkloadVideo,
-	WorkloadImage,
-	WorkloadAudio,
-	WorkloadMusic,
+	WorkloadLLM,
 	WorkloadGeneral,
 }
 
@@ -387,14 +344,6 @@ func (w WorkloadKind) DisplayName() string {
 		return "LLM 大模型"
 	case WorkloadVideo:
 		return "视频生成"
-	case WorkloadImage:
-		return "图像生成"
-	case WorkloadAudio:
-		return "音频 / 语音"
-	case WorkloadMusic:
-		return "音乐生成"
-	case WorkloadGeneral:
-		return "训练 / 通用"
 	default:
 		return "训练 / 通用"
 	}
@@ -406,31 +355,8 @@ func (w WorkloadKind) ShortBadge() string {
 		return "LLM"
 	case WorkloadVideo:
 		return "视频"
-	case WorkloadImage:
-		return "生图"
-	case WorkloadAudio:
-		return "音频"
-	case WorkloadMusic:
-		return "音乐"
 	default:
 		return "通用"
-	}
-}
-
-func (w WorkloadKind) MetricCardTitle() string {
-	switch w {
-	case WorkloadLLM:
-		return "上下文"
-	case WorkloadVideo:
-		return "渲染队列"
-	case WorkloadImage:
-		return "出图队列"
-	case WorkloadAudio:
-		return "音频服务"
-	case WorkloadMusic:
-		return "音轨任务"
-	default:
-		return "整机负载"
 	}
 }
 
@@ -438,29 +364,16 @@ func (w WorkloadKind) DefaultRemotePort() int {
 	switch w {
 	case WorkloadLLM:
 		return 18080
-	case WorkloadVideo, WorkloadImage:
+	case WorkloadVideo:
 		return 8188
-	case WorkloadAudio, WorkloadMusic:
-		return 7860
 	default:
 		return 8888
 	}
 }
 
-func (w WorkloadKind) SupportsWebUI() bool {
-	switch w {
-	case WorkloadVideo, WorkloadImage, WorkloadAudio, WorkloadMusic:
-		return true
-	default:
-		return false
-	}
-}
-
 func (w WorkloadKind) WebUIButtonTitle() string {
 	switch w {
-	case WorkloadAudio, WorkloadMusic:
-		return "试听页"
-	case WorkloadVideo, WorkloadImage:
+	case WorkloadVideo:
 		return "WebUI"
 	default:
 		return "网页"
@@ -581,7 +494,7 @@ func SanitizeDriveSubpath(raw, fallback string) string {
 	return strings.TrimRight(p, "/")
 }
 
-// BuildDeployEnv constructs validated, injection-safe environment variables for built-in video deploy scripts.
+// BuildDeployEnv constructs validated, injection-safe environment variables for the unified ComfyUI deploy script.
 func BuildDeployEnv(acc AccountProfile) (map[string]string, error) {
 	acc.Sanitize()
 	boolStr := func(b bool) string {
@@ -590,23 +503,32 @@ func BuildDeployEnv(acc AccountProfile) (map[string]string, error) {
 		}
 		return "0"
 	}
+	recipe := "general"
+	if acc.DeployRecipe == RecipeH3Video {
+		recipe = "h3"
+	}
+	cloudIdleStop := 0
+	if acc.AutoShutdownEnabled {
+		cloudIdleStop = max(acc.IdleTimeoutMinutes+15, 30)
+	}
 	env := map[string]string{
+		"COMFY_RECIPE":                  recipe,
 		"SERVICE_PORT":                  fmt.Sprintf("%d", acc.RemoteServicePort),
 		"WORKLOAD_KIND":                 string(acc.WorkloadKind),
 		"USE_GOOGLE_DRIVE":              boolStr(acc.UseGoogleDrive),
 		"DRIVE_MODELS_DIR":              acc.DriveModelsDir,
 		"DRIVE_OUTPUT_DIR":              acc.DriveOutputDir,
 		"DRIVE_WHEELS_DIR":              "/content/drive/MyDrive/ColabTools/wheels",
-		"CACHE_BASE_TO_DRIVE":           boolStr(acc.CacheBaseToDrive),
-		"ENABLE_CLOUDFLARED":            boolStr(acc.EnableCloudflared),
+		"CACHE_BASE_TO_DRIVE":           boolStr(acc.UseGoogleDrive),
 		"RESTORE_CUSTOM_NODES_SNAPSHOT": boolStr(acc.RestoreCustomNodesSnapshot),
+		"IDLE_AUTO_STOP_MINUTES":        fmt.Sprintf("%d", cloudIdleStop),
 	}
 	if acc.DeployRecipe == RecipeH3Video {
 		env["H3_VARIANT"] = string(acc.H3Variant)
 		env["H3_GGUF_QUANT"] = acc.H3GGUFQuant
 		driveOnly := acc.H3Variant == H3VariantCustom && acc.H3DriveOnly
 		env["H3_DRIVE_ONLY"] = boolStr(driveOnly)
-		env["H3_ENABLE_SOL_ATTN"] = boolStr(acc.H3EnableSolAttn)
+		env["H3_ENABLE_SOL_ATTN"] = "1"
 		if acc.H3Variant == H3VariantCustom && !driveOnly {
 			repo := strings.TrimSpace(acc.H3CustomHFRepo)
 			files := SanitizeCustomHFFiles(acc.H3CustomHFFiles)
@@ -618,6 +540,28 @@ func BuildDeployEnv(acc AccountProfile) (map[string]string, error) {
 		}
 	}
 	return env, nil
+}
+
+// BuildLLMDeployEnv constructs validated environment variables for the built-in LLM proxy deploy script.
+func BuildLLMDeployEnv(acc AccountProfile) map[string]string {
+	acc.Sanitize()
+	useDrive := "0"
+	if acc.UseGoogleDrive {
+		useDrive = "1"
+	}
+	env := map[string]string{
+		"LLAMA_PORT":       fmt.Sprintf("%d", acc.RemoteServicePort),
+		"SERVICE_PORT":     fmt.Sprintf("%d", acc.RemoteServicePort),
+		"WORKLOAD_KIND":    string(WorkloadLLM),
+		"USE_GOOGLE_DRIVE": useDrive,
+	}
+	if repo := strings.TrimSpace(acc.LLMHFRepo); IsValidHFRepo(repo) {
+		env["HF_REPO"] = repo
+	}
+	if alias := strings.TrimSpace(acc.LLMModelAlias); IsValidModelAlias(alias) {
+		env["MODEL_ALIAS"] = alias
+	}
+	return env
 }
 
 // GPUStrategyMode unifies card picking into 3 beginner-friendly modes so users never juggle dual settings.
@@ -755,14 +699,6 @@ func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, targe
 	}
 }
 
-// EffectiveAutoQueue determines whether 503 shortages automatically continue in polite queue.
-func EffectiveAutoQueue(acc AccountProfile) bool {
-	if acc.GPUStrategy == GPUStrategyCustom {
-		return acc.EnablePoliteQueue
-	}
-	return true
-}
-
 // EffectiveUseHighMem determines whether --high-mem should be requested.
 func EffectiveUseHighMem(acc AccountProfile) bool {
 	if !acc.Tier.SupportsHighMem() {
@@ -784,17 +720,12 @@ func EffectiveGPUPlanSummary(acc AccountProfile) string {
 	return fmt.Sprintf("%s（%s）", acc.GPUStrategy.DisplayName(), QueueTargetsSummary(targets))
 }
 
-// EffectiveIdleTimeoutMinutes returns the unified idle shutdown timeout shared by both the watchdog loop and UI countdowns.
-func EffectiveIdleTimeoutMinutes(acc AccountProfile, rt AccountRuntimeState) int {
-	timeout := acc.IdleTimeoutMinutes
-	if timeout < 5 {
-		timeout = 40
+// EffectiveIdleTimeoutMinutes returns the single unified idle shutdown timeout shared by the watchdog loop and UI countdowns.
+func EffectiveIdleTimeoutMinutes(acc AccountProfile) int {
+	if acc.IdleTimeoutMinutes < 5 {
+		return 40
 	}
-	queueDrainMode := !acc.EnableLLMModule && acc.StopAfterQueueDrained && rt.SawQueueBusyThisRun && rt.QueueRunning == 0 && rt.QueuePending == 0
-	if queueDrainMode && acc.QueueDrainMinutes >= 5 && acc.QueueDrainMinutes < timeout {
-		return acc.QueueDrainMinutes
-	}
-	return timeout
+	return acc.IdleTimeoutMinutes
 }
 
 // AccountProfile persists a single Google Colab account's preferences.
@@ -811,7 +742,6 @@ type AccountProfile struct {
 	HighMem              bool              `json:"highMem"`
 	WorkloadKind         WorkloadKind      `json:"workloadKind"`
 	EnableLLMModule      bool              `json:"enableLLMModule"`
-	EnableHardwareIdle   bool              `json:"enableHardwareIdleFallback"`
 
 	// Built-in Video / H3 One-Click Deployment & Google Drive Sync
 	DeployRecipe               DeployRecipe `json:"deployRecipe,omitempty"`
@@ -820,19 +750,16 @@ type AccountProfile struct {
 	H3CustomHFRepo             string       `json:"h3CustomHFRepo,omitempty"`
 	H3CustomHFFiles            string       `json:"h3CustomHFFiles,omitempty"`
 	H3DriveOnly                bool         `json:"h3DriveOnly,omitempty"`
-	H3EnableSolAttn            bool         `json:"h3EnableSolAttn"`
 	UseGoogleDrive             bool         `json:"useGoogleDrive"`
 	DriveModelsDir             string       `json:"driveModelsDir,omitempty"`
 	DriveOutputDir             string       `json:"driveOutputDir,omitempty"`
 	RestoreCustomNodesSnapshot bool         `json:"restoreCustomNodesSnapshot,omitempty"`
-	CacheBaseToDrive           bool         `json:"cacheBaseToDrive"`
-	AutoOpenComfyUI            bool         `json:"autoOpenComfyUI"`
-	EnableCloudflared          bool         `json:"enableCloudflared,omitempty"`
-	StopAfterQueueDrained      bool         `json:"stopAfterQueueDrained"`
-	QueueDrainMinutes          int          `json:"queueDrainMinutes,omitempty"`
 
-	// Polite queue & off-peak scheduling
-	EnablePoliteQueue        bool                `json:"enablePoliteQueue"`
+	// Built-in LLM Proxy optional overrides (empty uses generic open defaults)
+	LLMHFRepo     string `json:"llmHFRepo,omitempty"`
+	LLMModelAlias string `json:"llmModelAlias,omitempty"`
+
+	// Polite queue & persistent watch
 	QueuePersistentMode      bool                `json:"queuePersistentMode,omitempty"`
 	QueuePersistentMaxHours  int                 `json:"queuePersistentMaxHours,omitempty"`
 	QueueTargets             []AcceleratorOption `json:"queueTargets"`
@@ -840,13 +767,6 @@ type AccountProfile struct {
 	QueueFallbackAfterRounds int                 `json:"queueFallbackAfterRounds"`
 	QueueFallbackTarget      AcceleratorOption   `json:"queueFallbackTarget"`
 	AllowCrossModelFallback  bool                `json:"allowCrossModelFallback,omitempty"`
-
-	ScheduledStartEnabled     bool       `json:"scheduledStartEnabled"`
-	ScheduledStartHour        int        `json:"scheduledStartHour"`
-	ScheduledStartMinute      int        `json:"scheduledStartMinute"`
-	ScheduledStartRepeatDaily bool       `json:"scheduledStartRepeatDaily"`
-	ScheduledNextFireAt       *time.Time `json:"scheduledNextFireAt,omitempty"`
-	LastScheduledFireDay      string     `json:"lastScheduledFireDay"`
 
 	// Idle watchdog
 	AutoShutdownEnabled bool `json:"autoShutdownEnabled"`
@@ -860,7 +780,6 @@ type AccountProfile struct {
 	AutoSyncCodex      bool   `json:"autoSyncCodex"`
 	CCSwitchProviderID string `json:"ccSwitchProviderId"`
 	CCSwitchName       string `json:"ccSwitchProviderName"`
-	LocalEnvPath       string `json:"localEnvPath"`
 	LocalSSHTunnelPort int    `json:"localSSHTunnelPort"`
 	RemoteServicePort  int    `json:"remoteServicePort"`
 }
@@ -892,31 +811,19 @@ func NewDefaultAccountProfile(name, email string, tier SubscriptionTier, authMod
 		HighMem:                    tier.SupportsHighMem(),
 		WorkloadKind:               WorkloadVideo,
 		EnableLLMModule:            false,
-		EnableHardwareIdle:         true,
 		DeployRecipe:               RecipeH3Video,
 		H3Variant:                  H3VariantFlash,
 		H3GGUFQuant:                "Q4_K_M",
-		H3EnableSolAttn:            true,
 		UseGoogleDrive:             true,
 		DriveModelsDir:             "",
 		DriveOutputDir:             "/content/drive/MyDrive/ColabTools/outputs",
 		RestoreCustomNodesSnapshot: false,
-		CacheBaseToDrive:           true,
-		AutoOpenComfyUI:            true,
-		EnableCloudflared:          false,
-		StopAfterQueueDrained:      true,
-		QueueDrainMinutes:          10,
-		EnablePoliteQueue:          true,
 		QueuePersistentMode:        false,
 		QueuePersistentMaxHours:    QueuePersistentDefaultHours,
 		QueueTargets:               defaultTargets,
 		QueueFallbackEnabled:       false,
 		QueueFallbackAfterRounds:   2,
 		QueueFallbackTarget:        fallback,
-		ScheduledStartEnabled:      false,
-		ScheduledStartHour:         7,
-		ScheduledStartMinute:       0,
-		ScheduledStartRepeatDaily:  true,
 		AutoShutdownEnabled:        true,
 		IdleTimeoutMinutes:         10,
 		WarnBeforeMinutes:          2,
@@ -989,12 +896,6 @@ func (a *AccountProfile) Sanitize() {
 		a.DriveModelsDir = SanitizeDriveSubpath(a.DriveModelsDir, "")
 	}
 	a.DriveOutputDir = SanitizeDriveSubpath(a.DriveOutputDir, "/content/drive/MyDrive/ColabTools/outputs")
-	if a.QueueDrainMinutes < 5 {
-		a.QueueDrainMinutes = 10
-	}
-	if a.QueueDrainMinutes > 60 {
-		a.QueueDrainMinutes = 60
-	}
 	a.QueueTargets = SanitizedQueueTargets(a.QueueTargets, a.Tier)
 	if a.QueuePersistentMaxHours <= 0 {
 		a.QueuePersistentMaxHours = QueuePersistentDefaultHours
@@ -1010,8 +911,6 @@ func (a *AccountProfile) Sanitize() {
 	if !IsValidAccelerator(string(a.QueueFallbackTarget)) || !slices.Contains(a.Tier.QueueableAccelerators(), a.QueueFallbackTarget) {
 		a.QueueFallbackTarget = DefaultFallbackTarget(a.QueueTargets, a.Tier)
 	}
-	a.ScheduledStartHour = clampInt(a.ScheduledStartHour, 0, 23)
-	a.ScheduledStartMinute = clampInt(a.ScheduledStartMinute, 0, 59)
 	if a.IdleTimeoutMinutes < 5 {
 		a.IdleTimeoutMinutes = 40
 	}
@@ -1070,17 +969,10 @@ func DefaultAppSettings() AppSettings {
 	}
 }
 
-// ConfigDir returns the unified cross-platform config directory:
-// - macOS / Linux: ~/.config/colab-tools
-// - Windows: %APPDATA%\colab-tools (fallback to home/.config/colab-tools)
+// ConfigDir returns the unified macOS/Unix config directory (~/.config/colab-tools).
 func ConfigDir() string {
 	if custom := strings.TrimSpace(os.Getenv("COLAB_TOOLS_CONFIG_DIR")); custom != "" {
 		return custom
-	}
-	if runtime.GOOS == "windows" {
-		if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
-			return filepath.Join(appData, "colab-tools")
-		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -1134,37 +1026,14 @@ func normalizeLegacySettingsJSON(raw []byte) ([]byte, bool, error) {
 			if !ok {
 				continue
 			}
-			if rawDate, exists := m["scheduledNextFireAt"]; exists && rawDate != nil {
-				if t, ok := parseFlexTimestamp(rawDate); ok {
-					m["scheduledNextFireAt"] = t.Format(time.RFC3339Nano)
-				} else {
-					delete(m, "scheduledNextFireAt")
-				}
-			}
-			// Populate friendly v0.3.8 video/Drive defaults for accounts upgraded from earlier versions
+			// Populate friendly video/Drive defaults for accounts upgraded from earlier versions
 			if _, hasRecipe := m["deployRecipe"]; !hasRecipe {
-				for k, v := range map[string]any{
-					"useGoogleDrive":        true,
-					"cacheBaseToDrive":      true,
-					"autoOpenComfyUI":       true,
-					"h3EnableSolAttn":       true,
-					"stopAfterQueueDrained": true,
-					"queueDrainMinutes":     10,
-				} {
-					if _, exists := m[k]; !exists {
-						m[k] = v
-					}
+				if _, exists := m["useGoogleDrive"]; !exists {
+					m["useGoogleDrive"] = true
 				}
 			}
-			for k, v := range map[string]any{
-				"enablePoliteQueue":          true,
-				"enableHardwareIdleFallback": true,
-				"enableCloudflared":          false,
-				"queuePersistentMaxHours":    QueuePersistentDefaultHours,
-			} {
-				if _, exists := m[k]; !exists {
-					m[k] = v
-				}
+			if _, exists := m["queuePersistentMaxHours"]; !exists {
+				m["queuePersistentMaxHours"] = QueuePersistentDefaultHours
 			}
 			// Populate v0.3.10 unified GPU strategy cleanly when upgrading from earlier configs
 			if _, hasStrat := m["gpuStrategy"]; !hasStrat {
@@ -1378,21 +1247,6 @@ const (
 	SignalSourceHardwareDualLowLoad ActivitySignalSource = "hardware_dual_low_load"
 )
 
-func (s ActivitySignalSource) ShortLabel() string {
-	switch s {
-	case SignalSourceLLMSlots:
-		return "/slots 信号"
-	case SignalSourceStatusFile:
-		return "状态协议"
-	case SignalSourceComfyQueue:
-		return "Comfy 队列"
-	case SignalSourceHardwareDualLowLoad:
-		return "GPU+CPU 双低载"
-	default:
-		return "未接入信号"
-	}
-}
-
 type SlotInfo struct {
 	ID            *int  `json:"id"`
 	NCtx          *int  `json:"n_ctx"`
@@ -1452,7 +1306,7 @@ type AccountRuntimeState struct {
 	DeployLogTail              string
 	DeployLogLoading           bool
 	RenderedVideoCount             int
-	SawQueueBusyThisRun            bool
+	SessionIsVideoComfy            bool
 	AutoOpenedEndpoint             string
 	ComfyOpening                   bool
 	DriveMountedKnown              bool
@@ -1461,7 +1315,6 @@ type AccountRuntimeState struct {
 	TempOutputVideos               int
 	TempOutputScanKnown            bool
 	WatchdogDeferredForTempOutputs bool
-	CloudflaredActive              bool
 
 	ActivitySignal ActivitySignal
 	SignalSource   ActivitySignalSource
@@ -1481,7 +1334,6 @@ type AccountRuntimeState struct {
 	SSHTunnelActive       bool
 	ActiveSSHTunnelPort   *int
 	QueueCircuitBreakTill *time.Time
-	NonLLMReminderPending bool
 	LastError             string
 	LastErrorTitle        string
 	LastErrorAction       string // "", "retry", "stop_existing", "reauth", "clear_cooldown"
@@ -1613,10 +1465,7 @@ func (rt AccountRuntimeState) EstimatedHoursRemaining(acc AccountProfile) (hours
 	}
 
 	ref := acc.PreferredAccelerator
-	if acc.GPUStrategy == GPUStrategyCustom && !acc.EnablePoliteQueue {
-		// Honor explicit single-launch preferred accelerator when custom queue is disabled
-		ref = acc.PreferredAccelerator
-	} else if targets := EffectiveQueueTargets(acc); len(targets) > 0 {
+	if targets := EffectiveQueueTargets(acc); len(targets) > 0 {
 		ref = targets[0]
 	}
 	switch ref {
