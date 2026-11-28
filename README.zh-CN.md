@@ -8,7 +8,7 @@
 
 不用敲命令、不用自己传脚本 · 默认选 H3 原版或 Flash 极速版就能跑 · 不用盯屏：菜单栏实时显示抢卡进度，抢到或没抢到都会弹窗响铃通知 · 聪明配合 Google Drive 不掉盘不白跑 · 也能一键切大模型代理给编程工具用
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [下载最新版](https://github.com/LJMStark/Colab-Tools/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](SECURITY.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [官方网站](https://colab.tools/) · [下载最新版](https://github.com/LJMStark/Colab-Tools/releases/latest) · [更新日志](CHANGELOG.md) · [安全说明](SECURITY.md)
 
 [![CI](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml/badge.svg)](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/LJMStark/Colab-Tools?color=f59e0b&logo=github)](https://github.com/LJMStark/Colab-Tools/releases/latest)

@@ -8,7 +8,7 @@
 
 No manual scripts or terminal juggling · Pick **H3 Original** or **H3 Flash** (or any custom weight) and click Start · Smart Google Drive copy & real-time output backup · No babysitting: live queue progress in the menu bar, plus sound & popup notifications when allocated, ready, or stopped · Also switches cleanly to LLM proxy mode for coding tools.
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [Download Latest](https://github.com/LJMStark/Colab-Tools/releases/latest) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [Official website](https://colab.tools/en/) · [Download Latest](https://github.com/LJMStark/Colab-Tools/releases/latest) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
 [![CI](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml/badge.svg)](https://github.com/LJMStark/Colab-Tools/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/LJMStark/Colab-Tools?color=f59e0b&logo=github)](https://github.com/LJMStark/Colab-Tools/releases/latest)
