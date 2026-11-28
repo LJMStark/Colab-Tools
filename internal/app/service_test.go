@@ -2154,3 +2154,85 @@ func TestV0320CodexReviewFixesStopGuardPromptIDAndTempDir(t *testing.T) {
 		t.Fatal("expected watchdog to remain deferred while /content/output still holds unsaved videos even after Drive remount")
 	}
 }
+
+func TestRequestWebStopGuideAndOpenColabWebHome(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	var opened []string
+	svc.URLOpener = func(u string) {
+		opened = append(opened, u)
+	}
+
+	acc := core.NewDefaultAccountProfile("主账号", "demo+user@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState()
+
+	sess := core.ColabSessionItem{
+		Name:     "?",
+		Endpoint: "ep-web-t4",
+		Hardware: "T4",
+		Shape:    "High-RAM",
+		IsOrphan: true,
+	}
+	svc.RequestWebStopGuide(acc.ID, sess, "1.87 CU/h")
+	p := svc.CurrentActionPrompt()
+	if p == nil || p.Kind != core.PromptWebStopGuide {
+		t.Fatalf("expected PromptWebStopGuide, got %+v", p)
+	}
+	for _, want := range []string{
+		"这台 T4 需到 Colab 网页手动关闭",
+		"T4 · High-RAM（1.87 CU/h）",
+		"demo+user@example.com",
+		"第 1 步",
+		"核对页面右上角登录的是上方账号",
+		"第 2 步",
+		"Runtime → Manage sessions",
+		"第 3 步",
+		"核对笔记本名称与显卡型号（T4）",
+		"终止 / TERMINATE",
+	} {
+		if !strings.Contains(p.Title+"\n"+p.Message, want) {
+			t.Fatalf("missing %q in web stop guide prompt: title=%q msg=%q", want, p.Title, p.Message)
+		}
+	}
+
+	// Cancel closes modal without opening browser
+	svc.ResolveActionPromptByID(p.ID, "cancel")
+	if svc.CurrentActionPrompt() != nil || len(opened) != 0 {
+		t.Fatalf("expected cancel to dismiss prompt without opening URL, prompt=%+v opened=%+v", svc.CurrentActionPrompt(), opened)
+	}
+
+	// Primary dismisses modal and opens Colab web home with authuser query parameter
+	svc.RequestWebStopGuide(acc.ID, sess, "1.87 CU/h")
+	p2 := svc.CurrentActionPrompt()
+	svc.ResolveActionPromptByID(p2.ID, "primary")
+	if svc.CurrentActionPrompt() != nil {
+		t.Fatal("expected primary action to dismiss PromptWebStopGuide")
+	}
+	if len(opened) != 1 || opened[0] != "https://colab.research.google.com/?authuser=demo%2Buser%40example.com" {
+		t.Fatalf("expected Colab web home with escaped authuser, got %+v", opened)
+	}
+
+	// Active waiting Drive auth prompt must NOT be overwritten/aborted by RequestWebStopGuide
+	waitCh := make(chan bool, 1)
+	svc.mu.Lock()
+	svc.driveAuthResultCh = waitCh
+	svc.actionPrompt = &core.UserActionPrompt{
+		ID:    "drive-auth-live",
+		Kind:  core.PromptDriveAuth,
+		Title: "Drive Auth",
+	}
+	svc.mu.Unlock()
+	svc.RequestWebStopGuide(acc.ID, sess, "1.87 CU/h")
+	if cur := svc.CurrentActionPrompt(); cur == nil || cur.ID != "drive-auth-live" {
+		t.Fatalf("expected active PromptDriveAuth preserved, got %+v", cur)
+	}
+	select {
+	case v := <-waitCh:
+		t.Fatalf("expected driveAuthResultCh NOT triggered when web stop guide defers, got %v", v)
+	default:
+	}
+}

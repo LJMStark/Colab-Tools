@@ -1320,6 +1320,7 @@ const (
 	PromptConfirmRemoveAccount ActionPromptKind = "confirm_remove_account"
 	PromptConfirmQuit          ActionPromptKind = "confirm_quit"
 	PromptTempOutputGuard      ActionPromptKind = "temp_output_guard"
+	PromptWebStopGuide         ActionPromptKind = "web_stop_guide"
 )
 
 // UserActionPrompt 描述需要用户在桌面弹窗中确认或处理的小白向引导操作。

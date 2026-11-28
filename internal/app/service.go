@@ -31,7 +31,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.22"
+const AppVersion = "0.3.23"
 
 var errSSHTunnelStarting = errors.New("本机加密通道正在建立中，请稍候")
 
@@ -2958,6 +2958,13 @@ func (s *Service) ResolveActionPromptByID(promptID, action string) {
 				go s.StopAccountSession(promptCopy.AccountID, "", "用户确认跳过临时盘护片关机")
 			}
 		}
+	case core.PromptWebStopGuide:
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if action == "primary" && promptCopy.AccountID != "" {
+			s.OpenColabWebHome(promptCopy.AccountID)
+		}
 	default:
 		s.actionPrompt = nil
 		s.mu.Unlock()
@@ -3004,6 +3011,49 @@ func (s *Service) RequestConfirmStopSession(accountID, specificSession string) {
 		Message:      fmt.Sprintf("将停止账号「%s」下这台名为 %s 的云端机器并停止扣点。", acc.DisplayName, target),
 		PrimaryLabel: "确认关机",
 		CancelLabel:  "取消",
+	})
+}
+
+// RequestWebStopGuide 针对非本软件启动、无法直接关闭的机器，弹出清晰的 3 步手动关闭指引弹窗。
+func (s *Service) RequestWebStopGuide(accountID string, sess core.ColabSessionItem, rateHint string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	// Never interrupt an active waiting Google Drive authorization flow.
+	s.mu.RLock()
+	driveAuthWaiting := s.actionPrompt != nil && s.actionPrompt.Kind == core.PromptDriveAuth && s.driveAuthResultCh != nil
+	s.mu.RUnlock()
+	if driveAuthWaiting {
+		s.ShowToast("请先完成当前的 Google Drive 授权，再查看手动关机指引")
+		return
+	}
+	hw := strings.TrimSpace(sess.Hardware)
+	if hw == "" {
+		hw = "云端 GPU"
+	}
+	spec := hw
+	if sh := strings.TrimSpace(sess.Shape); sh != "" {
+		spec = fmt.Sprintf("%s · %s", hw, sh)
+	}
+	machineInfo := spec
+	if rh := strings.TrimSpace(rateHint); rh != "" {
+		machineInfo = fmt.Sprintf("%s（%s）", spec, rh)
+	}
+	msg := fmt.Sprintf(
+		"当前机器：%s · 账号：%s\n这台机器不是由当前软件启动的，无法在这里直接关机，请按以下 3 步到 Colab 网页关闭：\n第 1 步：点击下方「打开 Colab 网页」，先核对页面右上角登录的是上方账号，再打开任意一个笔记本。\n第 2 步：点击顶部菜单「代码执行程序 → 管理会话」（英文界面为 Runtime → Manage sessions）。\n第 3 步：在列表中核对笔记本名称与显卡型号（%s），确认无误后点击右侧「终止 / TERMINATE」即可停止扣点。",
+		machineInfo,
+		driveAuthAccountLabel(acc),
+		hw,
+	)
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:           uuid.New().String(),
+		Kind:         core.PromptWebStopGuide,
+		AccountID:    accountID,
+		Title:        fmt.Sprintf("这台 %s 需到 Colab 网页手动关闭", hw),
+		Message:      msg,
+		PrimaryLabel: "打开 Colab 网页 ↗",
+		CancelLabel:  "我知道了",
 	})
 }
 
@@ -4858,17 +4908,40 @@ func (s *Service) StopSSHTunnel(accountID string) {
 	s.notifyUI()
 }
 
+// OpenColabWebHome 直接在浏览器打开 Google Colab 官网（自动附加 authuser 邮箱防多号串号）。
+func (s *Service) OpenColabWebHome(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	target := "https://colab.research.google.com/"
+	if email := strings.TrimSpace(acc.Email); email != "" {
+		target += "?authuser=" + url.QueryEscape(email)
+	}
+	s.mu.RLock()
+	opener := s.URLOpener
+	s.mu.RUnlock()
+	if opener != nil {
+		opener(target)
+	}
+}
+
 func (s *Service) OpenColabInBrowser(accountID string) {
 	acc, ok := s.accountByID(accountID)
 	if !ok {
 		return
 	}
 	go func() {
-		if u := s.Engine.ResolveColabURL(context.Background(), acc, acc.SessionName); u != "" && s.URLOpener != nil {
-			s.URLOpener(u)
-		} else {
-			s.ShowToast("未能获取 Colab 网页链接")
+		if u := s.Engine.ResolveColabURL(context.Background(), acc, acc.SessionName); u != "" {
+			s.mu.RLock()
+			opener := s.URLOpener
+			s.mu.RUnlock()
+			if opener != nil {
+				opener(u)
+				return
+			}
 		}
+		s.OpenColabWebHome(accountID)
 	}()
 }
 

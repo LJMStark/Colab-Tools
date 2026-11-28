@@ -3,6 +3,14 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.23] - 2026-11-28
+
+### Added
+- **统一「运行中的云端机器」实时总览清单与 3 步手动关机指引**：
+  - 只要任意账号存在运行中的云端机器，主页底部即自动展示统一的「运行中的云端机器」清单（0 台时自动隐藏），一屏列出每台机器的来源、显卡与规格、实时状态/显存及扣点速率，卡头汇总全账号实时总扣点，并对重复绑定的同邮箱账号与同实例自动去重；
+  - 对非本软件启动、无法自动关机的机器使用克制的微琥珀描边与「需去网页关」胶囊特别区分，并保留可点击的「关机 ↗」按钮；
+  - 点击不可自动关机器的「关机 ↗」将弹出清晰的 3 步 Colab 网页手动关闭指引弹窗（含账号邮箱核对、菜单路径「代码执行程序 → 管理会话 / Runtime → Manage sessions」及「终止 / TERMINATE」步骤）与一键携带 `authuser` 直达 Colab 官网的按钮，且不会打断正在等待中的 Google Drive 授权弹窗。
+
 ## [0.3.22] - 2026-11-28
 
 ### Improved

@@ -378,7 +378,7 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 					case core.PromptConfirmStop, core.PromptConfirmStopAll, core.PromptConfirmRemoveAccount, core.PromptConfirmQuit:
 						led = pal.Coral
 						dangerPrimary = true
-					case core.PromptTempOutputGuard:
+					case core.PromptTempOutputGuard, core.PromptWebStopGuide:
 						led = pal.Amber
 					}
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
@@ -969,16 +969,15 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		m.bentoStrategy(c, pal, acc)
 	})
 
-	// Bottom Live Sessions & Accounts Table (only shown when multi-account or extra live machine exists)
+	// Unified Running Machines Card (shows every active GPU across managed & external sessions; hidden when 0 running)
 	accounts := m.Svc.AccountsSnapshot()
-	hasExtraOrOrphan := false
-	for _, sess := range rt.Sessions {
-		if sess.IsOrphan || sess.Name != acc.SessionName {
-			hasExtraOrOrphan = true
-			break
-		}
+	runningRows, totalBurnRate, hasRateSample := m.collectRunningMachineRows(accounts)
+	if len(runningRows) > 0 {
+		m.renderRunningMachinesCard(c, pal, runningRows, totalBurnRate, hasRateSample, len(accounts) >= 2)
 	}
-	if len(accounts) >= 2 || hasExtraOrOrphan {
+
+	// Multi-Account Overview Table (only when 2+ accounts are bound)
+	if len(accounts) >= 2 {
 		m.renderLiveAccountsTable(c, pal, acc)
 	}
 }
@@ -1912,6 +1911,327 @@ func (m *MainUI) quickCardButtonStyled(c *ui.Context, pal Palette, label string,
 	})
 }
 
+type runningMachineRow struct {
+	account      core.AccountProfile
+	session      core.ColabSessionItem
+	isPrimary    bool
+	isWebManual  bool
+	isStopping   bool
+	hardwareSpec string
+	statusText   string
+	vramRatio    float32
+	hasVRAM      bool
+	rateText     string
+	rateAmber    bool
+}
+
+func primaryRowStatusAndVRAM(rt core.AccountRuntimeState) (string, float32, bool) {
+	if rt.Phase.Kind == core.PhaseStopping {
+		return "正在关机…", 0, false
+	}
+	if rt.VRAMTotalMB > 0 {
+		return fmt.Sprintf("显存 %.1f/%.0fG", float64(rt.VRAMUsedMB)/1024.0, float64(rt.VRAMTotalMB)/1024.0), float32(rt.VRAMRatio()), true
+	}
+	return "运行中", 0, false
+}
+
+func formatSessionRateEstimate(acc core.AccountProfile, rt core.AccountRuntimeState, sess core.ColabSessionItem, accRowCount int) string {
+	singleConfirmed := accRowCount == 1 && rt.CURatePerHour > 0 && (rt.ActiveAssignments == 0 || rt.ActiveAssignments == 1)
+	if singleConfirmed {
+		return fmt.Sprintf("%.2f CU/h", rt.CURatePerHour)
+	}
+	if acc.Tier == core.TierFree && rt.CURatePerHour == 0 {
+		return "免费池"
+	}
+	if core.NormalizeHardwareKey(sess.Hardware) != "" {
+		return fmt.Sprintf("约 %.2f CU/h", core.EstimatedHourlyCU(sess.Hardware))
+	}
+	return "费率未知"
+}
+
+func (m *MainUI) collectRunningMachineRows(accounts []core.AccountProfile) ([]runningMachineRow, float64, bool) {
+	var rows []runningMachineRow
+	totalRate := 0.0
+	hasRateSample := false
+	seenEndpoints := map[string]bool{}
+	seenBillingIdent := map[string]bool{}
+
+	for _, acc := range accounts {
+		rt := m.Svc.StateFor(acc.ID)
+		var accRows []runningMachineRow
+		hasPrimaryInSessions := false
+		isStoppingPrimary := rt.Phase.Kind == core.PhaseStopping
+
+		for _, sess := range rt.Sessions {
+			ep := strings.TrimSpace(sess.Endpoint)
+			if ep != "" && seenEndpoints[ep] {
+				continue
+			}
+			isPrimary := !sess.IsOrphan && sess.Name == acc.SessionName
+			if isPrimary {
+				hasPrimaryInSessions = true
+			}
+			hw := strings.TrimSpace(sess.Hardware)
+			if hw == "" && isPrimary {
+				hw = rt.ShortGPUName()
+			}
+			if hw == "" {
+				hw = "GPU"
+			}
+			shape := strings.TrimSpace(sess.Shape)
+			spec := hw
+			if shape != "" {
+				spec = fmt.Sprintf("%s · %s", hw, shape)
+			}
+
+			statusText := "运行中"
+			var vramRatio float32
+			hasVRAM := false
+			stoppingRow := false
+			if isPrimary {
+				statusText, vramRatio, hasVRAM = primaryRowStatusAndVRAM(rt)
+				stoppingRow = isStoppingPrimary
+			} else if sess.IsOrphan {
+				statusText = "运行中 · 读不到显存"
+			}
+			if ep != "" {
+				seenEndpoints[ep] = true
+			}
+
+			accRows = append(accRows, runningMachineRow{
+				account:      acc,
+				session:      sess,
+				isPrimary:    isPrimary,
+				isWebManual:  sess.IsOrphan,
+				isStopping:   stoppingRow,
+				hardwareSpec: spec,
+				statusText:   statusText,
+				vramRatio:    vramRatio,
+				hasVRAM:      hasVRAM,
+			})
+		}
+
+		// Ensure a running or stopping primary machine still appears before the next sessions refresh arrives
+		if (rt.Phase.IsRunning() || isStoppingPrimary) && !hasPrimaryInSessions {
+			ep := strings.TrimSpace(rt.ActiveEndpoint)
+			if ep == "" || !seenEndpoints[ep] {
+				if ep != "" {
+					seenEndpoints[ep] = true
+				}
+				hw := rt.ShortGPUName()
+				if hw == "" {
+					hw = "GPU"
+				}
+				statusText, vramRatio, hasVRAM := primaryRowStatusAndVRAM(rt)
+				accRows = append(accRows, runningMachineRow{
+					account: acc,
+					session: core.ColabSessionItem{
+						Name:     acc.SessionName,
+						Endpoint: ep,
+						Hardware: hw,
+					},
+					isPrimary:    true,
+					isStopping:   isStoppingPrimary,
+					hardwareSpec: hw,
+					statusText:   statusText,
+					vramRatio:    vramRatio,
+					hasVRAM:      hasVRAM,
+				})
+			}
+		}
+
+		// Deduplicate account-level billing across duplicate bindings of the same Google email
+		billingKey := strings.ToLower(strings.TrimSpace(acc.Email))
+		if billingKey == "" {
+			billingKey = "id:" + acc.ID
+		}
+		if !seenBillingIdent[billingKey] {
+			if rt.LastUsageFetchAt != nil || rt.CURatePerHour > 0 {
+				hasRateSample = true
+			}
+			if rt.CURatePerHour > 0 && (len(accRows) > 0 || rt.ActiveAssignments > 0) {
+				totalRate += rt.CURatePerHour
+			}
+			seenBillingIdent[billingKey] = true
+		}
+
+		for i := range accRows {
+			r := &accRows[i]
+			if r.isStopping {
+				r.rateText = "停机中"
+			} else {
+				r.rateText = formatSessionRateEstimate(acc, rt, r.session, len(accRows))
+			}
+			r.rateAmber = r.isWebManual
+		}
+		rows = append(rows, accRows...)
+	}
+	return rows, totalRate, hasRateSample
+}
+
+func (m *MainUI) renderRunningMachinesCard(c *ui.Context, pal Palette, rows []runningMachineRow, totalRate float64, hasRateSample bool, showAccountName bool) {
+	const (
+		colHW     float32 = 136
+		colStatus float32 = 162
+		colRate   float32 = 104
+		colAct    float32 = 96
+	)
+	hasWebManual := false
+	for _, r := range rows {
+		if r.isWebManual {
+			hasWebManual = true
+			break
+		}
+	}
+	managedCount := m.Svc.TotalManagedRunningSessionCount()
+
+	PrecisionCard(c, pal, 16, 18, func() {
+		ui.Row(c).FillWidth().Gap(10).Padding(0, 6).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).Grow(1).MinWidth(220).Gap(10).AlignItems(ui.Center).Children(func() {
+				ui.Textf(c, "运行中的云端机器 (%d)", len(rows)).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
+				if managedCount >= 2 {
+					stopAllLabel := "⏻ 全部关机止损"
+					if hasWebManual {
+						stopAllLabel = fmt.Sprintf("⏻ 关闭本软件 %d 台", managedCount)
+					}
+					SmallActionButton(c, pal, stopAllLabel, &pal.Coral, false, func() {
+						m.Svc.RequestConfirmStopAll()
+					})
+				}
+			})
+			rateSummary := "扣点同步中"
+			rateSummaryCol := pal.TextMuted
+			if totalRate > 0 {
+				rateSummary = fmt.Sprintf("实时总扣点 %.2f CU/h", totalRate)
+				if hasWebManual {
+					rateSummaryCol = pal.Amber
+				} else {
+					rateSummaryCol = pal.Emerald
+				}
+			} else if hasRateSample {
+				rateSummary = "实时总扣点 0.00 CU/h"
+			}
+			ui.Text(c, rateSummary).FontSize(12.5).FontWeight(600).FontFeatures("tnum").TextColor(rateSummaryCol).MaxLines(1)
+		})
+
+		ui.Row(c).FillWidth().Gap(10).Padding(2, 6, 0, 6).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "来源与标识").FontSize(11.5).FontWeight(500).TextColor(pal.TextFaint).Grow(1).MinWidth(210).MaxLines(1)
+			ui.Text(c, "显卡与规格").FontSize(11.5).FontWeight(500).TextColor(pal.TextFaint).Width(colHW).MaxLines(1)
+			ui.Text(c, "运行状态").FontSize(11.5).FontWeight(500).TextColor(pal.TextFaint).Width(colStatus).MaxLines(1)
+			ui.Text(c, "扣点速率").FontSize(11.5).FontWeight(500).TextColor(pal.TextFaint).Width(colRate).TextAlign(ui.End).MaxLines(1)
+			ui.Text(c, "操作").FontSize(11.5).FontWeight(500).TextColor(pal.TextFaint).Width(colAct).TextAlign(ui.End).MaxLines(1)
+		})
+
+		ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
+
+		for idx, item := range rows {
+			if idx > 0 {
+				ui.Box(c).FillWidth().Height(1).Background(pal.RowDivider)
+			}
+			rowCopy := item
+			rowEl := ui.Row(c).FillWidth().Gap(10).Padding(8, 8).Radius(9).AlignItems(ui.Center)
+			if rowCopy.isWebManual {
+				rowEl.Background(WithAlpha(pal.Amber, 0.05)).Border(1, WithAlpha(pal.Amber, 0.24))
+			}
+			rowEl.Children(func() {
+				// Column 1: LED + Source badge + concise identifier
+				ui.Row(c).Grow(1).MinWidth(210).Gap(8).AlignItems(ui.Center).Children(func() {
+					ledCol := pal.Emerald
+					badgeText := "本软件"
+					badgeTint := pal.Emerald
+					label := rowCopy.account.DisplayName
+					if !showAccountName {
+						if rowCopy.isPrimary {
+							label = rowCopy.account.DeployRecipe.DisplayName()
+							if rowCopy.account.DeployRecipe == core.RecipeH3Video {
+								label = rowCopy.account.H3Variant.DisplayName()
+							}
+						} else if !rowCopy.isWebManual {
+							label = rowCopy.session.Name
+						} else {
+							label = "网页或其他设备开启"
+						}
+					}
+					if rowCopy.isStopping {
+						ledCol = pal.Coral
+						badgeText = "关机中"
+						badgeTint = pal.Coral
+					} else if rowCopy.isWebManual {
+						ledCol = pal.Amber
+						badgeText = "需去网页关"
+						badgeTint = pal.Amber
+					} else if !rowCopy.isPrimary {
+						badgeText = "本机其他任务"
+						badgeTint = pal.Sky
+						if showAccountName && rowCopy.session.Name != "" {
+							label = fmt.Sprintf("%s · %s", rowCopy.account.DisplayName, rowCopy.session.Name)
+						}
+					}
+					DrawPrecisionLED(c, ledCol, 11)
+					Badge(c, pal, badgeText, &badgeTint)
+					ui.Text(c, label).FontSize(12.5).FontWeight(500).TextColor(pal.TextPrimary).Grow(1).MaxLines(1).Ellipsis("…")
+				})
+
+				// Column 2: Hardware & shape
+				ui.Text(c, rowCopy.hardwareSpec).FontSize(13).FontWeight(600).TextColor(pal.TextPrimary).Width(colHW).MaxLines(1).Ellipsis("…")
+
+				// Column 3: Status / VRAM
+				ui.Row(c).Width(colStatus).Gap(8).AlignItems(ui.Center).Children(func() {
+					if rowCopy.hasVRAM {
+						barTint := pal.Emerald
+						if rowCopy.vramRatio >= 0.94 {
+							barTint = pal.Amber
+						}
+						ratio := rowCopy.vramRatio
+						ui.Box(c).Width(46).Height(6).Draw(func(p *ui.Painter, rect ui.Rect) {
+							p.Fill(rect, pal.SubtleBg, 3)
+							p.Fill(ui.Rect{X: rect.X, Y: rect.Y, W: rect.W * ratio, H: rect.H}, barTint, 3)
+						})
+						ui.Text(c, rowCopy.statusText).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+					} else {
+						stCol := pal.TextMuted
+						if rowCopy.isStopping {
+							stCol = pal.Coral
+						} else if rowCopy.isWebManual {
+							stCol = pal.TextFaint
+						}
+						ui.Text(c, rowCopy.statusText).FontSize(12).TextColor(stCol).MaxLines(1).Ellipsis("…")
+					}
+				})
+
+				// Column 4: Burn rate
+				rCol := pal.TextPrimary
+				if rowCopy.isStopping {
+					rCol = pal.TextMuted
+				} else if rowCopy.rateAmber {
+					rCol = pal.Amber
+				}
+				ui.Text(c, rowCopy.rateText).FontSize(12.5).FontWeight(600).FontFeatures("tnum").TextColor(rCol).Width(colRate).TextAlign(ui.End).MaxLines(1)
+
+				// Column 5: Action (always clickable; web manual machines open 3-step guide modal)
+				ui.Row(c).Width(colAct).Justify(ui.End).AlignItems(ui.Center).Children(func() {
+					switch {
+					case rowCopy.isStopping:
+						SmallActionButton(c, pal, "关机中…", &pal.Coral, true, nil)
+					case rowCopy.isWebManual:
+						SmallActionButton(c, pal, "关机 ↗", &pal.Amber, false, func() {
+							m.Svc.RequestWebStopGuide(rowCopy.account.ID, rowCopy.session, rowCopy.rateText)
+						})
+					case rowCopy.isPrimary:
+						SmallActionButton(c, pal, "关机", &pal.Coral, false, func() {
+							m.Svc.RequestConfirmStop(rowCopy.account.ID)
+						})
+					default:
+						SmallActionButton(c, pal, "关机", &pal.Coral, false, func() {
+							m.Svc.RequestConfirmStopSession(rowCopy.account.ID, rowCopy.session.Name)
+						})
+					}
+				})
+			})
+		}
+	}).Gap(8)
+}
+
 // MARK: - Bottom Mole-Style Live Sessions & Accounts Table
 
 func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected core.AccountProfile) {
@@ -1929,11 +2249,6 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 		ui.Row(c).FillWidth().Gap(10).Padding(0, 6).AlignItems(ui.Center).Children(func() {
 			ui.Row(c).Grow(1).MinWidth(220).Gap(10).AlignItems(ui.Center).Children(func() {
 				ui.Textf(c, "账号与活跃会话 (%d)", len(accounts)).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1)
-				if m.Svc.TotalManagedRunningSessionCount() >= 2 {
-					SmallActionButton(c, pal, "⏻ 全部关机止损", &pal.Coral, false, func() {
-						m.Svc.RequestConfirmStopAll()
-					})
-				}
 			})
 			ui.Text(c, "硬件与形态").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colHW).MaxLines(1)
 			ui.Text(c, "显存占用").FontSize(12).FontWeight(500).TextColor(pal.TextMuted).Width(colVRAM).MaxLines(1)
@@ -2060,36 +2375,6 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 					}
 				})
 			})
-
-			// Surface any extra live machine right below the account row
-			for _, sess := range rt.Sessions {
-				if !sess.IsOrphan && sess.Name == accCopy.SessionName {
-					continue
-				}
-				sessCopy := sess
-				ui.Row(c).FillWidth().Gap(10).Padding(5, 6, 5, 24).AlignItems(ui.Center).Children(func() {
-					label := fmt.Sprintf("⚠ 另一台运行中的机器：%s", sessCopy.Name)
-					if sessCopy.IsOrphan {
-						label = "⚠ Colab 网页端运行中（需去网页关闭）"
-					}
-					ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(pal.Amber).Grow(1).MinWidth(200).MaxLines(1).Ellipsis("…")
-					ui.Textf(c, "%s · %s", sessCopy.Hardware, sessCopy.Shape).FontSize(12).TextColor(pal.TextMuted).Width(colHW).MaxLines(1)
-					ui.Box(c).Width(colVRAM)
-					ui.Box(c).Width(colCU)
-					ui.Box(c).Width(colRate)
-					ui.Row(c).Width(colAct).Justify(ui.End).Children(func() {
-						if !sessCopy.IsOrphan {
-							SmallActionButton(c, pal, "关机", &pal.Coral, false, func() {
-								m.Svc.RequestConfirmStopSession(accCopy.ID, sessCopy.Name)
-							})
-						} else {
-							SmallActionButton(c, pal, "打开网页", &pal.Sky, false, func() {
-								m.Svc.OpenColabInBrowser(accCopy.ID)
-							})
-						}
-					})
-				})
-			}
 		}
 	}).Gap(10)
 }

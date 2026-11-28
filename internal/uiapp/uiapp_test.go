@@ -1153,3 +1153,100 @@ func TestV0320PopoverScrollOnboardingAndMinHeightOverlays(t *testing.T) {
 		}
 	}
 }
+
+func TestV0323RunningMachinesCardAndWebStopGuideModal(t *testing.T) {
+	svc := makeDemoService(app.SectionHome, false, false)
+	// Keep single account with both managed A100 and external web-opened T4 running concurrently
+	acc := svc.Settings.Accounts[0]
+	acc.Email = "demo-user@example.com"
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	rt := svc.Runtime[acc.ID]
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveHardware = "A100"
+	rt.ActiveEndpoint = "ep-managed-a100"
+	rt.GPUName = "NVIDIA A100-SXM4-80GB"
+	rt.VRAMUsedMB = 46899
+	rt.VRAMTotalMB = 81920
+	rt.CURatePerHour = 13.87
+	rt.Sessions = []core.ColabSessionItem{
+		{Name: acc.SessionName, Endpoint: "ep-managed-a100", Hardware: "A100", Shape: "High-RAM", Variant: "GPU"},
+		{Name: "?", Endpoint: "ep-web-t4", Hardware: "T4", Shape: "High-RAM", Variant: "GPU", IsOrphan: true},
+	}
+	svc.Runtime[acc.ID] = rt
+
+	var openedURL string
+	svc.URLOpener = func(u string) { openedURL = u }
+
+	m := uiapp.NewMainUI(svc)
+	m.PreviewMode = true
+	m.ForceTheme = "dark"
+
+	tester := ui.NewTester(m.View, 1160, 880)
+	for _, want := range []string{
+		"运行中的云端机器 (2)",
+		"实时总扣点 13.87 CU/h",
+		"本软件",
+		"需去网页关",
+		"A100 · High-RAM",
+		"T4 · High-RAM",
+		"运行中 · 读不到显存",
+		"关机 ↗",
+	} {
+		if !tester.HasText(want) {
+			t.Fatalf("missing %q in running machines card: %q", want, tester.Texts())
+		}
+	}
+
+	if qaDir := os.Getenv("COLAB_TOOLS_V0323_QA_DIR"); qaDir != "" {
+		_ = os.MkdirAll(qaDir, 0o755)
+		renderPNG(t, m.View, 1160, 880, filepath.Join(qaDir, "v0323-running-machines-mixed-1160x880.png"))
+		renderPNG(t, m.View, 980, 860, filepath.Join(qaDir, "v0323-running-machines-mixed-980x860.png"))
+	}
+
+	// Verify duplicate-bound account with same email deduplicates endpoints & burn rate cleanly
+	dupAcc := acc
+	dupAcc.ID = "dup-same-email"
+	svc.Settings.Accounts = append(svc.Settings.Accounts, dupAcc)
+	svc.Runtime[dupAcc.ID] = rt
+	dupTester := ui.NewTester(m.View, 980, 960)
+	if !dupTester.HasText("运行中的云端机器 (2)") || !dupTester.HasText("实时总扣点 13.87 CU/h") {
+		t.Fatalf("expected duplicate email account deduplicated to 2 machines & 13.87 CU/h, got %q", dupTester.Texts())
+	}
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+
+	// Clicking "关机 ↗" at minimum width 980 must open the 3-step manual stop guidance modal
+	minTester := ui.NewTester(m.View, 980, 860)
+	if err := minTester.Click("关机 ↗"); err != nil {
+		t.Fatalf("click web machine stop button at 980px failed: %v", err)
+	}
+	p := svc.CurrentActionPrompt()
+	if p == nil || p.Kind != core.PromptWebStopGuide {
+		t.Fatalf("expected PromptWebStopGuide after clicking 关机 ↗, got %+v", p)
+	}
+
+	modalTester := ui.NewTester(m.View, 980, 660)
+	for _, want := range []string{
+		"这台 T4 需到 Colab 网页手动关闭",
+		"第 1 步：",
+		"第 2 步：",
+		"第 3 步：",
+		"打开 Colab 网页 ↗",
+		"我知道了",
+	} {
+		if !modalTester.HasText(want) {
+			t.Fatalf("missing %q in web stop guide modal: %q", want, modalTester.Texts())
+		}
+	}
+	if qaDir := os.Getenv("COLAB_TOOLS_V0323_QA_DIR"); qaDir != "" {
+		renderPNG(t, m.View, 980, 660, filepath.Join(qaDir, "v0323-web-stop-guide-980x660.png"))
+	}
+
+	if err := modalTester.Click("打开 Colab 网页 ↗"); err != nil {
+		t.Fatalf("click open colab web button failed: %v", err)
+	}
+	if svc.CurrentActionPrompt() != nil || openedURL != "https://colab.research.google.com/?authuser=demo-user%40example.com" {
+		t.Fatalf("expected prompt dismissed and Colab web home opened, prompt=%+v url=%q", svc.CurrentActionPrompt(), openedURL)
+	}
+}
