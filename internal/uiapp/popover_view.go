@@ -111,11 +111,12 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 		rt := p.Svc.StateFor(acc.ID)
 		if rt.Phase.IsRunning() {
 			dotCol = pal.Emerald
-			if acc.EnableLLMModule {
+			sessRecipe, sessVariant, sessKind, sessLLM := rt.EffectiveSessionState(acc)
+			if sessLLM {
 				pill = fmt.Sprintf("%s · %dK", rt.ShortGPUName(), rt.ContextLimit/1024)
-			} else if acc.DeployRecipe == core.RecipeH3Video {
+			} else if sessRecipe == core.RecipeH3Video {
 				shortV := "H3 Flash"
-				switch acc.H3Variant {
+				switch sessVariant {
 				case core.H3VariantOriginal:
 					shortV = "H3 原版"
 				case core.H3VariantFlashGGUF:
@@ -125,7 +126,7 @@ func (p *PopoverUI) renderHeader(c *ui.Context, pal Palette) {
 				}
 				pill = fmt.Sprintf("%s · %s", rt.ShortGPUName(), shortV)
 			} else {
-				pill = fmt.Sprintf("%s · %s", rt.ShortGPUName(), acc.WorkloadKind.DisplayName())
+				pill = fmt.Sprintf("%s · %s", rt.ShortGPUName(), sessKind.DisplayName())
 			}
 		}
 	}
@@ -211,7 +212,7 @@ func (p *PopoverUI) renderMultiOverview(c *ui.Context, pal Palette, accounts []c
 				}).Children(func() {
 					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 						ui.Text(c, acc.DisplayName).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
-						Badge(c, pal, acc.Tier.ShortBadge(), nil)
+						Badge(c, pal, acc.DisplayTierBadge(), nil)
 					})
 					sub := acc.Email
 					if rt.Phase.IsRunning() {
@@ -250,11 +251,15 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
 			ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
-				ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+				if !rt.Phase.IsRunning() && rt.LastUsageFetchAt == nil && rt.CURatePerHour == 0 {
+					ui.Text(c, "读取中…").FontSize(22).Bold().TextColor(pal.TextMuted)
+				} else {
+					ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
+				}
 				ui.Text(c, st).FontSize(13).FontWeight(600).TextColor(stCol).Padding(0, 0, 4, 0)
 			})
 			ui.Row(c).Gap(6).Children(func() {
-				Badge(c, pal, acc.Tier.ShortBadge(), nil)
+				Badge(c, pal, acc.DisplayTierBadge(), nil)
 				if rt.Phase.IsRunning() {
 					Badge(c, pal, rt.ShortGPUName(), nil)
 					Badge(c, pal, core.FormatDuration(rt.SessionUptimeSec), nil)
@@ -291,10 +296,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		})
 	}
 
-	taskLabel := acc.DeployRecipe.DisplayName()
-	if acc.DeployRecipe == core.RecipeH3Video {
-		taskLabel = acc.H3Variant.DisplayName()
-	}
+	taskLabel := rt.EffectiveSessionTaskLabel(acc)
 
 	if rt.Phase.IsRunning() {
 		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
@@ -316,16 +318,16 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		hrs, basis, ok := rt.EstimatedHoursRemaining(acc)
 		energyRatio := 0.0
 		if ok {
-			capHours := float64(max(24, acc.Tier.MaxSessionHours()))
+			capHours := float64(max(24, acc.MaxSessionHours()))
 			energyRatio = math.Min(1.0, math.Max(0.05, hrs/capHours))
 		}
-		SectionCard(c, pal, "算力续航与方案", fmt.Sprintf("上限 %dh", acc.Tier.MaxSessionHours()), func() {
+		SectionCard(c, pal, "算力续航与方案", fmt.Sprintf("上限 %dh", acc.MaxSessionHours()), func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 				ui.Column(c).Grow(1).Gap(2).Children(func() {
 					if ok {
 						ui.Textf(c, "%.0f 小时（按 %s）", hrs, basis).FontSize(15.5).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
 					} else {
-						ui.Text(c, acc.Tier.DisplayName()).FontSize(15).Bold().TextColor(pal.TextPrimary)
+						ui.Text(c, acc.DisplayTierBadge()).FontSize(15).Bold().TextColor(pal.TextPrimary)
 					}
 					ui.Text(c, fmt.Sprintf("%s · %s", taskLabel, core.EffectiveGPUPlanSummary(acc))).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
 				})
@@ -340,16 +342,18 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 	} else {
 		rateSummary := "已关机 · 0.00 CU/h"
 		rateColor := pal.TextMuted
-		if rt.CURatePerHour > 0 {
+		if rt.LastUsageFetchAt == nil && rt.CURatePerHour == 0 {
+			rateSummary = "正在读取点数与状态…"
+		} else if rt.CURatePerHour > 0 {
 			rateSummary = fmt.Sprintf("有其他会话计费 · %.2f CU/h", rt.CURatePerHour)
 			rateColor = pal.Amber
 		}
-		SectionCard(c, pal, "当前状态与方案", acc.Tier.ShortBadge(), func() {
+		SectionCard(c, pal, "当前状态与方案", acc.DisplayTierBadge(), func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
 				ui.Column(c).Grow(1).Gap(3).Children(func() {
 					ui.Text(c, rateSummary).FontSize(14.5).Bold().FontFeatures("tnum").TextColor(rateColor)
 					ui.Text(c, fmt.Sprintf("当前任务：%s", taskLabel)).FontSize(12).TextColor(pal.TextPrimary).MaxLines(1).Ellipsis("…")
-					ui.Text(c, fmt.Sprintf("挑卡策略：%s", core.EffectiveGPUPlanSummary(acc))).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+					ui.Text(c, core.PrelaunchSummary(acc)).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
 				})
 				SmallActionButton(c, pal, "换方案 ›", nil, false, func() {
 					if p.OnOpenMain != nil {
@@ -360,7 +364,7 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 		})
 	}
 
-	effMins := core.EffectiveIdleTimeoutMinutes(acc)
+	effMins := rt.EffectiveSessionIdleTimeout(acc)
 	remMin := max(0, (rt.RemainingIdleSeconds(effMins)+59)/60)
 	guardStatus := "未开启"
 	if acc.AutoShutdownEnabled {
@@ -373,7 +377,8 @@ func (p *PopoverUI) renderSingleDetail(c *ui.Context, pal Palette, acc core.Acco
 	SectionCard(c, pal, "快捷操作", guardStatus, func() {
 		hasTargets := acc.AutoSyncCCSwitch || acc.AutoSyncOpenCode || acc.AutoSyncCodex
 		allSynced := hasTargets && (!acc.AutoSyncCCSwitch || rt.CCSwitchSynced) && (!acc.AutoSyncOpenCode || rt.OpenCodeSynced) && (!acc.AutoSyncCodex || rt.CodexSynced)
-		isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || acc.WorkloadKind == core.WorkloadVideo)
+		sessRecipe, _, sessKind, sessLLM := rt.EffectiveSessionState(acc)
+		isVideo := !sessLLM && (sessRecipe.IsVideoComfy() || sessKind == core.WorkloadVideo)
 		amber := pal.Amber
 		ui.Row(c).FillWidth().Gap(7).Children(func() {
 			if isVideo {

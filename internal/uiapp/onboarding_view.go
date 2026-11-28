@@ -236,7 +236,7 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(3).Children(func() {
 				ui.Text(c, "绑定你的第一个 Google Colab 账号").FontSize(16).FontWeight(600).TextColor(pal.TextPrimary)
-				ui.Text(c, "凭证仅加密存于本机 macOS 钥匙串；支持同时绑定多个 AI Ultra / Pro+ / Pro / Free 账号。").FontSize(12.5).TextColor(pal.TextMuted)
+				ui.Text(c, "凭证仅加密存于本机 macOS 钥匙串；绑定后自动识别你的邮箱、余额与实际可用显卡。").FontSize(12.5).TextColor(pal.TextMuted)
 			})
 			SmallActionButton(c, pal, "自动导入终端已登账号", nil, !vs.CLIInstalled || vs.IsImportingDefault, func() {
 				go func() {
@@ -255,14 +255,18 @@ func (m *MainUI) onboardingStep2Accounts(c *ui.Context, pal Palette) {
 				ui.Row(c).FillWidth().Padding(12).Radius(12).Background(pal.RecessedBg).Border(1, pal.RecessedBorder).InsetShadow(0, 1, 2, 0, pal.RecessedInnerShadow).AlignItems(ui.Center).Gap(10).Children(func() {
 					DrawPrecisionLED(c, AccountTagColor(pal, acc.ColorTag), 13)
 					ui.Column(c).Grow(1).Gap(2).Children(func() {
-						ui.Textf(c, "%s · %s", acc.DisplayName, acc.Tier.DisplayName()).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
+						ui.Textf(c, "%s · %s", acc.DisplayName, acc.DisplayTierBadge()).FontSize(13.5).FontWeight(600).TextColor(pal.TextPrimary)
 						email := acc.Email
 						if email == "" {
-							email = "默认官方 CLI 账号"
+							email = "本机已登录的 Google 账号"
 						}
-						ui.Text(c, email).FontSize(12).TextColor(pal.TextMuted)
+						ui.Textf(c, "%s · 可用显卡：%s", email, acc.EligibleCardsSummary()).FontSize(12).TextColor(pal.TextMuted)
 					})
-					ui.Textf(c, "%s CU", core.FormatCU(rt.CUBalance)).FontSize(14).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
+					balTxt := "读取中…"
+					if rt.LastUsageFetchAt != nil {
+						balTxt = fmt.Sprintf("%s CU", core.FormatCU(rt.CUBalance))
+					}
+					ui.Text(c, balTxt).FontSize(14).FontWeight(600).FontFeatures("tnum").TextColor(pal.TextPrimary)
 					e := pal.Emerald
 					StatusPill(c, pal, &e, "已绑定")
 				})

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2218,5 +2220,392 @@ func TestStopVerificationRejectsStillAliveOrphanEndpointAndPreservesVideoGuard(t
 	}
 	if !flushed {
 		t.Fatal("expected pre-stop workflow flush to still run for live video ComfyUI session even after user switched next-run recipe to LLM")
+	}
+}
+
+func TestBindingUsesEligibleGPUsAndPopulatesInitialBalance(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		switch {
+		case strings.Contains(cmd, "whoami"):
+			return runner.Result{ExitCode: 0, Stdout: "Auth provider: oauth2\nEmail: aipro200@example.com\nExpires in: 59m\n"}
+		case strings.Contains(cmd, "usage"):
+			return runner.Result{
+				ExitCode: 0,
+				Stdout:   "Current balance: 200.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n",
+				Stderr:   "DEBUG - Response Body: )]}'\n{\"currentBalance\":200.0,\"consumptionRateHourly\":0,\"assignmentsCount\":0,\"eligibleGpus\":[\"A100\",\"L4\",\"T4\"],\"eligibleTpus\":[\"V5E1\"]}\n",
+			}
+		case strings.Contains(cmd, "sessions"):
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		default:
+			return runner.Result{ExitCode: 0}
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	if ok := svc.TryImportSystemDefaultAccount(); !ok {
+		t.Fatal("expected TryImportSystemDefaultAccount to succeed")
+	}
+	acc, ok := svc.SelectedAccount()
+	if !ok {
+		t.Fatal("expected imported account selected")
+	}
+	if acc.Tier == core.TierColabProPlus {
+		t.Fatalf("200 CU account with only A100/L4/T4 eligible must NOT be misclassified as Pro+, got %v", acc.Tier)
+	}
+	if acc.HasHighTierGPU() {
+		t.Fatalf("expected HasHighTierGPU=false, eligible=%v", acc.EligibleAccelerators)
+	}
+	if targets := core.EffectiveQueueTargets(acc); len(targets) != 2 || targets[0] != core.AccA100 || targets[1] != core.AccL4 {
+		t.Fatalf("expected A100->L4 queue targets, got %v", targets)
+	}
+	rt := svc.StateFor(acc.ID)
+	if rt.LastUsageFetchAt == nil || rt.CUBalance != 200.0 {
+		t.Fatalf("expected initial runtime immediately populated with 200.0 CU, got bal=%.2f fetchAt=%v", rt.CUBalance, rt.LastUsageFetchAt)
+	}
+}
+
+func TestRunningModeSwitchPromptPreservesSessionWatchdogAndSupportsRedeploy(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+
+	acc := core.NewDefaultAccountProfile("SwitchUser", "switch@example.com", core.TierAIPro, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.H3Variant = core.H3VariantFlash
+	acc.WorkloadKind = core.WorkloadVideo
+	acc.EnableLLMModule = false
+	acc.IdleTimeoutMinutes = 10
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	now := time.Now()
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-video-1"
+	rt.ActiveHardware = "A100"
+	rt.SessionLocked = true
+	rt.SessionRecipe = core.RecipeH3Video
+	rt.SessionH3Variant = core.H3VariantFlash
+	rt.SessionWorkloadKind = core.WorkloadVideo
+	rt.SessionEnableLLM = false
+	rt.SessionIdleTimeoutMin = 10
+	rt.SessionIsVideoComfy = true
+	rt.QueueRunning = 1
+	rt.QueuePending = 2
+	rt.TempOutputScanKnown = true
+	rt.TempOutputVideos = 2
+	svc.Runtime[acc.ID] = rt
+
+	// Clicking LLM Proxy while video is running must prompt user with two choices and risk summary
+	svc.RequestSelectTaskPreset(acc.ID, core.RecipeLLMProxy, "")
+	p := svc.CurrentActionPrompt()
+	if p == nil || p.Kind != core.PromptSwitchModeWhileRunning {
+		t.Fatalf("expected PromptSwitchModeWhileRunning, got %+v", p)
+	}
+	if !strings.Contains(p.Message, "1 条正在渲染") || !strings.Contains(p.Message, "2 条排队中") || !strings.Contains(p.Message, "2 条未存网盘的视频") {
+		t.Fatalf("expected active risk details in switch prompt, got %q", p.Message)
+	}
+
+	// Primary action: next boot only -> profile updates to LLM Proxy, running session stays video + 10m + ComfyUI telemetry works
+	svc.ResolveActionPrompt("primary")
+	updatedAcc, _ := svc.SelectedAccount()
+	if updatedAcc.DeployRecipe != core.RecipeLLMProxy || !updatedAcc.EnableLLMModule {
+		t.Fatalf("expected next-boot preset saved as LLM Proxy, got %+v", updatedAcc)
+	}
+	liveRT := svc.StateFor(acc.ID)
+	if liveRT.EffectiveSessionEnableLLM(updatedAcc) {
+		t.Fatal("running video session must stay non-LLM after choosing next-boot only")
+	}
+	if liveRT.EffectiveSessionIdleTimeout(updatedAcc) != 10 {
+		t.Fatalf("running video idle timeout must stay 10m, got %d", liveRT.EffectiveSessionIdleTimeout(updatedAcc))
+	}
+	if !liveRT.HasPendingModeSwitch(updatedAcc) {
+		t.Fatal("expected HasPendingModeSwitch=true")
+	}
+
+	// Verify fetchAndApplyTelemetry still polls ComfyUI queue signal for the locked video session despite acc.EnableLLMModule=true
+	fr := &fakeRunner{}
+	fr.onShell = func(_ string) runner.Result {
+		return runner.Result{
+			ExitCode: 0,
+			Stdout:   "HEALTH=ok\nCOMFY_QUEUE={\"queue_running\":[],\"queue_pending\":[]}\n",
+		}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+	svc.fetchAndApplyTelemetry(updatedAcc, "ep-video-1")
+	afterTel := svc.StateFor(acc.ID)
+	if afterTel.SignalSource != core.SignalSourceComfyQueue || afterTel.ActivitySignal.Kind != core.SignalIdle {
+		t.Fatalf("expected locked video session to keep refreshing ComfyUI idle signal, got src=%v kind=%v", afterTel.SignalSource, afterTel.ActivitySignal.Kind)
+	}
+	_ = now
+}
+
+func TestTempOutputGuardWithDriveDisabledEnforcesGraceExpiryAndManualStopWarning(t *testing.T) {
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+	svc.tempOutputGraceDuration = 15 * time.Minute
+
+	acc := core.NewDefaultAccountProfile("TempUser", "temp@example.com", core.TierAIPro, core.AuthSystemDefaultOAuth2)
+	acc.DeployRecipe = core.RecipeH3Video
+	acc.UseGoogleDrive = false // user explicitly turned off Drive autosave
+	acc.AutoShutdownEnabled = true
+	acc.IdleTimeoutMinutes = 10
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	now := time.Now()
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-temp-1"
+	rt.ActiveHardware = "L4"
+	rt.CURatePerHour = 2.33
+	rt.SessionLocked = true
+	rt.SessionRecipe = core.RecipeH3Video
+	rt.SessionH3Variant = core.H3VariantFlash
+	rt.SessionWorkloadKind = core.WorkloadVideo
+	rt.SessionEnableLLM = false
+	rt.SessionIdleTimeoutMin = 10
+	rt.SessionIsVideoComfy = true
+	rt.EffectiveOutputDir = "/content/output"
+	rt.TempOutputScanKnown = true
+	rt.TempOutputVideos = 2
+	rt.SessionNewVideoCount = 2
+	rt.SessionOutputs = []core.SessionVideoOutput{{Filename: "clip_01.mp4", Type: "output", SavedToDrive: false}}
+	rt.QueueRunning = 1
+	rt.QueuePending = 3
+	rt.IdleSeconds = 10 * 60
+	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
+	svc.Runtime[acc.ID] = rt
+
+	// Manual stop confirmation must surface queue + temp outputs and offer 3 buttons
+	svc.RequestConfirmStop(acc.ID)
+	stopPrompt := svc.CurrentActionPrompt()
+	if stopPrompt == nil || stopPrompt.Kind != core.PromptConfirmStop {
+		t.Fatalf("expected PromptConfirmStop, got %+v", stopPrompt)
+	}
+	if !strings.Contains(stopPrompt.Message, "1 条正在生成") || !strings.Contains(stopPrompt.Message, "3 条排队等待") || !strings.Contains(stopPrompt.Message, "2 条视频仅存在云电脑上") {
+		t.Fatalf("expected queue & temp risks in manual stop modal, got %q", stopPrompt.Message)
+	}
+	if stopPrompt.SecondaryLabel != "先下回本机" || stopPrompt.PrimaryLabel != "放弃并立刻关机" {
+		t.Fatalf("expected 3-button risk modal labels, got primary=%q secondary=%q", stopPrompt.PrimaryLabel, stopPrompt.SecondaryLabel)
+	}
+	svc.PresentActionPrompt(nil)
+
+	// Idle shutdown tick with Drive disabled + temp videos MUST first defer with 15m grace (not instant stop)
+	stoppedCh := make(chan string, 1)
+	fr := &fakeRunner{}
+	fr.onShell = func(cmd string) runner.Result {
+		if strings.Contains(cmd, "stop") {
+			select {
+			case stoppedCh <- cmd:
+			default:
+			}
+			return runner.Result{ExitCode: 0, Stdout: "Stopped.\n"}
+		}
+		if strings.Contains(cmd, "usage") {
+			return runner.Result{ExitCode: 0, Stdout: "Current balance: 199.0 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+		}
+		if strings.Contains(cmd, "sessions") {
+			return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+		}
+		return runner.Result{ExitCode: 0}
+	}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	svc.handleOneSecondTick(now)
+	st := svc.StateFor(acc.ID)
+	if !st.WatchdogDeferredForTempOutputs || st.TempGuardGraceUntil.IsZero() {
+		t.Fatalf("expected temp-output grace period activated even when UseGoogleDrive=false, got %+v", st)
+	}
+	guardPrompt := svc.CurrentActionPrompt()
+	if guardPrompt == nil || guardPrompt.Kind != core.PromptTempOutputGuard || !strings.Contains(guardPrompt.Message, "宽限 15 分钟") {
+		t.Fatalf("expected PromptTempOutputGuard with 15m grace notice, got %+v", guardPrompt)
+	}
+
+	// Once 15m grace period expires with fresh idle signal, watchdog MUST force stop to prevent CU burn
+	expiredAt := now.Add(16 * time.Minute)
+	svc.mu.Lock()
+	cur := svc.Runtime[acc.ID]
+	cur.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: expiredAt}
+	svc.Runtime[acc.ID] = cur
+	svc.mu.Unlock()
+
+	svc.handleOneSecondTick(expiredAt)
+	select {
+	case <-stoppedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected forced stop after 15m temp-output grace expiry")
+	}
+}
+
+func TestSessionVideoPreviewDownloadAndExactDriveSearch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/queue":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
+		case "/view":
+			if r.URL.Query().Get("filename") == "demo_clip.mp4" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("FAKE_MP4_PAYLOAD"))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(ts.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var port int
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
+
+	svc := NewService(true)
+	defer svc.Shutdown()
+	dlDir := t.TempDir()
+	svc.downloadBaseDir = dlDir
+
+	var openedURL string
+	svc.URLOpener = func(u string) { openedURL = u }
+	var revealed string
+	svc.revealFileFn = func(p string) { revealed = p }
+
+	acc := core.NewDefaultAccountProfile("MediaUser", "media@example.com", core.TierAIPro, core.AuthSystemDefaultOAuth2)
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-media-1"
+	rt.SSHTunnelActive = true
+	rt.ActiveSSHTunnelPort = &port
+	rt.SessionNewVideoCount = 1
+	rt.SessionOutputs = []core.SessionVideoOutput{
+		{Filename: "demo_clip.mp4", Subfolder: "h3", Type: "output", SavedToDrive: true},
+	}
+	svc.Runtime[acc.ID] = rt
+
+	// 1. Preview opens local ComfyUI /view URL
+	svc.PreviewLatestSessionVideo(acc.ID)
+	wantPreview := fmt.Sprintf("http://127.0.0.1:%d/view?filename=demo_clip.mp4&subfolder=h3&type=output", port)
+	if openedURL != wantPreview {
+		t.Fatalf("expected preview URL %q, got %q", wantPreview, openedURL)
+	}
+
+	// 2. Download streams MP4 into downloadBaseDir and deduplicates on repeat download
+	svc.DownloadLatestSessionVideo(acc.ID)
+	firstPath := filepath.Join(dlDir, "demo_clip.mp4")
+	raw, err := os.ReadFile(firstPath)
+	if err != nil || string(raw) != "FAKE_MP4_PAYLOAD" {
+		t.Fatalf("expected downloaded MP4 payload at %s, err=%v raw=%q", firstPath, err, string(raw))
+	}
+	if revealed != firstPath {
+		t.Fatalf("expected revealFileFn called with %q, got %q", firstPath, revealed)
+	}
+	svc.DownloadLatestSessionVideo(acc.ID)
+	secondPath := filepath.Join(dlDir, "demo_clip-2.mp4")
+	if _, err := os.Stat(secondPath); err != nil {
+		t.Fatalf("expected duplicate download saved to %s, err=%v", secondPath, err)
+	}
+
+	// 3. OpenDriveOutputs searches exact filename when newest output is saved to Drive
+	svc.OpenDriveOutputs(acc.ID)
+	if !strings.Contains(openedURL, "q=demo_clip.mp4") || !strings.Contains(openedURL, "authuser=media%40example.com") {
+		t.Fatalf("expected exact filename Drive search URL, got %q", openedURL)
+	}
+}
+
+func TestCodexReviewHardeningGraceDownloadStalePromptAndIncompatibleHardware(t *testing.T) {
+	// 1. Grace expiry reason maps to ShutdownAutoIdle (never ShutdownManual)
+	if got := mapShutdownReason("临时盘宽限到期自动关机"); got != core.ShutdownAutoIdle {
+		t.Fatalf("expected ShutdownAutoIdle for grace expiry, got %v", got)
+	}
+
+	// 2. Active download suppresses grace-expiry shutdown; stale temp-guard prompt cannot stop a new instance
+	svc := NewService(true)
+	defer svc.Shutdown()
+	svc.NotifySender = func(_, _ string) {}
+	acc := core.NewDefaultAccountProfile("Harden", "harden@example.com", core.TierAIPro, core.AuthSystemDefaultOAuth2)
+	acc.UseGoogleDrive = false
+	acc.AutoShutdownEnabled = true
+	acc.IdleTimeoutMinutes = 10
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+
+	now := time.Now()
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-old"
+	rt.SessionLocked = true
+	rt.SessionRecipe = core.RecipeH3Video
+	rt.SessionH3Variant = core.H3VariantFlash
+	rt.SessionWorkloadKind = core.WorkloadVideo
+	rt.SessionEnableLLM = false
+	rt.SessionIdleTimeoutMin = 10
+	rt.TempOutputScanKnown = true
+	rt.TempOutputVideos = 1
+	rt.IdleSeconds = 12 * 60
+	rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
+	rt.WatchdogDeferredForTempOutputs = true
+	rt.TempGuardGraceUntil = now.Add(-1 * time.Second)
+	rt.DownloadingOutput = true
+	svc.Runtime[acc.ID] = rt
+
+	stopCalled := false
+	fr := &fakeRunner{onShell: func(cmd string) runner.Result {
+		if strings.Contains(cmd, "stop") {
+			stopCalled = true
+		}
+		return runner.Result{ExitCode: 0}
+	}}
+	svc.Engine = colab.NewEngine(fr, svc.Vault)
+
+	svc.handleOneSecondTick(now)
+	time.Sleep(50 * time.Millisecond)
+	if stopCalled {
+		t.Fatal("grace-expiry shutdown must NOT interrupt an active temporary-video download")
+	}
+
+	// Stale PromptTempOutputGuard bound to ep-old must NOT stop a newer ep-new instance
+	svc.PresentActionPrompt(&core.UserActionPrompt{
+		ID:               "stale-guard",
+		Kind:             core.PromptTempOutputGuard,
+		AccountID:        acc.ID,
+		ExpectedEndpoint: "ep-old",
+		PrimaryLabel:     "保存",
+		SecondaryLabel:   "关机",
+	})
+	svc.mu.Lock()
+	cur := svc.Runtime[acc.ID]
+	cur.ActiveEndpoint = "ep-new"
+	svc.Runtime[acc.ID] = cur
+	svc.mu.Unlock()
+	svc.ResolveActionPrompt("secondary")
+	time.Sleep(50 * time.Millisecond)
+	if stopCalled {
+		t.Fatal("stale PromptTempOutputGuard for ep-old must NOT stop ep-new")
+	}
+
+	// 3. Incompatible hardware (H3 31B Original on L4/T4-only account without cross-model fallback) blocks start
+	incompat := core.NewDefaultAccountProfile("L4Only", "l4@example.com", core.TierAIPro, core.AuthSystemDefaultOAuth2)
+	incompat.EligibleAccelerators = []core.AcceleratorOption{core.AccL4, core.AccT4}
+	incompat.DeployRecipe = core.RecipeH3Video
+	incompat.H3Variant = core.H3VariantOriginal
+	incompat.AllowCrossModelFallback = false
+	svc.Settings.Accounts = append(svc.Settings.Accounts, incompat)
+	svc.Runtime[incompat.ID] = core.NewAccountRuntimeState()
+
+	svc.StartAccountSession(incompat.ID)
+	if svc.StateFor(incompat.ID).Phase.IsQueuing() {
+		t.Fatal("StartAccountSession must block H3 31B Original when account only has L4/T4 and cross-model fallback is off")
 	}
 }

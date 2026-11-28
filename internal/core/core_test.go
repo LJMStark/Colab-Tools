@@ -676,3 +676,84 @@ func TestSettingsSchemaVersionAndHistoryInFlightPersistence(t *testing.T) {
 		t.Fatalf("expected legacy file renamed to .migrated, err=%v", err)
 	}
 }
+
+func TestEligibleAcceleratorsPrelaunchSummaryAndSessionLock(t *testing.T) {
+	norm := core.NormalizeEligibleAccelerators([]string{"T4", "h100", "A100", "g4", "L4", "v6e-1", "V5E1", "A100", "unknown"})
+	wantNorm := []core.AcceleratorOption{core.AccG4, core.AccH100, core.AccA100, core.AccL4, core.AccT4, core.AccTPUV6e1, core.AccTPUV5e1}
+	if len(norm) != len(wantNorm) {
+		t.Fatalf("expected %v, got %v", wantNorm, norm)
+	}
+	for i := range wantNorm {
+		if norm[i] != wantNorm[i] {
+			t.Fatalf("index %d: expected %v, got %v", i, wantNorm[i], norm[i])
+		}
+	}
+
+	// AI Pro account with 200 CU whose server-reported eligibleGpus only contains A100/L4/T4
+	// must NEVER attempt G4 even if Tier note were Pro+.
+	aiPro := core.NewDefaultAccountProfile("AIPro200", "aipro@example.com", core.TierColabProPlus, core.AuthIsolatedVaultADC)
+	aiPro.EligibleAccelerators = []core.AcceleratorOption{core.AccA100, core.AccL4, core.AccT4}
+	aiPro.DeployRecipe = core.RecipeH3Video
+	aiPro.H3Variant = core.H3VariantFlash
+	aiPro.Sanitize()
+
+	if aiPro.HasHighTierGPU() {
+		t.Fatal("account without G4/H100 in EligibleAccelerators must NOT report HasHighTierGPU")
+	}
+	targets := core.EffectiveQueueTargets(aiPro)
+	if len(targets) != 2 || targets[0] != core.AccA100 || targets[1] != core.AccL4 {
+		t.Fatalf("expected A100->L4 for eligible-only standard paid account, got %v", targets)
+	}
+	if badge := aiPro.DisplayTierBadge(); badge != "付费卡池" {
+		t.Fatalf("expected unconfirmed eligible standard paid badge 付费卡池, got %q", badge)
+	}
+	aiPro.TierUserConfirmed = true
+	if badge := aiPro.DisplayTierBadge(); badge != "Pro+" {
+		t.Fatalf("expected user-confirmed badge Pro+, got %q", badge)
+	}
+
+	summaryDrive := core.PrelaunchSummary(aiPro)
+	if !strings.Contains(summaryDrive, "A100 → L4") || !strings.Contains(summaryDrive, "CU/h") || !strings.Contains(summaryDrive, "成片存 Google Drive") {
+		t.Fatalf("unexpected Drive PrelaunchSummary: %q", summaryDrive)
+	}
+	aiPro.UseGoogleDrive = false
+	summaryTemp := core.PrelaunchSummary(aiPro)
+	if !strings.Contains(summaryTemp, "成片仅存云电脑（关机清空）") {
+		t.Fatalf("expected explicit temp-disk warning in PrelaunchSummary, got %q", summaryTemp)
+	}
+
+	// Session state lock isolates active running session from next-boot profile mutations.
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.SessionLocked = true
+	rt.SessionRecipe = core.RecipeH3Video
+	rt.SessionH3Variant = core.H3VariantFlash
+	rt.SessionWorkloadKind = core.WorkloadVideo
+	rt.SessionEnableLLM = false
+	rt.SessionIdleTimeoutMin = 10
+
+	aiPro.DeployRecipe = core.RecipeLLMProxy
+	aiPro.EnableLLMModule = true
+	aiPro.WorkloadKind = core.WorkloadLLM
+	aiPro.IdleTimeoutMinutes = 40
+
+	r, v, k, isLLM := rt.EffectiveSessionState(aiPro)
+	if r != core.RecipeH3Video || v != core.H3VariantFlash || k != core.WorkloadVideo || isLLM {
+		t.Fatalf("expected locked video session preserved, got (%v, %v, %v, %v)", r, v, k, isLLM)
+	}
+	if rt.EffectiveSessionIdleTimeout(aiPro) != 10 {
+		t.Fatalf("expected locked idle timeout 10m, got %d", rt.EffectiveSessionIdleTimeout(aiPro))
+	}
+	if !rt.HasPendingModeSwitch(aiPro) {
+		t.Fatal("expected HasPendingModeSwitch=true when next-boot preset differs from locked session")
+	}
+	if !rt.IsTempOutputActive(aiPro) {
+		t.Fatal("expected IsTempOutputActive=true when UseGoogleDrive=false on active video session")
+	}
+	now := time.Now()
+	rt.WatchdogDeferredForTempOutputs = true
+	rt.TempGuardGraceUntil = now.Add(9 * time.Minute)
+	if rem := rt.RemainingTempGuardGraceSeconds(now); rem < 530 || rem > 550 {
+		t.Fatalf("unexpected remaining grace seconds: %d", rem)
+	}
+}

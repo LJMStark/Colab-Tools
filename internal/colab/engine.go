@@ -25,9 +25,11 @@ import (
 )
 
 type UsageSnapshot struct {
-	Balance           float64
-	RatePerHour       float64
-	ActiveAssignments int
+	Balance              float64
+	RatePerHour          float64
+	ActiveAssignments    int
+	EligibleAccelerators []core.AcceleratorOption
+	EligibleKnown        bool
 }
 
 type WhoamiInfo struct {
@@ -59,6 +61,8 @@ type RemoteTelemetry struct {
 	DetectedWebPort    *int
 	DeployAlive        bool
 	RenderedVideoCount int
+	SessionNewVideos   *int
+	SessionOutputs     []core.SessionVideoOutput
 	DriveMounted       *bool
 	EffectiveOutputDir string
 	TempOutputVideos   *int
@@ -310,24 +314,115 @@ func (e *Engine) Whoami(ctx context.Context, profile core.AccountProfile) (*Whoa
 	return ParseWhoami(r.Stdout)
 }
 
+// ParseUsageEligibleAccelerators extracts server-reported eligibleGpus/eligibleTpus
+// from `colab --logtostderr usage` stderr output while ignoring all other debug lines.
+func ParseUsageEligibleAccelerators(stderr string) []core.AcceleratorOption {
+	elig, _ := ParseUsageEligibleAcceleratorsWithKnown(stderr)
+	return elig
+}
+
+// ParseUsageEligibleAcceleratorsWithKnown distinguishes "fields present (possibly empty)" from "fields absent".
+func ParseUsageEligibleAcceleratorsWithKnown(stderr string) ([]core.AcceleratorOption, bool) {
+	cleaned := runner.StripCR(stderr)
+	// First try scanning from the last "Response Body:" marker (handles both single-line and multi-line JSON).
+	candidates := []string{}
+	if idx := strings.LastIndex(cleaned, "Response Body:"); idx >= 0 {
+		candidates = append(candidates, cleaned[idx+len("Response Body:"):])
+	}
+	for _, raw := range strings.Split(cleaned, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.Contains(line, "eligibleGpus") || strings.Contains(line, "eligibleTpus") {
+			candidates = append(candidates, line)
+		}
+	}
+	for _, cand := range candidates {
+		start := strings.Index(cand, "{")
+		if start < 0 {
+			continue
+		}
+		dec := json.NewDecoder(strings.NewReader(cand[start:]))
+		var rawMap map[string]json.RawMessage
+		if err := dec.Decode(&rawMap); err != nil {
+			continue
+		}
+		rawGPUs, hasGPUs := rawMap["eligibleGpus"]
+		rawTPUs, hasTPUs := rawMap["eligibleTpus"]
+		if !hasGPUs && !hasTPUs {
+			continue
+		}
+		var gpus, tpus []string
+		if hasGPUs {
+			_ = json.Unmarshal(rawGPUs, &gpus)
+		}
+		if hasTPUs {
+			_ = json.Unmarshal(rawTPUs, &tpus)
+		}
+		combined := make([]string, 0, len(gpus)+len(tpus))
+		combined = append(combined, gpus...)
+		combined = append(combined, tpus...)
+		return core.NormalizeEligibleAccelerators(combined), true
+	}
+	return nil, false
+}
+
+var sensitiveQueryRegex = regexp.MustCompile(`(?i)([?&](?:colab-runtime-proxy-token|access_token|proxy[_-]?token|token|auth|key|secret|sig)=[^&\s'"\)\]]+)`)
+
+// SanitizeCLIErrorOutput strips verbose debug/header lines and query-string secrets
+// (including Authorization Bearer tokens and colab-runtime-proxy-token) before surfacing errors.
+func SanitizeCLIErrorOutput(raw string) string {
+	var clean []string
+	for _, line := range strings.Split(runner.StripCR(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.Contains(lower, "authorization") ||
+			strings.Contains(lower, "bearer ") ||
+			strings.Contains(lower, "request headers:") ||
+			strings.Contains(lower, "response headers:") ||
+			strings.Contains(lower, "x-goog-") ||
+			strings.Contains(lower, "cookie") ||
+			strings.Contains(lower, "colab-runtime-proxy-token") ||
+			strings.Contains(trimmed, " - DEBUG - ") ||
+			strings.Contains(trimmed, " - INFO - ") ||
+			strings.HasPrefix(trimmed, ")]}'") {
+			continue
+		}
+		trimmed = sensitiveQueryRegex.ReplaceAllString(trimmed, "")
+		if trimmed != "" {
+			clean = append(clean, trimmed)
+		}
+	}
+	return strings.TrimSpace(strings.Join(clean, "\n"))
+}
+
 func (e *Engine) FetchUsageAndSessions(ctx context.Context, profile core.AccountProfile) (*UsageSnapshot, []core.ColabSessionItem, error) {
-	u := e.RunColab(ctx, profile, []string{"usage"}, "", 25*time.Second)
+	u := e.RunColab(ctx, profile, []string{"--logtostderr", "usage"}, "", 25*time.Second)
 	usage, ok := ParseUsage(u.Stdout)
+	if (u.ExitCode != 0 || !ok) && strings.Contains(strings.ToLower(u.Stderr), "no such option") {
+		u = e.RunColab(ctx, profile, []string{"usage"}, "", 25*time.Second)
+		usage, ok = ParseUsage(u.Stdout)
+	}
 	if u.ExitCode != 0 || !ok {
-		errTxt := strings.TrimSpace(u.Stderr)
+		errTxt := SanitizeCLIErrorOutput(u.Stderr)
 		if errTxt == "" {
-			errTxt = strings.TrimSpace(u.Stdout)
+			errTxt = SanitizeCLIErrorOutput(u.Stdout)
 		}
 		if errTxt == "" {
-			errTxt = "colab usage 查询失败"
+			errTxt = "查询账号点数失败"
 		}
 		return nil, nil, errors.New(errTxt)
 	}
+	if elig, known := ParseUsageEligibleAcceleratorsWithKnown(u.Stderr); known {
+		usage.EligibleAccelerators = elig
+		usage.EligibleKnown = true
+	}
 	s := e.RunColab(ctx, profile, []string{"sessions"}, "", 25*time.Second)
 	if s.ExitCode != 0 {
-		errTxt := strings.TrimSpace(s.Stderr)
+		errTxt := SanitizeCLIErrorOutput(s.Stderr)
 		if errTxt == "" {
-			errTxt = strings.TrimSpace(s.Stdout)
+			errTxt = SanitizeCLIErrorOutput(s.Stdout)
 		}
 		if errTxt == "" {
 			errTxt = "colab sessions 查询失败"
@@ -361,11 +456,11 @@ def read_cpu():
         return str(max(0, min(100, int(round(100.0 * (dt - (i2 - i1)) / dt)))))
     except Exception:
         return ""
-def http_get(url, timeout=2.0):
+def http_get(url, timeout=2.0, max_bytes=32768):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             if 200 <= resp.status < 400:
-                return resp.read(32768).decode("utf-8", errors="ignore")
+                return resp.read(max_bytes).decode("utf-8", errors="ignore")
     except Exception:
         pass
     return ""
@@ -400,6 +495,7 @@ if status_p.exists():
     if raw_s:
         print("STATUS_JSON=" + raw_s)
 health_ok = False
+comfy_port = 0
 if http_get("http://127.0.0.1:%d/health"):
     health_ok = True
 for cp in ([%d] if %d == 8188 else [%d, 8188]):
@@ -407,6 +503,7 @@ for cp in ([%d] if %d == 8188 else [%d, 8188]):
     if cq and "queue_running" in cq:
         print("COMFY_QUEUE=" + cq.replace("\n", " "))
         print(f"WEB_PORT={cp}")
+        comfy_port = cp
         health_ok = True
         break
 if not health_ok:
@@ -490,21 +587,129 @@ temp_out_val = scan_temp_videos(["/content/output", "/content/ComfyUI/output"])
 print(f"TEMP_OUT_VIDEOS={temp_out_val}")
 out_count = 0
 eff_out_dir = ""
-cand_dirs = [%q, "/content/drive/MyDrive/ColabTools/outputs", "/content/output"] if drive_mounted else ["/content/output"]
-for odir in cand_dirs:
-    if not odir:
-        continue
-    op = pathlib.Path(odir)
-    if op.is_dir():
-        if not eff_out_dir:
-            eff_out_dir = odir
-        c_num = count_videos_display(op)
-        if c_num > 0:
-            out_count = c_num
-            eff_out_dir = odir
-            break
+active_out_p = pathlib.Path("/tmp/colab-tools-output-dir.txt")
+if active_out_p.is_file():
+    try:
+        recorded_out = active_out_p.read_text(encoding="utf-8", errors="ignore").strip()
+        if recorded_out and pathlib.Path(recorded_out).is_dir():
+            eff_out_dir = recorded_out
+            out_count = count_videos_display(pathlib.Path(recorded_out))
+    except Exception:
+        pass
+if not eff_out_dir:
+    cand_dirs = [%q, "/content/drive/MyDrive/ColabTools/outputs", "/content/output"] if drive_mounted else ["/content/output"]
+    for odir in cand_dirs:
+        if not odir:
+            continue
+        op = pathlib.Path(odir)
+        if op.is_dir():
+            if not eff_out_dir:
+                eff_out_dir = odir
+            c_num = count_videos_display(op)
+            if c_num > 0:
+                out_count = c_num
+                eff_out_dir = odir
+                break
 print("EFFECTIVE_OUT_DIR=" + eff_out_dir)
 print(f"OUT_VIDEOS={out_count}")
+def is_file_saved_in_drive(fn, sub):
+    if not drive_mounted or not eff_out_dir.startswith("/content/drive/"):
+        return False
+    base = pathlib.Path(eff_out_dir)
+    fp = (base / sub / fn) if sub else (base / fn)
+    try:
+        return fp.is_file() and fp.stat().st_size > 0
+    except Exception:
+        return False
+session_outputs = []
+session_total_new = 0
+seen_out_keys = set()
+if comfy_port:
+    hist_raw = http_get(f"http://127.0.0.1:{comfy_port}/history?max_items=50", timeout=2.5, max_bytes=524288)
+    if hist_raw:
+        try:
+            hist_data = json.loads(hist_raw)
+            if isinstance(hist_data, dict):
+                collected = []
+                for _pid, entry in hist_data.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    outs = entry.get("outputs") or {}
+                    if not isinstance(outs, dict):
+                        continue
+                    for _nid, node_out in outs.items():
+                        if not isinstance(node_out, dict):
+                            continue
+                        for key in ("videos", "gifs", "images"):
+                            items = node_out.get(key)
+                            if not isinstance(items, list):
+                                continue
+                            for it in items:
+                                if not isinstance(it, dict):
+                                    continue
+                                fn = str(it.get("filename") or "").strip()
+                                ftype = str(it.get("type") or "output").strip()
+                                sub = str(it.get("subfolder") or "").strip()
+                                if not fn or ftype != "output":
+                                    continue
+                                if fn.lower().endswith(video_exts):
+                                    collected.append((fn, sub, ftype))
+                for fn, sub, ftype in reversed(collected):
+                    k = (sub, fn)
+                    if k in seen_out_keys:
+                        continue
+                    seen_out_keys.add(k)
+                    session_total_new += 1
+                    if len(session_outputs) < 50:
+                        session_outputs.append({
+                            "filename": fn,
+                            "subfolder": sub,
+                            "type": ftype,
+                            "savedToDrive": is_file_saved_in_drive(fn, sub),
+                        })
+        except Exception:
+            pass
+if session_total_new == 0 and eff_out_dir:
+    ts_p = pathlib.Path("/tmp/colab-tools-session-start.ts")
+    if ts_p.exists():
+        try:
+            start_ts = float(ts_p.read_text().strip())
+            op = pathlib.Path(eff_out_dir)
+            if op.is_dir():
+                cands = []
+                for cur_root, dirs, files in os.walk(op, topdown=True, followlinks=False):
+                    depth = len(pathlib.Path(cur_root).parts) - len(op.parts)
+                    if depth >= 3:
+                        dirs[:] = []
+                    else:
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    for fn in files:
+                        if fn.startswith(".") or not fn.lower().endswith(video_exts):
+                            continue
+                        fp = pathlib.Path(cur_root) / fn
+                        try:
+                            st = fp.stat()
+                        except Exception:
+                            continue
+                        if st.st_mtime >= start_ts and st.st_size > 0:
+                            rel_sub = str(pathlib.Path(cur_root).relative_to(op))
+                            if rel_sub == ".":
+                                rel_sub = ""
+                            cands.append((st.st_mtime, fn, rel_sub))
+                cands.sort(key=lambda x: x[0], reverse=True)
+                session_total_new = len(cands)
+                for _mt, fn, rel_sub in cands[:50]:
+                    session_outputs.append({
+                        "filename": fn,
+                        "subfolder": rel_sub,
+                        "type": "output",
+                        "savedToDrive": is_file_saved_in_drive(fn, rel_sub),
+                    })
+        except Exception:
+            pass
+if comfy_port or pathlib.Path("/tmp/colab-tools-session-start.ts").exists():
+    print(f"SESSION_NEW_VIDEOS={session_total_new}")
+    print("SESSION_OUTPUTS_JSON=" + json.dumps(session_outputs, ensure_ascii=False))
 meta_p = pathlib.Path("/tmp/llama-server.meta")
 if meta_p.exists():
     print("META=" + meta_p.read_text(errors="ignore").strip())
@@ -569,11 +774,52 @@ else:
 		case strings.HasPrefix(raw, "EFFECTIVE_OUT_DIR="):
 			t.EffectiveOutputDir = strings.TrimSpace(strings.TrimPrefix(raw, "EFFECTIVE_OUT_DIR="))
 		case strings.HasPrefix(raw, "TEMP_OUT_VIDEOS="):
-			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "TEMP_OUT_VIDEOS="))); err == nil {
+			valStr := strings.TrimSpace(strings.TrimPrefix(raw, "TEMP_OUT_VIDEOS="))
+			if valStr == "unknown" {
+				neg := -1
+				t.TempOutputVideos = &neg
+			} else if v, err := strconv.Atoi(valStr); err == nil {
 				t.TempOutputVideos = &v
 			}
 		case strings.HasPrefix(raw, "OUT_VIDEOS="):
 			t.RenderedVideoCount, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "OUT_VIDEOS=")))
+		case strings.HasPrefix(raw, "SESSION_NEW_VIDEOS="):
+			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "SESSION_NEW_VIDEOS="))); err == nil && v >= 0 {
+				t.SessionNewVideos = &v
+			}
+		case strings.HasPrefix(raw, "SESSION_OUTPUTS_JSON="):
+			var items []core.SessionVideoOutput
+			if json.Unmarshal([]byte(strings.TrimPrefix(raw, "SESSION_OUTPUTS_JSON=")), &items) == nil {
+				valid := make([]core.SessionVideoOutput, 0, len(items))
+				for _, it := range items {
+					fn := strings.TrimSpace(it.Filename)
+					if fn == "" || strings.Contains(fn, "/") || strings.Contains(fn, `\`) || strings.Contains(fn, "..") || strings.HasPrefix(fn, ".") {
+						continue
+					}
+					sub := strings.TrimSpace(it.Subfolder)
+					if sub != "" {
+						badSub := strings.HasPrefix(sub, "/") || strings.Contains(sub, `\`)
+						if !badSub {
+							for _, seg := range strings.Split(sub, "/") {
+								if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") {
+									badSub = true
+									break
+								}
+							}
+						}
+						if badSub {
+							continue
+						}
+					}
+					if it.Type == "" {
+						it.Type = "output"
+					}
+					it.Filename = fn
+					it.Subfolder = sub
+					valid = append(valid, it)
+				}
+				t.SessionOutputs = valid
+			}
 		case strings.HasPrefix(raw, "UPTIME="):
 			t.UptimeSeconds, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(raw, "UPTIME=")))
 		case strings.HasPrefix(raw, "WEB_PORT="):
@@ -622,6 +868,157 @@ else:
 		}
 	}
 	return t
+}
+
+func classifySafeDownloadError(stdout, stderr string) string {
+	combined := strings.ToLower(stderr + "\n" + stdout)
+	switch {
+	case strings.Contains(combined, "401") || strings.Contains(combined, "403") || strings.Contains(combined, "unauthorized") || strings.Contains(combined, "forbidden"):
+		return "云端下载授权已过期或无权限，请刷新或重连后再试"
+	case strings.Contains(combined, "404") || strings.Contains(combined, "not found") || strings.Contains(combined, "no such file"):
+		return "云端未找到对应成片文件（可能已移动或清空）"
+	case strings.Contains(combined, "timeout") || strings.Contains(combined, "timed out"):
+		return "下载超时，请稍后重试"
+	case strings.Contains(combined, "500") || strings.Contains(combined, "502") || strings.Contains(combined, "503") || strings.Contains(combined, "504"):
+		return "云端文件服务暂时异常，请稍后重试"
+	default:
+		return "从云端下载文件失败，请确认机器仍在运行后重试"
+	}
+}
+
+// DownloadRemoteFile downloads a file from the running Colab session using official `colab download`.
+// Error messages never expose raw proxy URLs or query-string tokens.
+func (e *Engine) DownloadRemoteFile(ctx context.Context, profile core.AccountProfile, remotePath, localPath string) error {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return errors.New("会话名不合法")
+	}
+	if strings.TrimSpace(remotePath) == "" || strings.TrimSpace(localPath) == "" {
+		return errors.New("下载路径不能为空")
+	}
+	r := e.RunColab(ctx, profile, []string{"download", "-s", profile.SessionName, remotePath, localPath}, "", 180*time.Second)
+	if r.ExitCode == 0 {
+		return nil
+	}
+	return errors.New(classifySafeDownloadError(r.Stdout, r.Stderr))
+}
+
+// ListRemoteTempVideos enumerates all actual video files stored on ephemeral cloud disk so bulk save never misses files.
+func (e *Engine) ListRemoteTempVideos(ctx context.Context, profile core.AccountProfile) ([]core.SessionVideoOutput, error) {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return nil, errors.New("会话名不合法")
+	}
+	py := `import json, os, pathlib
+video_exts = (".mp4", ".webm", ".mov", ".mkv", ".gif")
+found = []
+for root_s in ("/content/output", "/content/ComfyUI/output"):
+    rp = pathlib.Path(root_s)
+    if not rp.is_dir():
+        continue
+    for cur_root, dirs, files in os.walk(rp, topdown=True, followlinks=False):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            if fn.startswith(".") or not fn.lower().endswith(video_exts):
+                continue
+            fp = pathlib.Path(cur_root) / fn
+            try:
+                st = fp.stat()
+            except Exception:
+                continue
+            if st.st_size <= 0:
+                continue
+            rel_sub = str(pathlib.Path(cur_root).relative_to(rp))
+            if rel_sub == ".":
+                rel_sub = ""
+            found.append((st.st_mtime, root_s, rel_sub, fn))
+found.sort(key=lambda x: x[0], reverse=True)
+out = []
+seen = set()
+for _mt, root_s, sub, fn in found:
+    key = (root_s, sub, fn)
+    if key in seen:
+        continue
+    seen.add(key)
+    out.append({"filename": fn, "subfolder": sub, "type": root_s, "savedToDrive": False})
+print("TEMP_LIST_JSON=" + json.dumps(out, ensure_ascii=False))
+`
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 25*time.Second)
+	if r.ExitCode != 0 {
+		return nil, errors.New("读取云端临时盘文件列表失败")
+	}
+	for _, raw := range strings.Split(runner.StripCR(r.Stdout), "\n") {
+		if !strings.HasPrefix(raw, "TEMP_LIST_JSON=") {
+			continue
+		}
+		var items []core.SessionVideoOutput
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(raw, "TEMP_LIST_JSON=")), &items); err != nil {
+			return nil, err
+		}
+		valid := make([]core.SessionVideoOutput, 0, len(items))
+		for _, it := range items {
+			fn := strings.TrimSpace(it.Filename)
+			if fn == "" || strings.Contains(fn, "/") || strings.Contains(fn, `\`) || strings.Contains(fn, "..") || strings.HasPrefix(fn, ".") {
+				continue
+			}
+			sub := strings.TrimSpace(it.Subfolder)
+			if sub != "" {
+				bad := strings.HasPrefix(sub, "/") || strings.Contains(sub, `\`)
+				if !bad {
+					for _, seg := range strings.Split(sub, "/") {
+						if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") {
+							bad = true
+							break
+						}
+					}
+				}
+				if bad {
+					continue
+				}
+			}
+			it.Filename = fn
+			it.Subfolder = sub
+			valid = append(valid, it)
+		}
+		return valid, nil
+	}
+	return nil, nil
+}
+
+// StopRemoteManagedServices cleanly terminates managed ComfyUI / LLM / tunnel processes when switching to bare compute mode.
+func (e *Engine) StopRemoteManagedServices(ctx context.Context, profile core.AccountProfile) error {
+	if !core.IsValidSessionName(profile.SessionName) {
+		return errors.New("会话名不合法")
+	}
+	py := `import os, pathlib, signal, subprocess, time
+def stop_pidfile(pf, token):
+    p = pathlib.Path(pf)
+    if not p.is_file():
+        return
+    try:
+        pid = int(p.read_text().strip())
+        cmd_p = pathlib.Path(f"/proc/{pid}/cmdline")
+        if cmd_p.is_file() and token in cmd_p.read_bytes().decode("utf-8", errors="ignore"):
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(10):
+                if not pathlib.Path(f"/proc/{pid}").exists():
+                    break
+                time.sleep(0.2)
+    except Exception:
+        pass
+    p.unlink(missing_ok=True)
+stop_pidfile("/tmp/colab-tools-wf-sync.pid", "colab-tools-wf-sync.py")
+stop_pidfile("/tmp/colab-tools-cloudflared.pid", "cloudflared")
+stop_pidfile("/tmp/colab-tools-llama.pid", "llama-server")
+subprocess.run(["pkill", "-TERM", "-f", "/content/ComfyUI/main.py"], check=False)
+subprocess.run(["pkill", "-TERM", "-f", "/content/bin/llama-server"], check=False)
+pathlib.Path("/tmp/public_url.txt").unlink(missing_ok=True)
+pathlib.Path("/tmp/colab-tools-status.json").unlink(missing_ok=True)
+print("SERVICES_STOPPED=1")
+`
+	r := e.RunColab(ctx, profile, []string{"exec", "-s", profile.SessionName}, py, 25*time.Second)
+	if r.ExitCode == 0 && strings.Contains(r.Stdout, "SERVICES_STOPPED=1") {
+		return nil
+	}
+	return errors.New("停止云端旧服务失败，请稍后重试或直接关机")
 }
 
 func (e *Engine) FetchRemoteAPIKeySafely(ctx context.Context, profile core.AccountProfile) string {

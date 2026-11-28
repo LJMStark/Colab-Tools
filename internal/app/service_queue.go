@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 
@@ -46,6 +47,11 @@ func (s *Service) startAccountSession(accountID string, interactive bool) {
 	if s.ActiveQueueAccountID != "" && s.ActiveQueueAccountID != accountID {
 		s.mu.Unlock()
 		s.ShowToast("已有其他账号在排队拿卡中（单通道防风控）")
+		return
+	}
+	if compatErr := core.CheckTaskHardwareCompatibility(acc); compatErr != nil {
+		s.mu.Unlock()
+		s.ShowToast(compatErr.Error())
 		return
 	}
 	delete(s.skipNextDriveMount, accountID)
@@ -258,6 +264,7 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 				}
 			}
 			if preUsage != nil {
+				var eligSnap *core.AppSettings
 				s.mu.Lock()
 				if cur, ok := s.Runtime[acc.ID]; ok && !cur.Phase.IsRunning() {
 					now := time.Now()
@@ -267,13 +274,44 @@ func (s *Service) runPoliteQueue(ctx context.Context, acc core.AccountProfile, t
 					cur.LastUsageFetchAt = &now
 					s.Runtime[acc.ID] = cur
 				}
+				if preUsage.EligibleKnown {
+					for i := range s.Settings.Accounts {
+						if s.Settings.Accounts[i].ID == acc.ID && !slices.Equal(s.Settings.Accounts[i].EligibleAccelerators, preUsage.EligibleAccelerators) {
+							s.Settings.Accounts[i].EligibleAccelerators = slices.Clone(preUsage.EligibleAccelerators)
+							s.Settings.Accounts[i].Sanitize()
+							acc = s.Settings.Accounts[i]
+							cp := s.cloneSettingsLocked()
+							eligSnap = &cp
+							break
+						}
+					}
+				}
 				s.mu.Unlock()
+				if eligSnap != nil {
+					s.saveSettingsSnapshot(*eligSnap)
+				}
 			}
+		}
+
+		if compatErr := core.CheckTaskHardwareCompatibility(acc); compatErr != nil {
+			s.mu.RLock()
+			owned := s.isQueueTokenOwnerLocked(acc.ID, token)
+			s.mu.RUnlock()
+			if owned {
+				outcome := core.ProvisionOutcome{
+					Kind:    core.OutcomeUnsupportedTier400,
+					Code:    "INCOMPATIBLE_HARDWARE",
+					Message: compatErr.Error(),
+				}
+				logQueueOnce("", false, false, core.AllocTagError, outcome.Message)
+				s.handleProvisionFailure(acc, outcome)
+			}
+			return
 		}
 
 		primaryTargets := core.EffectiveQueueTargets(acc)
 		fbEnabled, fbAfter, fbTarget := core.EffectiveFallback(acc)
-		roundAccs := core.QueueTargetsForRound(attempt, primaryTargets, fbEnabled, fbAfter, fbTarget, acc.Tier)
+		roundAccs := core.QueueTargetsForRoundWithAllowed(attempt, primaryTargets, fbEnabled, fbAfter, fbTarget, acc.EffectiveQueueableAccelerators())
 		lastTargetsSummary = core.QueueTargetsSummary(roundAccs)
 		roundsCompleted = attempt
 		var probeTargets []core.ProbeTarget

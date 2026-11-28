@@ -462,3 +462,106 @@ func TestParseSessionsStrictFlushValidationAndTelemetryDriveState(t *testing.T) 
 		}
 	}
 }
+
+func TestParseUsageEligibleAcceleratorsSanitizeErrorAndSessionOutputs(t *testing.T) {
+	// 1. Real `--logtostderr usage` stderr payload with XSSI prefix and sensitive Authorization header
+	stderr := strings.Join([]string{
+		"2026-11-28 23:28:31,100 - colab_cli.client - DEBUG - Request Headers: {'Authorization': 'Bearer ya29.super-secret-token'}",
+		"2026-11-28 23:28:31,351 - colab_cli.client - DEBUG - Response: 200 OK",
+		"2026-11-28 23:28:31,351 - colab_cli.client - DEBUG - Response Body: )]}'",
+		`{"currentBalance":200.0, "consumptionRateHourly":0, "assignmentsCount":0, "eligibleGpus":["A100", "L4", "T4"], "eligibleTpus":["V5E1"]}`,
+	}, "\n")
+	elig := colab.ParseUsageEligibleAccelerators(stderr)
+	want := []core.AcceleratorOption{core.AccA100, core.AccL4, core.AccT4, core.AccTPUV5e1}
+	if len(elig) != len(want) {
+		t.Fatalf("expected %v, got %v", want, elig)
+	}
+	for i := range want {
+		if elig[i] != want[i] {
+			t.Fatalf("eligible[%d]: want %v, got %v", i, want[i], elig[i])
+		}
+	}
+
+	// 2. Error sanitization must NEVER leak Authorization Bearer tokens or DEBUG request headers
+	errStderr := strings.Join([]string{
+		"2026-11-28 23:28:31,100 - colab_cli.client - DEBUG - Request Headers: {'Authorization': 'Bearer ya29.leak-test'}",
+		"[colab] Warning: failed to fetch compute-unit info: 401 Unauthorized",
+	}, "\n")
+	sanitized := colab.SanitizeCLIErrorOutput(errStderr)
+	if strings.Contains(sanitized, "ya29.leak-test") || strings.Contains(sanitized, "Authorization") {
+		t.Fatalf("SanitizeCLIErrorOutput leaked sensitive header: %q", sanitized)
+	}
+	if !strings.Contains(sanitized, "401 Unauthorized") {
+		t.Fatalf("expected user-facing error preserved, got %q", sanitized)
+	}
+
+	// 3. Fallback to plain `colab usage` when older CLI rejects `--logtostderr`
+	acc := core.NewDefaultAccountProfile("Compat", "compat@example.com", core.TierAIPro, core.AuthSystemDefaultOAuth2)
+	mrFallback := &mockRunner{
+		onShell: func(cmd string) runner.Result {
+			switch {
+			case strings.Contains(cmd, "--logtostderr"):
+				return runner.Result{ExitCode: 2, Stderr: "Error: No such option: --logtostderr"}
+			case strings.Contains(cmd, "usage"):
+				return runner.Result{ExitCode: 0, Stdout: "Current balance: 200.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0\n"}
+			case strings.Contains(cmd, "sessions"):
+				return runner.Result{ExitCode: 0, Stdout: "No active sessions.\n"}
+			default:
+				return runner.Result{ExitCode: 0}
+			}
+		},
+	}
+	usage, sessions, err := colab.NewEngine(mrFallback, vault.New(vault.NewMemoryBackend())).FetchUsageAndSessions(context.Background(), acc)
+	if err != nil || usage == nil || usage.Balance != 200.0 || len(sessions) != 0 {
+		t.Fatalf("expected fallback usage=200.0, got usage=%+v sessions=%+v err=%v", usage, sessions, err)
+	}
+
+	// 4. FetchRemoteTelemetry parses SESSION_NEW_VIDEOS, TEMP_OUT_VIDEOS=unknown (-1), & rejects invalid filenames/subfolders
+	mrOut := &mockRunner{
+		onShell: func(_ string) runner.Result {
+			return runner.Result{
+				ExitCode: 0,
+				Stdout: strings.Join([]string{
+					"HEALTH=ok",
+					"EFFECTIVE_OUT_DIR=/content/output",
+					"TEMP_OUT_VIDEOS=unknown",
+					"OUT_VIDEOS=9",
+					"SESSION_NEW_VIDEOS=2",
+					`SESSION_OUTPUTS_JSON=[{"filename":"clip_002.mp4","subfolder":"","type":"output","savedToDrive":false},{"filename":"../evil.mp4","subfolder":"","type":"output","savedToDrive":false},{"filename":"bad_sub.mp4","subfolder":"../escape","type":"output","savedToDrive":false},{"filename":"clip_001.mp4","subfolder":"scene1","type":"output","savedToDrive":false}]`,
+				}, "\n"),
+			}
+		},
+	}
+	tel := colab.NewEngine(mrOut, vault.New(vault.NewMemoryBackend())).FetchRemoteTelemetry(context.Background(), acc)
+	if tel == nil || tel.SessionNewVideos == nil || *tel.SessionNewVideos != 2 {
+		t.Fatalf("expected SessionNewVideos=2, got %+v", tel)
+	}
+	if tel.TempOutputVideos == nil || *tel.TempOutputVideos != -1 {
+		t.Fatalf("expected TEMP_OUT_VIDEOS=unknown mapped to -1, got %+v", tel.TempOutputVideos)
+	}
+	if len(tel.SessionOutputs) != 2 || tel.SessionOutputs[0].Filename != "clip_002.mp4" || tel.SessionOutputs[1].Filename != "clip_001.mp4" {
+		t.Fatalf("expected sanitized 2 outputs (excluding traversal filename & subfolder), got %+v", tel.SessionOutputs)
+	}
+
+	// 5. ParseUsageEligibleAcceleratorsWithKnown distinguishes absent field vs explicit empty array
+	if _, known := colab.ParseUsageEligibleAcceleratorsWithKnown("DEBUG - Response: 200 OK\n"); known {
+		t.Fatal("expected known=false when eligible fields absent")
+	}
+	if emptyElig, known := colab.ParseUsageEligibleAcceleratorsWithKnown("Response Body: )]}'\n{\"eligibleGpus\":[],\"eligibleTpus\":[]}"); !known || len(emptyElig) != 0 {
+		t.Fatalf("expected known=true empty slice for explicit empty arrays, got known=%v elig=%v", known, emptyElig)
+	}
+
+	// 6. DownloadRemoteFile must never leak colab-runtime-proxy-token from stdout/stderr
+	mrDL := &mockRunner{
+		onShell: func(_ string) runner.Result {
+			return runner.Result{
+				ExitCode: 1,
+				Stdout:   "Error downloading https://proxy.example/files?colab-runtime-proxy-token=SECRET_XYZ_999 (403 Forbidden)",
+			}
+		},
+	}
+	dlErr := colab.NewEngine(mrDL, vault.New(vault.NewMemoryBackend())).DownloadRemoteFile(context.Background(), acc, "/content/output/a.mp4", filepath.Join(t.TempDir(), "a.mp4"))
+	if dlErr == nil || strings.Contains(dlErr.Error(), "SECRET_XYZ_999") || strings.Contains(dlErr.Error(), "proxy-token") {
+		t.Fatalf("DownloadRemoteFile leaked proxy token or missed error: %v", dlErr)
+	}
+}

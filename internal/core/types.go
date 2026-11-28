@@ -140,6 +140,47 @@ const (
 	AccCPU      AcceleratorOption = "CPU"
 )
 
+var canonicalEligibleOrder = []AcceleratorOption{
+	AccG4, AccH100, AccA100, AccL4, AccT4, AccTPUV6e1, AccTPUV5e1,
+}
+
+// NormalizeEligibleAccelerators parses raw server GPU/TPU codes (from ccu-info eligibleGpus/eligibleTpus)
+// into a deduplicated slice ordered from highest-tier GPU to TPU.
+func NormalizeEligibleAccelerators(raw []string) []AcceleratorOption {
+	present := map[AcceleratorOption]bool{}
+	for _, item := range raw {
+		u := strings.ToUpper(strings.TrimSpace(item))
+		u = strings.ReplaceAll(u, "-", "")
+		u = strings.ReplaceAll(u, "_", "")
+		switch u {
+		case "G4":
+			present[AccG4] = true
+		case "H100":
+			present[AccH100] = true
+		case "A100":
+			present[AccA100] = true
+		case "L4":
+			present[AccL4] = true
+		case "T4":
+			present[AccT4] = true
+		case "V6E1":
+			present[AccTPUV6e1] = true
+		case "V5E1":
+			present[AccTPUV5e1] = true
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	out := make([]AcceleratorOption, 0, len(present))
+	for _, opt := range canonicalEligibleOrder {
+		if present[opt] {
+			out = append(out, opt)
+		}
+	}
+	return out
+}
+
 func IsValidAccelerator(raw string) bool {
 	switch AcceleratorOption(raw) {
 	case AccAutoBest, AccAutoPro, AccG4, AccH100, AccA100, AccL4, AccT4, AccTPUV6e1, AccTPUV5e1, AccCPU:
@@ -603,16 +644,85 @@ func ShouldCrossModelDowngrade(acc AccountProfile, allocatedHardware string) boo
 		IsSmallVRAMHardware(allocatedHardware)
 }
 
-// SmartQueueTargets derives the most reliable GPU priority order for a given subscription tier and task.
+// EffectiveQueueableAccelerators returns the authoritative hardware pool for this account:
+// server-reported eligibleGpus/eligibleTpus when available, falling back to Tier presets otherwise.
+func (a AccountProfile) EffectiveQueueableAccelerators() []AcceleratorOption {
+	if len(a.EligibleAccelerators) > 0 {
+		raw := make([]string, 0, len(a.EligibleAccelerators))
+		for _, opt := range a.EligibleAccelerators {
+			raw = append(raw, string(opt))
+		}
+		if norm := NormalizeEligibleAccelerators(raw); len(norm) > 0 {
+			return norm
+		}
+	}
+	return a.Tier.QueueableAccelerators()
+}
+
+// HasHighTierGPU reports whether this account is eligible for G4 or H100 high-tier cards.
+func (a AccountProfile) HasHighTierGPU() bool {
+	allowed := a.EffectiveQueueableAccelerators()
+	return slices.Contains(allowed, AccG4) || slices.Contains(allowed, AccH100)
+}
+
+// IsFreeOnly reports whether this account is restricted to the free T4-only pool.
+func (a AccountProfile) IsFreeOnly() bool {
+	if len(a.EligibleAccelerators) > 0 {
+		allowed := a.EffectiveQueueableAccelerators()
+		return len(allowed) == 1 && allowed[0] == AccT4
+	}
+	return a.Tier == TierFree
+}
+
+func (a AccountProfile) SupportsHighMem() bool {
+	return !a.IsFreeOnly()
+}
+
+func (a AccountProfile) MaxSessionHours() int {
+	if a.IsFreeOnly() {
+		return 12
+	}
+	return 24
+}
+
+func (a AccountProfile) EligibleCardsSummary() string {
+	allowed := a.EffectiveQueueableAccelerators()
+	if len(allowed) == 0 {
+		return "待识别"
+	}
+	parts := make([]string, 0, len(allowed))
+	for _, opt := range allowed {
+		parts = append(parts, opt.ShortChipLabel())
+	}
+	return strings.Join(parts, " / ")
+}
+
+func (a AccountProfile) DisplayTierBadge() string {
+	if a.TierUserConfirmed {
+		return a.Tier.ShortBadge()
+	}
+	if len(a.EligibleAccelerators) > 0 {
+		if a.HasHighTierGPU() {
+			return "高配卡池"
+		}
+		if a.IsFreeOnly() {
+			return "免费卡池"
+		}
+		return "付费卡池"
+	}
+	return a.Tier.ShortBadge()
+}
+
+// SmartQueueTargets derives the most reliable GPU priority order for an account's real hardware eligibility and task.
 func SmartQueueTargets(acc AccountProfile) []AcceleratorOption {
-	switch acc.Tier {
-	case TierFree:
+	if acc.IsFreeOnly() {
 		return []AcceleratorOption{AccT4}
-	case TierAIPro, TierColabPro, TierPayAsYouGo:
+	}
+	if !acc.HasHighTierGPU() {
 		if isH3VideoRecipe(acc) {
 			switch acc.H3Variant {
 			case H3VariantOriginal:
-				// 31B Original strictly requires A100 on Pro/PAYG; never put L4/T4 in the queue.
+				// 31B Original strictly requires A100 on standard paid accounts; never put L4/T4 in the queue.
 				return []AcceleratorOption{AccA100}
 			case H3VariantFlash:
 				// H3 Flash needs >=24GB VRAM; never put 16GB T4 in the queue.
@@ -622,30 +732,30 @@ func SmartQueueTargets(acc AccountProfile) []AcceleratorOption {
 			}
 		}
 		return []AcceleratorOption{AccA100, AccL4}
-	default: // TierAIUltra, TierColabProPlus
-		if isH3VideoRecipe(acc) {
-			switch acc.H3Variant {
-			case H3VariantOriginal:
-				// 31B Original stays strictly on high-VRAM GPUs and never blindly falls back to 24GB L4.
-				return []AcceleratorOption{AccG4, AccA100, AccH100}
-			case H3VariantFlashGGUF:
-				return []AcceleratorOption{AccL4, AccG4, AccA100}
-			}
-		}
-		// H3 Flash, General ComfyUI, LLM Proxy, Pure Compute:
-		// prioritize G4 and A100 in primary rounds, then EffectiveFallback appends L4 from round 3.
-		return []AcceleratorOption{AccG4, AccA100}
 	}
+	// High-tier accounts (eligible for G4 / H100)
+	if isH3VideoRecipe(acc) {
+		switch acc.H3Variant {
+		case H3VariantOriginal:
+			// 31B Original stays strictly on high-VRAM GPUs and never blindly falls back to 24GB L4.
+			return []AcceleratorOption{AccG4, AccA100, AccH100}
+		case H3VariantFlashGGUF:
+			return []AcceleratorOption{AccL4, AccG4, AccA100}
+		}
+	}
+	// H3 Flash, General ComfyUI, LLM Proxy, Pure Compute:
+	// prioritize G4 and A100 in primary rounds, then EffectiveFallback appends L4 from round 3.
+	return []AcceleratorOption{AccG4, AccA100}
 }
 
 func ecoSaverQueueTargets(acc AccountProfile) []AcceleratorOption {
-	if acc.Tier == TierFree {
+	if acc.IsFreeOnly() {
 		return []AcceleratorOption{AccT4}
 	}
 	if isH3VideoRecipe(acc) {
 		switch acc.H3Variant {
 		case H3VariantOriginal:
-			if acc.Tier == TierColabProPlus || acc.Tier == TierAIUltra {
+			if acc.HasHighTierGPU() {
 				return []AcceleratorOption{AccA100, AccG4}
 			}
 			return []AcceleratorOption{AccA100}
@@ -658,13 +768,14 @@ func ecoSaverQueueTargets(acc AccountProfile) []AcceleratorOption {
 
 // EffectiveQueueTargets is the single source of truth for which cards will be attempted and in what order.
 func EffectiveQueueTargets(acc AccountProfile) []AcceleratorOption {
+	allowed := acc.EffectiveQueueableAccelerators()
 	switch acc.GPUStrategy {
 	case GPUStrategyEcoSaver:
-		return SanitizedQueueTargets(ecoSaverQueueTargets(acc), acc.Tier)
+		return SanitizedQueueTargetsWithAllowed(ecoSaverQueueTargets(acc), allowed)
 	case GPUStrategyCustom:
-		return SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
+		return SanitizedQueueTargetsWithAllowed(acc.QueueTargets, allowed)
 	default:
-		return SanitizedQueueTargets(SmartQueueTargets(acc), acc.Tier)
+		return SanitizedQueueTargetsWithAllowed(SmartQueueTargets(acc), allowed)
 	}
 }
 
@@ -676,7 +787,7 @@ func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, targe
 	case GPUStrategyCustom:
 		return acc.QueueFallbackEnabled, acc.QueueFallbackAfterRounds, acc.QueueFallbackTarget
 	default:
-		if acc.Tier == TierFree {
+		if acc.IsFreeOnly() {
 			return false, 2, AccT4
 		}
 		if isH3VideoRecipe(acc) {
@@ -686,13 +797,13 @@ func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, targe
 			case H3VariantFlashGGUF:
 				return false, 2, AccL4
 			case H3VariantFlash:
-				if acc.Tier == TierColabProPlus || acc.Tier == TierAIUltra {
+				if acc.HasHighTierGPU() {
 					return true, 2, AccL4
 				}
 				return false, 2, AccL4
 			}
 		}
-		if acc.Tier == TierColabProPlus || acc.Tier == TierAIUltra {
+		if acc.HasHighTierGPU() {
 			return true, 2, AccL4
 		}
 		return true, 2, AccT4
@@ -701,7 +812,7 @@ func EffectiveFallback(acc AccountProfile) (enabled bool, afterRounds int, targe
 
 // EffectiveUseHighMem determines whether --high-mem should be requested.
 func EffectiveUseHighMem(acc AccountProfile) bool {
-	if !acc.Tier.SupportsHighMem() {
+	if !acc.SupportsHighMem() {
 		return false
 	}
 	switch acc.GPUStrategy {
@@ -720,6 +831,101 @@ func EffectiveGPUPlanSummary(acc AccountProfile) string {
 	return fmt.Sprintf("%s（%s）", acc.GPUStrategy.DisplayName(), QueueTargetsSummary(targets))
 }
 
+// CheckTaskHardwareCompatibility blocks starting a billable GPU when the user's selected task/custom targets
+// have no valid intersection with the account's eligible hardware pool.
+func CheckTaskHardwareCompatibility(acc AccountProfile) error {
+	allowed := acc.EffectiveQueueableAccelerators()
+	if len(allowed) == 0 {
+		return fmt.Errorf("当前账号暂无可用加速卡配额，请先点右上角刷新状态或在 Colab 网页核对订阅")
+	}
+	if acc.GPUStrategy == GPUStrategyCustom {
+		hasAny := false
+		for _, opt := range acc.QueueTargets {
+			if slices.Contains(allowed, opt) {
+				hasAny = true
+				break
+			}
+		}
+		if !hasAny {
+			return fmt.Errorf("你自定义的显卡顺位与当前账号可用显卡（%s）没有交集，请先到「调整策略与进阶选项」重新勾选", acc.EligibleCardsSummary())
+		}
+		return nil
+	}
+	if isH3VideoRecipe(acc) && acc.H3Variant == H3VariantOriginal && !acc.AllowCrossModelFallback {
+		hasBigVRAM := slices.Contains(allowed, AccG4) || slices.Contains(allowed, AccH100) || slices.Contains(allowed, AccA100)
+		if !hasBigVRAM {
+			return fmt.Errorf("H3 原版 (31B) 需要 A100/G4/H100 级别大显存，当前账号可用显卡（%s）无法直接运行；请改选「H3 Flash 极速版」「轻量 GGUF」或在策略里开启保底降级", acc.EligibleCardsSummary())
+		}
+	}
+	return nil
+}
+
+// SessionEffectiveProfile returns a profile copy anchored to the live running session's locked mode and service port,
+// ensuring telemetry probes, auto-redeploy, workflow flush, and billing labels never drift to next-boot edits.
+func SessionEffectiveProfile(acc AccountProfile, rt AccountRuntimeState) AccountProfile {
+	if !rt.Phase.IsRunning() || !rt.SessionLocked {
+		return acc
+	}
+	eff := acc
+	eff.DeployRecipe = rt.SessionRecipe
+	eff.H3Variant = rt.SessionH3Variant
+	eff.WorkloadKind = rt.SessionWorkloadKind
+	eff.EnableLLMModule = rt.SessionEnableLLM
+	if rt.SessionIdleTimeoutMin >= 5 {
+		eff.IdleTimeoutMinutes = rt.SessionIdleTimeoutMin
+	}
+	if eff.EnableLLMModule || eff.DeployRecipe == RecipeLLMProxy {
+		if eff.RemoteServicePort == 8188 || eff.RemoteServicePort <= 0 {
+			eff.RemoteServicePort = 18080
+		}
+	} else if eff.DeployRecipe.IsVideoComfy() {
+		if eff.RemoteServicePort == 18080 || eff.RemoteServicePort <= 0 {
+			eff.RemoteServicePort = 8188
+		}
+	}
+	return eff
+}
+
+// PrelaunchSummary returns a concise plain-Chinese pre-start overview: priority GPUs, estimated CU/h, and output destination.
+func PrelaunchSummary(acc AccountProfile) string {
+	targets := EffectiveQueueTargets(acc)
+	tgtText := QueueTargetsSummary(targets)
+	rateText := "费率待定"
+	if acc.IsFreeOnly() {
+		if acc.Tier == TierFree && len(acc.EligibleAccelerators) == 0 {
+			rateText = "免费池"
+		} else {
+			rateText = "免费池/约 1.3 CU/h"
+		}
+	} else if len(targets) > 0 {
+		var rates []string
+		for i, t := range targets {
+			if i >= 2 {
+				break
+			}
+			r := EstimatedHourlyCU(string(t))
+			if r == math.Trunc(r) {
+				rates = append(rates, fmt.Sprintf("%.0f", r))
+			} else {
+				rates = append(rates, fmt.Sprintf("%.1f", r))
+			}
+		}
+		rateText = fmt.Sprintf("约 %s CU/h", strings.Join(rates, "/"))
+	}
+	dest := "纯开机"
+	switch {
+	case acc.EnableLLMModule || acc.DeployRecipe == RecipeLLMProxy:
+		dest = "大模型代理"
+	case acc.DeployRecipe.IsVideoComfy():
+		if acc.UseGoogleDrive {
+			dest = "成片存 Google Drive"
+		} else {
+			dest = "成片仅存云电脑（关机清空）"
+		}
+	}
+	return fmt.Sprintf("优先抢 %s · %s · %s", tgtText, rateText, dest)
+}
+
 // EffectiveIdleTimeoutMinutes returns the single unified idle shutdown timeout shared by the watchdog loop and UI countdowns.
 func EffectiveIdleTimeoutMinutes(acc AccountProfile) int {
 	if acc.IdleTimeoutMinutes < 5 {
@@ -733,9 +939,11 @@ type AccountProfile struct {
 	ID                   string            `json:"id"`
 	DisplayName          string            `json:"displayName"`
 	Email                string            `json:"email"`
-	ColorTag             AccountColorTag   `json:"colorTag"`
-	Tier                 SubscriptionTier  `json:"tier"`
-	AuthMode             AccountAuthMode   `json:"authMode"`
+	ColorTag             AccountColorTag     `json:"colorTag"`
+	Tier                 SubscriptionTier    `json:"tier"`
+	TierUserConfirmed    bool                `json:"tierUserConfirmed,omitempty"`
+	EligibleAccelerators []AcceleratorOption `json:"eligibleAccelerators,omitempty"`
+	AuthMode             AccountAuthMode     `json:"authMode"`
 	SessionName          string            `json:"sessionName"`
 	GPUStrategy          GPUStrategyMode   `json:"gpuStrategy,omitempty"`
 	PreferredAccelerator AcceleratorOption `json:"preferredAccelerator"`
@@ -896,7 +1104,15 @@ func (a *AccountProfile) Sanitize() {
 		a.DriveModelsDir = SanitizeDriveSubpath(a.DriveModelsDir, "")
 	}
 	a.DriveOutputDir = SanitizeDriveSubpath(a.DriveOutputDir, "/content/drive/MyDrive/ColabTools/outputs")
-	a.QueueTargets = SanitizedQueueTargets(a.QueueTargets, a.Tier)
+	if len(a.EligibleAccelerators) > 0 {
+		raw := make([]string, 0, len(a.EligibleAccelerators))
+		for _, opt := range a.EligibleAccelerators {
+			raw = append(raw, string(opt))
+		}
+		a.EligibleAccelerators = NormalizeEligibleAccelerators(raw)
+	}
+	allowed := a.EffectiveQueueableAccelerators()
+	a.QueueTargets = SanitizedQueueTargetsWithAllowed(a.QueueTargets, allowed)
 	if a.QueuePersistentMaxHours <= 0 {
 		a.QueuePersistentMaxHours = QueuePersistentDefaultHours
 	} else {
@@ -908,8 +1124,8 @@ func (a *AccountProfile) Sanitize() {
 	if a.QueueFallbackAfterRounds > QueueMaxAttempts-1 {
 		a.QueueFallbackAfterRounds = QueueMaxAttempts - 1
 	}
-	if !IsValidAccelerator(string(a.QueueFallbackTarget)) || !slices.Contains(a.Tier.QueueableAccelerators(), a.QueueFallbackTarget) {
-		a.QueueFallbackTarget = DefaultFallbackTarget(a.QueueTargets, a.Tier)
+	if !IsValidAccelerator(string(a.QueueFallbackTarget)) || !slices.Contains(allowed, a.QueueFallbackTarget) {
+		a.QueueFallbackTarget = DefaultFallbackTargetWithAllowed(a.QueueTargets, allowed)
 	}
 	if a.IdleTimeoutMinutes < 5 {
 		a.IdleTimeoutMinutes = 40
@@ -1188,25 +1404,37 @@ const (
 	PromptConfirmStopAll       ActionPromptKind = "confirm_stop_all"
 	PromptConfirmRemoveAccount ActionPromptKind = "confirm_remove_account"
 	PromptConfirmQuit          ActionPromptKind = "confirm_quit"
-	PromptTempOutputGuard      ActionPromptKind = "temp_output_guard"
-	PromptWebStopGuide         ActionPromptKind = "web_stop_guide"
+	PromptTempOutputGuard        ActionPromptKind = "temp_output_guard"
+	PromptWebStopGuide           ActionPromptKind = "web_stop_guide"
+	PromptSwitchModeWhileRunning ActionPromptKind = "switch_mode_running"
 )
 
 // UserActionPrompt 描述需要用户在桌面弹窗中确认或处理的小白向引导操作。
 type UserActionPrompt struct {
-	ID               string
-	Kind             ActionPromptKind
-	AccountID        string
-	SessionName      string
-	ExpectedEndpoint string
-	Title            string
-	Message          string
-	URL              string
-	PrimaryLabel     string
-	PrimaryAction    string
-	SecondaryLabel   string
-	SecondaryAction  string
-	CancelLabel      string
+	ID                  string
+	Kind                ActionPromptKind
+	AccountID           string
+	SessionName         string
+	ExpectedEndpoint    string
+	Title               string
+	Message             string
+	URL                 string
+	PrimaryLabel        string
+	PrimaryAction       string
+	SecondaryLabel      string
+	SecondaryAction     string
+	CancelLabel         string
+	TargetRecipe        DeployRecipe
+	TargetH3Variant     H3Variant
+	HasDownloadableTemp bool
+}
+
+// SessionVideoOutput describes a single video produced during the current running session.
+type SessionVideoOutput struct {
+	Filename     string `json:"filename"`
+	Subfolder    string `json:"subfolder,omitempty"`
+	Type         string `json:"type,omitempty"`
+	SavedToDrive bool   `json:"savedToDrive"`
 }
 
 func (p InstancePhase) IsRunning() bool { return p.Kind == PhaseRunning }
@@ -1306,7 +1534,16 @@ type AccountRuntimeState struct {
 	DeployLogTail              string
 	DeployLogLoading           bool
 	RenderedVideoCount             int
+	SessionNewVideoCount           int
+	SessionOutputs                 []SessionVideoOutput
+	DownloadingOutput              bool
 	SessionIsVideoComfy            bool
+	SessionLocked                  bool
+	SessionRecipe                  DeployRecipe
+	SessionH3Variant               H3Variant
+	SessionWorkloadKind            WorkloadKind
+	SessionEnableLLM               bool
+	SessionIdleTimeoutMin          int
 	AutoOpenedEndpoint             string
 	ComfyOpening                   bool
 	DriveMountedKnown              bool
@@ -1315,6 +1552,7 @@ type AccountRuntimeState struct {
 	TempOutputVideos               int
 	TempOutputScanKnown            bool
 	WatchdogDeferredForTempOutputs bool
+	TempGuardGraceUntil            time.Time
 
 	ActivitySignal ActivitySignal
 	SignalSource   ActivitySignalSource
@@ -1327,6 +1565,7 @@ type AccountRuntimeState struct {
 	IdleSeconds          int
 	WarnedForCurrentIdle bool
 
+	UsageFetching         bool
 	LastUsageFetchAt      *time.Time
 	CCSwitchSynced        bool
 	OpenCodeSynced        bool
@@ -1379,7 +1618,82 @@ func (rt *AccountRuntimeState) AppendTelemetrySample(gpuUtil int, vramRatio floa
 }
 
 func (rt AccountRuntimeState) IsFreeRuntimeRestricted(acc AccountProfile) bool {
-	return acc.Tier == TierFree && rt.CUBalance <= 0.01
+	return acc.IsFreeOnly() && rt.CUBalance <= 0.01
+}
+
+// EffectiveSessionState returns the active runtime's locked mode when running,
+// falling back to account next-boot preferences when offline or unlocked.
+func (rt AccountRuntimeState) EffectiveSessionState(acc AccountProfile) (DeployRecipe, H3Variant, WorkloadKind, bool) {
+	if rt.Phase.IsRunning() && rt.SessionLocked {
+		return rt.SessionRecipe, rt.SessionH3Variant, rt.SessionWorkloadKind, rt.SessionEnableLLM
+	}
+	return acc.DeployRecipe, acc.H3Variant, acc.WorkloadKind, acc.EnableLLMModule
+}
+
+func (rt AccountRuntimeState) EffectiveSessionEnableLLM(acc AccountProfile) bool {
+	_, _, _, isLLM := rt.EffectiveSessionState(acc)
+	return isLLM
+}
+
+func (rt AccountRuntimeState) EffectiveSessionIdleTimeout(acc AccountProfile) int {
+	if rt.Phase.IsRunning() && rt.SessionLocked && rt.SessionIdleTimeoutMin >= 5 {
+		return rt.SessionIdleTimeoutMin
+	}
+	return EffectiveIdleTimeoutMinutes(acc)
+}
+
+func (rt AccountRuntimeState) EffectiveSessionTaskLabel(acc AccountProfile) string {
+	recipe, variant, _, isLLM := rt.EffectiveSessionState(acc)
+	if isLLM || recipe == RecipeLLMProxy {
+		return RecipeLLMProxy.DisplayName()
+	}
+	if recipe == RecipeH3Video {
+		return variant.DisplayName()
+	}
+	return recipe.DisplayName()
+}
+
+// HasPendingModeSwitch reports whether the user changed next-boot task preferences while a different mode is running.
+func (rt AccountRuntimeState) HasPendingModeSwitch(acc AccountProfile) bool {
+	if !rt.Phase.IsRunning() || !rt.SessionLocked {
+		return false
+	}
+	if rt.SessionRecipe != acc.DeployRecipe || rt.SessionEnableLLM != acc.EnableLLMModule {
+		return true
+	}
+	if rt.SessionRecipe == RecipeH3Video && rt.SessionH3Variant != acc.H3Variant {
+		return true
+	}
+	return false
+}
+
+// IsTempOutputActive reports whether the running video session is writing to ephemeral cloud disk.
+func (rt AccountRuntimeState) IsTempOutputActive(acc AccountProfile) bool {
+	if !rt.Phase.IsRunning() {
+		return false
+	}
+	recipe, _, kind, isLLM := rt.EffectiveSessionState(acc)
+	if isLLM || (!recipe.IsVideoComfy() && kind != WorkloadVideo && !rt.SessionIsVideoComfy) {
+		return false
+	}
+	if strings.HasPrefix(rt.EffectiveOutputDir, "/content/output") || strings.HasPrefix(rt.EffectiveOutputDir, "/content/ComfyUI/output") {
+		return true
+	}
+	if !acc.UseGoogleDrive {
+		return true
+	}
+	return rt.DriveMountedKnown && !rt.DriveActuallyMounted
+}
+
+func (rt AccountRuntimeState) RemainingTempGuardGraceSeconds(now time.Time) int {
+	if !rt.WatchdogDeferredForTempOutputs || rt.TempGuardGraceUntil.IsZero() {
+		return 0
+	}
+	rem := int(math.Ceil(rt.TempGuardGraceUntil.Sub(now).Seconds()))
+	if rem < 0 {
+		return 0
+	}
+	return rem
 }
 
 func (rt AccountRuntimeState) IsTPUHardware() bool {
@@ -1486,7 +1800,7 @@ func (rt AccountRuntimeState) EstimatedHoursRemaining(acc AccountProfile) (hours
 	case AccCPU:
 		basis = "CPU"
 	default:
-		if acc.Tier == TierFree {
+		if acc.IsFreeOnly() {
 			basis = "T4"
 		} else {
 			basis = "L4"
@@ -1501,6 +1815,14 @@ func (rt AccountRuntimeState) EstimatedHoursRemaining(acc AccountProfile) (hours
 
 func (rt AccountRuntimeState) RemainingCapSeconds(tier SubscriptionTier) int {
 	rem := tier.MaxSessionHours()*3600 - rt.SessionUptimeSec
+	if rem < 0 {
+		return 0
+	}
+	return rem
+}
+
+func (rt AccountRuntimeState) RemainingCapSecondsForAccount(acc AccountProfile) int {
+	rem := acc.MaxSessionHours()*3600 - rt.SessionUptimeSec
 	if rem < 0 {
 		return 0
 	}

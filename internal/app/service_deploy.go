@@ -117,16 +117,24 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string,
 	}
 }
 
-// ApplyDeployRecipe updates an account's one-click deploy preset and aligns ports/workload/idle defaults cleanly.
-func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) {
-	acc, ok := s.accountByID(accountID)
-	if !ok {
-		return
-	}
+func buildTaskPresetProfile(acc core.AccountProfile, recipe core.DeployRecipe, variant core.H3Variant) core.AccountProfile {
 	prevLLM := acc.EnableLLMModule
 	acc.DeployRecipe = recipe
 	switch recipe {
-	case core.RecipeH3Video, core.RecipeComfyUIGeneral:
+	case core.RecipeH3Video:
+		if variant != "" {
+			acc.H3Variant = variant
+		} else if acc.H3Variant == "" {
+			acc.H3Variant = core.H3VariantFlash
+		}
+		acc.WorkloadKind = core.WorkloadVideo
+		acc.EnableLLMModule = false
+		acc.RemoteServicePort = 8188
+		acc.LocalSSHTunnelPort = 8188
+		if prevLLM && acc.IdleTimeoutMinutes == 40 {
+			acc.IdleTimeoutMinutes = 10
+		}
+	case core.RecipeComfyUIGeneral:
 		acc.WorkloadKind = core.WorkloadVideo
 		acc.EnableLLMModule = false
 		acc.RemoteServicePort = 8188
@@ -146,7 +154,184 @@ func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) 
 		acc.WorkloadKind = core.WorkloadGeneral
 		acc.EnableLLMModule = false
 	}
-	s.UpdateAccount(acc)
+	return acc
+}
+
+func targetTaskPresetLabel(recipe core.DeployRecipe, variant core.H3Variant) string {
+	if recipe == core.RecipeH3Video {
+		if variant == "" {
+			variant = core.H3VariantFlash
+		}
+		return variant.DisplayName()
+	}
+	return recipe.DisplayName()
+}
+
+// RequestSelectTaskPreset updates next-boot preferences immediately when idle,
+// or prompts the user to choose "next boot only" vs "redeploy now" when switching modes on a running machine.
+func (s *Service) RequestSelectTaskPreset(accountID string, recipe core.DeployRecipe, variant core.H3Variant) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	if recipe == core.RecipeH3Video && variant == "" {
+		variant = core.H3VariantFlash
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.applyNextBootPresetOnly(accountID, recipe, variant, false)
+		return
+	}
+
+	curRecipe, curVariant, _, _ := rt.EffectiveSessionState(acc)
+	sameAsRunning := curRecipe == recipe && (recipe != core.RecipeH3Video || curVariant == variant)
+	if sameAsRunning {
+		s.applyNextBootPresetOnly(accountID, recipe, variant, false)
+		return
+	}
+
+	curLabel := rt.EffectiveSessionTaskLabel(acc)
+	targetLabel := targetTaskPresetLabel(recipe, variant)
+	var riskNotes []string
+	if rt.QueueRunning > 0 || rt.QueuePending > 0 {
+		riskNotes = append(riskNotes, fmt.Sprintf("当前有 %d 条正在渲染、%d 条排队中", rt.QueueRunning, rt.QueuePending))
+	}
+	tempCnt := rt.TempOutputVideos
+	if tempCnt <= 0 && rt.IsTempOutputActive(acc) && rt.SessionNewVideoCount > 0 {
+		tempCnt = rt.SessionNewVideoCount
+	}
+	if tempCnt > 0 {
+		riskNotes = append(riskNotes, fmt.Sprintf("云电脑临时盘有 %d 条未存网盘的视频", tempCnt))
+	}
+	msg := fmt.Sprintf("当前云端机器正在运行「%s」。你可以只把「%s」设为下次开机使用（完全不影响当前任务与关机计时），也可以立刻在当前机器原地重装切过去。", curLabel, targetLabel)
+	if len(riskNotes) > 0 {
+		msg += "\n\n注意：" + strings.Join(riskNotes, "，") + "。若选择立刻重装，正在进行的渲染会被中断，建议先保存或仅改下次开机。"
+	}
+	s.PresentActionPrompt(&core.UserActionPrompt{
+		ID:               uuid.New().String(),
+		Kind:             core.PromptSwitchModeWhileRunning,
+		AccountID:        accountID,
+		ExpectedEndpoint: rt.ActiveEndpoint,
+		Title:            fmt.Sprintf("当前正在运行「%s」，如何切换到「%s」？", curLabel, targetLabel),
+		Message:          msg,
+		PrimaryLabel:     "只改下次开机",
+		SecondaryLabel:   "立刻重装切过去",
+		CancelLabel:      "取消",
+		TargetRecipe:     recipe,
+		TargetH3Variant:  variant,
+	})
+}
+
+func (s *Service) applyNextBootPresetOnly(accountID string, recipe core.DeployRecipe, variant core.H3Variant, showNotice bool) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	updated := buildTaskPresetProfile(acc, recipe, variant)
+	s.updateAccountProfile(updated, false)
+	s.ClearAccountError(accountID)
+	if showNotice {
+		s.ShowToast(fmt.Sprintf("已设为下次开机使用「%s」，当前运行任务与倒计时不受影响", targetTaskPresetLabel(recipe, variant)))
+	}
+}
+
+func (s *Service) redeploySwitchedMode(accountID string, recipe core.DeployRecipe, variant core.H3Variant, expectedEndpoint string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rtSnap := s.StateFor(accountID)
+	if !rtSnap.Phase.IsRunning() || (expectedEndpoint != "" && rtSnap.ActiveEndpoint != "" && rtSnap.ActiveEndpoint != expectedEndpoint) {
+		s.ShowToast("云端机器状态已变化，已取消本次过期切换")
+		return
+	}
+
+	updated := buildTaskPresetProfile(acc, recipe, variant)
+	if updated.DeployRecipe == core.RecipeH3Video {
+		if _, err := core.BuildDeployEnv(updated); err != nil {
+			s.ShowToast(err.Error())
+			return
+		}
+	}
+
+	// Flush pending ComfyUI workflow edits to Drive BEFORE shutting down the video workflow syncer.
+	oldSessAcc := core.SessionEffectiveProfile(acc, rtSnap)
+	wasVideo := rtSnap.SessionIsVideoComfy || (!oldSessAcc.EnableLLMModule && oldSessAcc.DeployRecipe.IsVideoComfy())
+	if wasVideo && acc.UseGoogleDrive && (!rtSnap.DriveMountedKnown || rtSnap.DriveActuallyMounted) {
+		flushCtx, cancelFlush := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = s.Engine.FlushWorkspaceToDrive(flushCtx, oldSessAcc)
+		cancelFlush()
+	}
+
+	if updated.DeployRecipe == core.RecipeNone {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 25*time.Second)
+		stopErr := s.Engine.StopRemoteManagedServices(stopCtx, oldSessAcc)
+		cancelStop()
+		if stopErr != nil {
+			s.ShowToast(stopErr.Error())
+			return
+		}
+	}
+
+	s.updateAccountProfile(updated, true)
+	s.ClearAccountError(accountID)
+
+	s.cancelDeployFlow(accountID)
+	s.cancelDeployWatcher(accountID)
+	s.StopSSHTunnel(accountID)
+
+	s.mu.Lock()
+	cur := s.Runtime[accountID]
+	if !cur.Phase.IsRunning() || (expectedEndpoint != "" && cur.ActiveEndpoint != "" && cur.ActiveEndpoint != expectedEndpoint) {
+		s.mu.Unlock()
+		return
+	}
+	cur.SessionLocked = true
+	cur.SessionRecipe = updated.DeployRecipe
+	cur.SessionH3Variant = updated.H3Variant
+	cur.SessionWorkloadKind = updated.WorkloadKind
+	cur.SessionEnableLLM = updated.EnableLLMModule
+	cur.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(updated)
+	cur.SessionIsVideoComfy = updated.DeployRecipe.IsVideoComfy()
+	cur.DeployRunning = false
+	cur.DeployPreLaunch = false
+	cur.DeployFailed = false
+	cur.DeployError = ""
+	cur.ServerHealthy = false
+	cur.PublicURL = ""
+	cur.LLMURLBoundEndpoint = ""
+	cur.DisplayUIURL = ""
+	cur.AutoOpenedEndpoint = ""
+	cur.QueueRunning = 0
+	cur.QueuePending = 0
+	cur.IdleSeconds = 0
+	cur.WarnedForCurrentIdle = false
+	cur.WatchdogDeferredForTempOutputs = false
+	cur.TempGuardGraceUntil = time.Time{}
+	cur.ActivitySignal = core.ActivitySignal{Kind: core.SignalUnknown}
+	cur.SignalSource = core.SignalSourceNone
+	s.Runtime[accountID] = cur
+	s.mu.Unlock()
+	s.notifyUI()
+
+	if updated.DeployRecipe.IsVideoComfy() {
+		s.launchVideoDeployFlow(updated)
+	} else if updated.EnableLLMModule {
+		s.launchLLMDeployFlow(updated)
+	} else {
+		s.ShowToast("画布与模型服务已关闭，云电脑仍在计费，不用时请点上方关机")
+	}
+}
+
+// ApplyDeployRecipe updates an account's one-click deploy preset and aligns ports/workload/idle defaults cleanly
+// without mutating an already-running session's locked mode or idle timeout.
+func (s *Service) ApplyDeployRecipe(accountID string, recipe core.DeployRecipe) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	updated := buildTaskPresetProfile(acc, recipe, acc.H3Variant)
+	s.updateAccountProfile(updated, false)
 	s.ClearAccountError(accountID)
 }
 
@@ -165,6 +350,10 @@ func (s *Service) DeployNow(accountID string) {
 	rt := s.StateFor(accountID)
 	if !rt.Phase.IsRunning() {
 		s.StartAccountSession(accountID)
+		return
+	}
+	if rt.HasPendingModeSwitch(acc) {
+		go s.redeploySwitchedMode(accountID, acc.DeployRecipe, acc.H3Variant, rt.ActiveEndpoint)
 		return
 	}
 	if acc.DeployRecipe.IsVideoComfy() {
@@ -633,6 +822,14 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 	}
 	cur.AutoOpenedEndpoint = ""
 	cur.SessionIsVideoComfy = true
+	cur.SessionLocked = true
+	cur.SessionRecipe = acc.DeployRecipe
+	cur.SessionH3Variant = acc.H3Variant
+	cur.SessionWorkloadKind = core.WorkloadVideo
+	cur.SessionEnableLLM = false
+	if cur.SessionIdleTimeoutMin < 5 {
+		cur.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(acc)
+	}
 	s.Runtime[acc.ID] = cur
 	s.mu.Unlock()
 	defer s.clearDeployFlowIfToken(acc.ID, flowToken)
@@ -715,6 +912,15 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 	cur.WorkloadMetricRatio = &ratio
 	cur.WorkloadDetail = fmt.Sprintf("已启动云端部署 %s，正在安装环境…", recipeLabelForSession(acc, false))
 	cur.AutoOpenedEndpoint = ""
+	cur.SessionIsVideoComfy = true
+	cur.SessionLocked = true
+	cur.SessionRecipe = acc.DeployRecipe
+	cur.SessionH3Variant = acc.H3Variant
+	cur.SessionWorkloadKind = core.WorkloadVideo
+	cur.SessionEnableLLM = false
+	if cur.SessionIdleTimeoutMin < 5 {
+		cur.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(acc)
+	}
 	s.Runtime[acc.ID] = cur
 	s.mu.Unlock()
 	s.clearDeployFlowIfToken(acc.ID, flowToken)
@@ -760,6 +966,14 @@ func (s *Service) launchLLMDeployFlow(acc core.AccountProfile) {
 	cur.WorkloadMetricRatio = &r5
 	cur.WorkloadDetail = "正在准备云端大模型代理环境…"
 	cur.AutoOpenedEndpoint = ""
+	cur.SessionIsVideoComfy = false
+	cur.SessionLocked = true
+	cur.SessionRecipe = core.RecipeLLMProxy
+	cur.SessionWorkloadKind = core.WorkloadLLM
+	cur.SessionEnableLLM = true
+	if cur.SessionIdleTimeoutMin < 5 {
+		cur.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(acc)
+	}
 	s.Runtime[acc.ID] = cur
 	s.mu.Unlock()
 	defer s.clearDeployFlowIfToken(acc.ID, flowToken)
@@ -858,14 +1072,8 @@ func (s *Service) handleDeployPushFailure(acc core.AccountProfile, flowToken, ex
 	s.mu.Lock()
 	stillValid := s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) && flowCtx.Err() == nil
 	if !stillValid {
-		if st, ok := s.Runtime[acc.ID]; ok && st.ActiveEndpoint == expectedEndpoint {
-			st.DeployPreLaunch = false
-			st.DeployRunning = false
-			st.DeployStartingUntil = time.Time{}
-			s.Runtime[acc.ID] = st
-		}
+		// Lost ownership to a newer deploy flow or cancelled externally: never clobber the newer flow's state.
 		s.mu.Unlock()
-		s.notifyUI()
 		return
 	}
 	errMsg := strings.TrimSpace(err.Error())

@@ -72,6 +72,16 @@ if [ "$USE_GOOGLE_DRIVE" = "1" ] && [ -d "/content/drive/MyDrive" ]; then
 fi
 mkdir -p "$BIN_DIR" "$MODEL_DIR"
 
+# Gently stop any previously running ComfyUI process & workflow sync daemon when switching modes in-place (verify /proc/<pid>/cmdline)
+if [ -f /tmp/colab-tools-wf-sync.pid ]; then
+  old_wf_pid=$(cat /tmp/colab-tools-wf-sync.pid 2>/dev/null || true)
+  if [ -n "$old_wf_pid" ] && [ -r "/proc/${old_wf_pid}/cmdline" ] && tr '\0' ' ' < "/proc/${old_wf_pid}/cmdline" | grep -q "colab-tools-wf-sync.py"; then
+    kill "$old_wf_pid" 2>/dev/null || true
+  fi
+  rm -f /tmp/colab-tools-wf-sync.pid
+fi
+pkill -TERM -f '/content/ComfyUI/main.py' 2>/dev/null || true
+
 write_status() {
   local label="$1"
   local val="$2"

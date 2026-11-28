@@ -374,7 +374,7 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 					case core.PromptConfirmStop, core.PromptConfirmStopAll, core.PromptConfirmRemoveAccount, core.PromptConfirmQuit:
 						led = pal.Coral
 						dangerPrimary = true
-					case core.PromptTempOutputGuard, core.PromptWebStopGuide:
+					case core.PromptTempOutputGuard, core.PromptWebStopGuide, core.PromptSwitchModeWhileRunning:
 						led = pal.Amber
 					}
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
@@ -922,7 +922,7 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(14).Children(func() {
 		m.bentoBillingCU(c, pal, acc, rt)
 		m.bentoLiveLoad(c, pal, acc, rt)
-		m.bentoCurrentTask(c, pal, acc)
+		m.bentoCurrentTask(c, pal, acc, rt)
 		m.bentoWorkloadOutput(c, pal, acc, rt)
 		m.bentoIdleWatchdog(c, pal, acc, rt)
 		m.bentoStrategy(c, pal, acc)
@@ -943,7 +943,7 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 	targetsSummary := core.QueueTargetsSummary(targets)
 
 	// Compute right-side available time
-	remCapSec := rt.RemainingCapSeconds(acc.Tier)
+	remCapSec := rt.RemainingCapSecondsForAccount(acc)
 	hrs, basis, hasEst := rt.EstimatedHoursRemaining(acc)
 
 	card := PrecisionCard(c, pal, 16, 14, func() {
@@ -1010,7 +1010,11 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 						ui.Text(c, "未分配机器").FontSize(19).Bold().TextColor(pal.TextMuted).MaxLines(1)
 						Badge(c, pal, "已停机", nil)
 					})
-					ui.Textf(c, "开机优先 %s · 显存/内存待开机", targetsSummary).FontSize(12).TextColor(pal.TextFaint).MaxLines(1).Ellipsis("…")
+					preCol := pal.TextMuted
+					if acc.DeployRecipe.IsVideoComfy() && !acc.UseGoogleDrive {
+						preCol = pal.Amber
+					}
+					ui.Text(c, core.PrelaunchSummary(acc)).FontSize(12).FontFeatures("tnum").TextColor(preCol).MaxLines(1).Ellipsis("…")
 				}
 			})
 
@@ -1151,12 +1155,12 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 						ui.Text(c, core.FormatDuration(remCapSec)).FontSize(21).Bold().FontFeatures("tnum").TextColor(remCol).MaxLines(1)
 						ui.Text(c, "剩余").FontSize(12).TextColor(pal.TextMuted).Padding(0, 0, 2, 0)
 					})
-					detail := fmt.Sprintf("单次上限 %dh", acc.Tier.MaxSessionHours())
+					detail := fmt.Sprintf("单次上限 %dh", acc.MaxSessionHours())
 					if hasEst {
-						detail = fmt.Sprintf("余额可跑约 %.0fh · 上限 %dh", hrs, acc.Tier.MaxSessionHours())
+						detail = fmt.Sprintf("余额可跑约 %.0fh · 上限 %dh", hrs, acc.MaxSessionHours())
 					}
 					if acc.AutoShutdownEnabled && !rt.ActivitySignal.IsBusy() {
-						effMins := core.EffectiveIdleTimeoutMinutes(acc)
+						effMins := rt.EffectiveSessionIdleTimeout(acc)
 						remIdle := max(0, (rt.RemainingIdleSeconds(effMins)+59)/60)
 						detail = fmt.Sprintf("余额可跑 %.0fh · 空闲停卡 %dm", hrs, remIdle)
 						if !hasEst {
@@ -1165,26 +1169,36 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 					}
 					ui.Text(c, detail).FontSize(12).FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
 				} else {
-					if hasEst {
-						ui.Row(c).Gap(4).AlignItems(ui.End).Children(func() {
-							ui.Textf(c, "%.0f", hrs).FontSize(21).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
-							ui.Text(c, "小时").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 2, 0)
-						})
-					} else if acc.Tier == core.TierFree {
-						ui.Text(c, "免费池 · 12h").FontSize(19).Bold().TextColor(pal.TextPrimary).MaxLines(1)
+					if rt.LastUsageFetchAt == nil {
+						if rt.LastError != "" {
+							ui.Text(c, "—").FontSize(21).Bold().TextColor(pal.TextMuted)
+							ui.Text(c, "点数读取失败 · 点右上角刷新").FontSize(12).TextColor(pal.Amber).MaxLines(1).Ellipsis("…")
+						} else {
+							ui.Text(c, "读取中…").FontSize(19).Bold().TextColor(pal.TextMuted).MaxLines(1)
+							ui.Text(c, "正在读取账号点数与运行状态").FontSize(12).TextColor(pal.TextFaint).MaxLines(1).Ellipsis("…")
+						}
 					} else {
-						ui.Text(c, "—").FontSize(21).Bold().TextColor(pal.TextMuted)
+						if hasEst {
+							ui.Row(c).Gap(4).AlignItems(ui.End).Children(func() {
+								ui.Textf(c, "%.0f", hrs).FontSize(21).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
+								ui.Text(c, "小时").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 2, 0)
+							})
+						} else if acc.IsFreeOnly() {
+							ui.Text(c, "免费池 · 12h").FontSize(19).Bold().TextColor(pal.TextPrimary).MaxLines(1)
+						} else {
+							ui.Text(c, "0.0 CU").FontSize(19).Bold().FontFeatures("tnum").TextColor(pal.TextMuted).MaxLines(1)
+						}
+						subRight := fmt.Sprintf("当前未扣点 · 0.00 CU/h（按 %s 估）", basis)
+						if !hasEst {
+							subRight = "当前未扣点 · 0.00 CU/h"
+						}
+						subRightCol := pal.TextFaint
+						if rt.CURatePerHour > 0 {
+							subRight = fmt.Sprintf("Colab 网页端扣点中 · %.2f CU/h", rt.CURatePerHour)
+							subRightCol = pal.Amber
+						}
+						ui.Text(c, subRight).FontSize(12).FontFeatures("tnum").TextColor(subRightCol).MaxLines(1).Ellipsis("…")
 					}
-					subRight := fmt.Sprintf("当前未扣点 · 0.00 CU/h（按 %s 估）", basis)
-					if !hasEst {
-						subRight = "当前未扣点 · 0.00 CU/h"
-					}
-					subRightCol := pal.TextFaint
-					if len(rt.Sessions) > 0 && rt.CURatePerHour > 0 {
-						subRight = fmt.Sprintf("Colab 网页端扣点中 · %.2f CU/h", rt.CURatePerHour)
-						subRightCol = pal.Amber
-					}
-					ui.Text(c, subRight).FontSize(12).FontFeatures("tnum").TextColor(subRightCol).MaxLines(1).Ellipsis("…")
 				}
 			})
 		})

@@ -48,7 +48,11 @@ type ProvisionOutcome struct {
 
 // SanitizedQueueTargets filters and deduplicates against legal subscription tier while preserving user priority order.
 func SanitizedQueueTargets(selected []AcceleratorOption, tier SubscriptionTier) []AcceleratorOption {
-	allowed := tier.QueueableAccelerators()
+	return SanitizedQueueTargetsWithAllowed(selected, tier.QueueableAccelerators())
+}
+
+// SanitizedQueueTargetsWithAllowed filters and deduplicates against an explicit allowed accelerator pool.
+func SanitizedQueueTargetsWithAllowed(selected, allowed []AcceleratorOption) []AcceleratorOption {
 	seen := make(map[AcceleratorOption]bool, len(selected))
 	ordered := make([]AcceleratorOption, 0, len(selected))
 	for _, opt := range selected {
@@ -76,10 +80,22 @@ func QueueTargetsForRound(
 	fallbackTarget AcceleratorOption,
 	tier SubscriptionTier,
 ) []AcceleratorOption {
-	base := SanitizedQueueTargets(primaryTargets, tier)
+	return QueueTargetsForRoundWithAllowed(attempt, primaryTargets, fallbackEnabled, fallbackAfterRounds, fallbackTarget, tier.QueueableAccelerators())
+}
+
+// QueueTargetsForRoundWithAllowed implements two-stage auto-fallback against an explicit allowed accelerator pool.
+func QueueTargetsForRoundWithAllowed(
+	attempt int,
+	primaryTargets []AcceleratorOption,
+	fallbackEnabled bool,
+	fallbackAfterRounds int,
+	fallbackTarget AcceleratorOption,
+	allowed []AcceleratorOption,
+) []AcceleratorOption {
+	base := SanitizedQueueTargetsWithAllowed(primaryTargets, allowed)
 	threshold := clampInt(fallbackAfterRounds, 1, QueueMaxAttempts-1)
 	if fallbackEnabled && attempt > threshold {
-		if slices.Contains(tier.QueueableAccelerators(), fallbackTarget) && !slices.Contains(base, fallbackTarget) {
+		if slices.Contains(allowed, fallbackTarget) && !slices.Contains(base, fallbackTarget) {
 			base = append(base, fallbackTarget)
 		}
 	}
@@ -87,9 +103,13 @@ func QueueTargetsForRound(
 }
 
 func EligibleFallbackTargets(excluding []AcceleratorOption, tier SubscriptionTier) []AcceleratorOption {
-	primary := SanitizedQueueTargets(excluding, tier)
+	return EligibleFallbackTargetsWithAllowed(excluding, tier.QueueableAccelerators())
+}
+
+func EligibleFallbackTargetsWithAllowed(excluding, allowed []AcceleratorOption) []AcceleratorOption {
+	primary := SanitizedQueueTargetsWithAllowed(excluding, allowed)
 	var out []AcceleratorOption
-	for _, opt := range tier.QueueableAccelerators() {
+	for _, opt := range allowed {
 		if !slices.Contains(primary, opt) {
 			out = append(out, opt)
 		}
@@ -101,7 +121,14 @@ func DefaultFallbackTarget(excluding []AcceleratorOption, tier SubscriptionTier)
 	if tier == TierFree {
 		return AccT4
 	}
-	candidates := EligibleFallbackTargets(excluding, tier)
+	return DefaultFallbackTargetWithAllowed(excluding, tier.QueueableAccelerators())
+}
+
+func DefaultFallbackTargetWithAllowed(excluding, allowed []AcceleratorOption) AcceleratorOption {
+	if len(allowed) == 1 && allowed[0] == AccT4 {
+		return AccT4
+	}
+	candidates := EligibleFallbackTargetsWithAllowed(excluding, allowed)
 	if slices.Contains(candidates, AccL4) {
 		return AccL4
 	}
@@ -109,12 +136,14 @@ func DefaultFallbackTarget(excluding []AcceleratorOption, tier SubscriptionTier)
 		return AccT4
 	}
 	// Never pick high-cost cards (H100/G4/A100) as a fallback when L4/T4 are already present or excluded.
-	allowed := tier.QueueableAccelerators()
 	if slices.Contains(allowed, AccT4) {
 		return AccT4
 	}
 	if slices.Contains(allowed, AccL4) {
 		return AccL4
+	}
+	if len(allowed) > 0 {
+		return allowed[len(allowed)-1]
 	}
 	return AccT4
 }

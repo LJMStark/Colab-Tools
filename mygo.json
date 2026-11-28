@@ -1,7 +1,7 @@
 {
   "name": "Colab Tools",
   "identifier": "io.github.ljmstark.colabtools",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "out": "build",
   "icon": "assets/AppIcon.png"
 }

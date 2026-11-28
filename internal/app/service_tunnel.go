@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -539,7 +542,7 @@ func (s *Service) OpenComfyUI(accountID string) {
 	}
 	if !rt.ServerHealthy {
 		s.ShowToast("正在为你自动安装 ComfyUI，装好后会自动弹出浏览器")
-		go s.launchVideoDeployFlow(acc)
+		go s.launchVideoDeployFlow(core.SessionEffectiveProfile(acc, rt))
 		return
 	}
 	if rt.IsFreeRuntimeRestricted(acc) {
@@ -641,11 +644,12 @@ func (s *Service) OpenWorkloadWebUI(accountID string) {
 		s.ShowToast("请先开机后再打开 WebUI")
 		return
 	}
-	if acc.DeployRecipe.IsVideoComfy() && !acc.EnableLLMModule {
+	sessionRecipe, _, _, sessionEnableLLM := rt.EffectiveSessionState(acc)
+	if sessionRecipe.IsVideoComfy() && !sessionEnableLLM {
 		go s.OpenComfyUI(accountID)
 		return
 	}
-	if acc.EnableLLMModule {
+	if sessionEnableLLM {
 		s.ShowToast("大模型代理模式请直接使用「同步工具」或「Claude 终端」")
 		return
 	}
@@ -706,6 +710,351 @@ func (s *Service) OpenWorkloadWebUI(accountID string) {
 	}()
 }
 
+func buildComfyViewURL(port int, item core.SessionVideoOutput) string {
+	q := url.Values{}
+	q.Set("filename", item.Filename)
+	if item.Subfolder != "" {
+		q.Set("subfolder", item.Subfolder)
+	}
+	outType := item.Type
+	if outType == "" {
+		outType = "output"
+	}
+	q.Set("type", outType)
+	return fmt.Sprintf("http://127.0.0.1:%d/view?%s", port, q.Encode())
+}
+
+func sanitizeLocalOutputFilename(raw string) string {
+	base := filepath.Base(strings.TrimSpace(raw))
+	if base == "" || base == "." || base == ".." || strings.HasPrefix(base, ".") {
+		return ""
+	}
+	base = strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == ':' || r < 32 {
+			return '_'
+		}
+		return r
+	}, base)
+	return base
+}
+
+// publishUniqueTempFile atomically publishes an exclusive temp file to a unique non-clobbering filename in destDir.
+// Uses os.Link so concurrent downloads across accounts can never overwrite each other's files.
+func publishUniqueTempFile(tmpPath, destDir, safeName string) (string, error) {
+	ext := filepath.Ext(safeName)
+	stem := strings.TrimSuffix(safeName, ext)
+	for i := 1; i < 1000; i++ {
+		name := safeName
+		if i > 1 {
+			name = fmt.Sprintf("%s-%d%s", stem, i, ext)
+		}
+		target := filepath.Join(destDir, name)
+		err := os.Link(tmpPath, target)
+		if err == nil {
+			_ = os.Remove(tmpPath)
+			return target, nil
+		}
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		// Fallback for filesystems without hard-link support: O_CREATE|O_EXCL copy
+		f, fErr := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if errors.Is(fErr, os.ErrExist) {
+			continue
+		}
+		if fErr != nil {
+			return "", fErr
+		}
+		src, sErr := os.Open(tmpPath)
+		if sErr != nil {
+			_ = f.Close()
+			_ = os.Remove(target)
+			return "", sErr
+		}
+		_, cpErr := io.Copy(f, src)
+		_ = src.Close()
+		cErr := f.Close()
+		if cpErr != nil || cErr != nil {
+			_ = os.Remove(target)
+			if cpErr != nil {
+				return "", cpErr
+			}
+			return "", cErr
+		}
+		_ = os.Remove(tmpPath)
+		return target, nil
+	}
+	return "", errors.New("下载目录同名文件过多，请先清理后再试")
+}
+
+func (s *Service) resolveLocalDownloadDir() (string, error) {
+	if strings.TrimSpace(s.downloadBaseDir) != "" {
+		if err := os.MkdirAll(s.downloadBaseDir, 0o755); err != nil {
+			return "", err
+		}
+		return s.downloadBaseDir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return "", errors.New("无法定位本机下载目录")
+	}
+	dir := filepath.Join(home, "Downloads", "ColabTools")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func (s *Service) ensureLocalComfyPort(accountID string, acc core.AccountProfile, rt core.AccountRuntimeState) (int, error) {
+	if rt.SSHTunnelActive && rt.ActiveSSHTunnelPort != nil && probeLocalComfyHTTP(*rt.ActiveSSHTunnelPort) {
+		return *rt.ActiveSSHTunnelPort, nil
+	}
+	if rt.IsFreeRuntimeRestricted(acc) {
+		return 0, errors.New("免费版不支持本机加密通道")
+	}
+	waitTimeout := s.comfyTunnelWaitTimeout
+	if waitTimeout <= 0 {
+		waitTimeout = 22 * time.Second
+	}
+	retryPause := s.comfyRetryPause
+	if retryPause <= 0 {
+		retryPause = 4 * time.Second
+	}
+	port, _, err := s.establishLocalSSHTunnel(accountID, 2, waitTimeout, retryPause, true)
+	return port, err
+}
+
+// PreviewLatestSessionVideo opens the newest video produced in the current session via the encrypted local ComfyUI tunnel.
+func (s *Service) PreviewLatestSessionVideo(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("机器未运行，请前往网盘或本机下载目录查看成片")
+		return
+	}
+	if len(rt.SessionOutputs) == 0 {
+		s.ShowToast("本次开机还没有可预览的新视频")
+		return
+	}
+	port, err := s.ensureLocalComfyPort(accountID, acc, rt)
+	if err != nil {
+		s.ShowToast("本机加密通道暂未连通，请先点「开 ComfyUI」再试")
+		return
+	}
+	if s.URLOpener != nil {
+		s.URLOpener(buildComfyViewURL(port, rt.SessionOutputs[0]))
+	}
+}
+
+// DownloadLatestSessionVideo downloads the newest video produced in the current session to ~/Downloads/ColabTools/.
+func (s *Service) DownloadLatestSessionVideo(accountID string) {
+	rt := s.StateFor(accountID)
+	if len(rt.SessionOutputs) == 0 {
+		s.ShowToast("本次开机还没有可下载的新视频")
+		return
+	}
+	s.downloadSessionOutputs(accountID, []core.SessionVideoOutput{rt.SessionOutputs[0]})
+}
+
+// DownloadAllTempVideos enumerates ALL unsaved temporary videos on the cloud VM (no 10-item cap)
+// and downloads every single one to ~/Downloads/ColabTools/, reporting exact success/failure counts.
+func (s *Service) DownloadAllTempVideos(accountID string) {
+	acc, ok := s.accountByID(accountID)
+	if !ok {
+		return
+	}
+	rt := s.StateFor(accountID)
+	if !rt.Phase.IsRunning() {
+		s.ShowToast("云端机器已停机，无法从临时盘下载")
+		return
+	}
+	var targets []core.SessionVideoOutput
+	if listed, err := s.Engine.ListRemoteTempVideos(context.Background(), acc); err == nil && len(listed) > 0 {
+		targets = listed
+	} else {
+		for _, out := range rt.SessionOutputs {
+			if !out.SavedToDrive {
+				targets = append(targets, out)
+			}
+		}
+		if len(targets) == 0 && len(rt.SessionOutputs) > 0 {
+			targets = []core.SessionVideoOutput{rt.SessionOutputs[0]}
+		}
+	}
+	if len(targets) == 0 {
+		s.ShowToast("未检测到可直下的成片列表，正在为你打开 ComfyUI 手动保存")
+		go s.OpenComfyUI(accountID)
+		return
+	}
+	s.downloadSessionOutputs(accountID, targets)
+}
+
+func (s *Service) downloadSessionOutputs(accountID string, items []core.SessionVideoOutput) {
+	acc, ok := s.accountByID(accountID)
+	if !ok || len(items) == 0 {
+		return
+	}
+	s.mu.Lock()
+	rt := s.Runtime[accountID]
+	if !rt.Phase.IsRunning() {
+		s.mu.Unlock()
+		s.ShowToast("云端机器已停机，无法从临时盘下载")
+		return
+	}
+	if rt.DownloadingOutput {
+		s.mu.Unlock()
+		s.ShowToast("正在下载成片到本机，请稍候…")
+		return
+	}
+	rt.DownloadingOutput = true
+	s.Runtime[accountID] = rt
+	s.mu.Unlock()
+	s.notifyUI()
+
+	defer func() {
+		s.mu.Lock()
+		if cur, exists := s.Runtime[accountID]; exists {
+			cur.DownloadingOutput = false
+			s.Runtime[accountID] = cur
+		}
+		s.mu.Unlock()
+		s.notifyUI()
+	}()
+
+	destDir, err := s.resolveLocalDownloadDir()
+	if err != nil {
+		s.ShowToast("准备本机下载目录失败：" + err.Error())
+		return
+	}
+
+	port, tunnelErr := s.ensureLocalComfyPort(accountID, acc, rt)
+	httpClient := &http.Client{Timeout: 120 * time.Second}
+	var savedPaths []string
+	var failedNames []string
+	var lastErr error
+	totalRequested := 0
+
+	for _, item := range items {
+		safeName := sanitizeLocalOutputFilename(item.Filename)
+		if safeName == "" {
+			continue
+		}
+		totalRequested++
+		downloaded := false
+		var publishedPath string
+
+		// 1. Prefer local encrypted SSH tunnel when item belongs to ComfyUI's active output directory
+		isExplicitRoot := strings.HasPrefix(item.Type, "/")
+		if !isExplicitRoot && tunnelErr == nil && port > 0 {
+			viewURL := buildComfyViewURL(port, item)
+			resp, err := httpClient.Get(viewURL)
+			if err == nil {
+				ct := strings.ToLower(resp.Header.Get("Content-Type"))
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 && !strings.Contains(ct, "text/html") {
+					tmpF, fErr := os.CreateTemp(destDir, ".colab-dl-*.part")
+					if fErr == nil {
+						tmpPath := tmpF.Name()
+						written, cpErr := io.Copy(tmpF, resp.Body)
+						closeErr := tmpF.Close()
+						if cpErr == nil && closeErr == nil && written > 0 {
+							if pub, pubErr := publishUniqueTempFile(tmpPath, destDir, safeName); pubErr == nil {
+								downloaded = true
+								publishedPath = pub
+							} else {
+								_ = os.Remove(tmpPath)
+								lastErr = pubErr
+							}
+						} else {
+							_ = os.Remove(tmpPath)
+							if cpErr != nil {
+								lastErr = cpErr
+							} else if closeErr != nil {
+								lastErr = closeErr
+							} else {
+								lastErr = errors.New("云端返回空文件")
+							}
+						}
+					} else {
+						lastErr = fErr
+					}
+				} else {
+					lastErr = fmt.Errorf("云端返回异常状态 (%d)", resp.StatusCode)
+				}
+				_ = resp.Body.Close()
+			} else {
+				lastErr = errors.New("本机通道读取失败")
+			}
+		}
+
+		// 2. Reliable fallback via official `colab download` into an exclusive 0600 temp file
+		if !downloaded {
+			outBase := rt.EffectiveOutputDir
+			if isExplicitRoot {
+				outBase = item.Type
+			} else if outBase == "" {
+				if acc.UseGoogleDrive && rt.DriveActuallyMounted && acc.DriveOutputDir != "" {
+					outBase = acc.DriveOutputDir
+				} else {
+					outBase = "/content/output"
+				}
+			}
+			remotePath := path.Join(outBase, item.Subfolder, item.Filename)
+			tmpF, tErr := os.CreateTemp(destDir, ".colab-cli-dl-*.part")
+			if tErr != nil {
+				lastErr = tErr
+			} else {
+				tmpPath := tmpF.Name()
+				_ = tmpF.Close()
+				if dlErr := s.Engine.DownloadRemoteFile(context.Background(), acc, remotePath, tmpPath); dlErr == nil {
+					if st, stErr := os.Stat(tmpPath); stErr == nil && st.Size() > 0 {
+						if pub, pubErr := publishUniqueTempFile(tmpPath, destDir, safeName); pubErr == nil {
+							downloaded = true
+							publishedPath = pub
+						} else {
+							_ = os.Remove(tmpPath)
+							lastErr = pubErr
+						}
+					} else {
+						_ = os.Remove(tmpPath)
+						lastErr = errors.New("下载文件为空")
+					}
+				} else {
+					_ = os.Remove(tmpPath)
+					lastErr = dlErr
+				}
+			}
+		}
+
+		if downloaded && publishedPath != "" {
+			savedPaths = append(savedPaths, publishedPath)
+		} else {
+			failedNames = append(failedNames, safeName)
+		}
+	}
+
+	if len(savedPaths) == 0 {
+		errMsg := "下载失败"
+		if lastErr != nil {
+			errMsg = lastErr.Error()
+		}
+		s.ShowToast("下载成片失败：" + errMsg)
+		return
+	}
+	if len(failedNames) > 0 {
+		s.ShowToast(fmt.Sprintf("仅成功保存 %d/%d 条，以下未保存：%s（暂勿关机）", len(savedPaths), totalRequested, strings.Join(failedNames, "、")))
+	} else if len(savedPaths) == 1 {
+		s.ShowToast("已下回本机：" + filepath.Base(savedPaths[0]))
+	} else {
+		s.ShowToast(fmt.Sprintf("已全部下回本机（%d/%d 条，位于 ~/Downloads/ColabTools）", len(savedPaths), totalRequested))
+	}
+	if s.revealFileFn != nil {
+		s.revealFileFn(savedPaths[0])
+	}
+}
+
 func (s *Service) OpenDriveOutputs(accountID ...string) {
 	if s.URLOpener == nil {
 		return
@@ -722,8 +1071,10 @@ func (s *Service) OpenDriveOutputs(accountID ...string) {
 	authEmail := ""
 	if hasAcc {
 		authEmail = strings.TrimSpace(acc.Email)
-		dir := strings.TrimSpace(acc.DriveOutputDir)
-		if dir != "" {
+		rt := s.StateFor(acc.ID)
+		if len(rt.SessionOutputs) > 0 && rt.SessionOutputs[0].SavedToDrive && strings.TrimSpace(rt.SessionOutputs[0].Filename) != "" {
+			queryTerm = strings.TrimSpace(rt.SessionOutputs[0].Filename)
+		} else if dir := strings.TrimSpace(acc.DriveOutputDir); dir != "" {
 			cleaned := path.Clean(strings.ReplaceAll(dir, `\`, "/"))
 			base := path.Base(cleaned)
 			if base != "" && base != "." && base != "/" {

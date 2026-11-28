@@ -3,9 +3,11 @@ package app
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/LJMStark/Colab-Tools/internal/colab"
 	"github.com/LJMStark/Colab-Tools/internal/core"
 	"github.com/LJMStark/Colab-Tools/internal/doctor"
 	"github.com/LJMStark/Colab-Tools/internal/integrations"
@@ -145,6 +147,48 @@ func (s *Service) CancelCLIInstall() {
 	s.notifyUI()
 }
 
+// inferInitialTierNote picks a non-authoritative display tier note when the user did not manually pick one.
+// Hardware eligibility always comes from server-reported eligibleGpus/eligibleTpus when present.
+func inferInitialTierNote(usage *colab.UsageSnapshot) core.SubscriptionTier {
+	if usage == nil {
+		return core.TierAIPro
+	}
+	if len(usage.EligibleAccelerators) > 0 {
+		hasHigh := slices.Contains(usage.EligibleAccelerators, core.AccG4) || slices.Contains(usage.EligibleAccelerators, core.AccH100)
+		hasPaid := hasHigh || slices.Contains(usage.EligibleAccelerators, core.AccA100) || slices.Contains(usage.EligibleAccelerators, core.AccL4)
+		if hasHigh {
+			if usage.Balance > 700 {
+				return core.TierAIUltra
+			}
+			return core.TierColabProPlus
+		}
+		if hasPaid {
+			return core.TierAIPro
+		}
+		if usage.Balance <= 0.01 {
+			return core.TierFree
+		}
+		return core.TierAIPro
+	}
+	if usage.Balance <= 0.01 {
+		return core.TierFree
+	}
+	return core.TierAIPro
+}
+
+func seedInitialRuntimeFromUsage(usage *colab.UsageSnapshot, sessions []core.ColabSessionItem, now time.Time) core.AccountRuntimeState {
+	rt := core.NewAccountRuntimeState()
+	if usage != nil {
+		rt.CUBalance = usage.Balance
+		rt.CURatePerHour = usage.RatePerHour
+		rt.ActiveAssignments = usage.ActiveAssignments
+		rt.Sessions = slices.Clone(sessions)
+		ts := now
+		rt.LastUsageFetchAt = &ts
+	}
+	return rt
+}
+
 // TryImportSystemDefaultAccount is serialized and re-deduplicated before append to prevent duplicate configs on double-click.
 func (s *Service) TryImportSystemDefaultAccount() bool {
 	s.mu.Lock()
@@ -181,17 +225,29 @@ func (s *Service) TryImportSystemDefaultAccount() bool {
 	}
 	s.mu.Unlock()
 
-	usage, sessions, _ := s.Engine.FetchUsageAndSessions(context.Background(), probe)
-	balance := 0.0
-	if usage != nil {
-		balance = usage.Balance
+	usage, sessions, sessErr := s.Engine.FetchUsageAndSessions(context.Background(), probe)
+	if sessErr != nil {
+		sessions = nil
 	}
-	tier := core.SuggestedTier(balance)
+	tier := inferInitialTierNote(usage)
 	name := strings.Split(who.Email, "@")[0]
 	if name == "" {
 		name = "主账号"
 	}
 	detected := core.NewDefaultAccountProfile(name, who.Email, tier, core.AuthSystemDefaultOAuth2)
+	detected.TierUserConfirmed = false
+	if usage != nil && usage.EligibleKnown {
+		detected.EligibleAccelerators = slices.Clone(usage.EligibleAccelerators)
+		if detected.HasHighTierGPU() {
+			detected.PreferredAccelerator = core.AccAutoBest
+		} else if detected.IsFreeOnly() {
+			detected.PreferredAccelerator = core.AccT4
+		} else {
+			detected.PreferredAccelerator = core.AccAutoPro
+		}
+		detected.HighMem = detected.SupportsHighMem()
+		detected.Sanitize()
+	}
 	for _, sess := range sessions {
 		if !sess.IsOrphan {
 			detected.SessionName = core.SanitizeSessionName(sess.Name)
@@ -213,7 +269,7 @@ func (s *Service) TryImportSystemDefaultAccount() bool {
 	}
 	s.Settings.Accounts = append(s.Settings.Accounts, detected)
 	s.Settings.SelectedAccountID = detected.ID
-	s.Runtime[detected.ID] = core.NewAccountRuntimeState()
+	s.Runtime[detected.ID] = seedInitialRuntimeFromUsage(usage, sessions, time.Now())
 	snap := s.cloneSettingsLocked()
 	s.mu.Unlock()
 	s.saveSettingsSnapshot(snap)
@@ -251,7 +307,13 @@ func (s *Service) CompleteOAuthFlow(displayName string, tier core.SubscriptionTi
 		return err
 	}
 
-	acc := core.NewDefaultAccountProfile(strings.TrimSpace(displayName), "", tier, core.AuthIsolatedVaultADC)
+	userPickedTier := tier != ""
+	initTier := tier
+	if initTier == "" {
+		initTier = core.TierAIPro
+	}
+	acc := core.NewDefaultAccountProfile(strings.TrimSpace(displayName), "", initTier, core.AuthIsolatedVaultADC)
+	acc.TierUserConfirmed = userPickedTier
 	if err := s.Vault.SaveADCCredentials(acc.ID, credJSON); err != nil {
 		return err
 	}
@@ -261,9 +323,25 @@ func (s *Service) CompleteOAuthFlow(displayName string, tier core.SubscriptionTi
 			acc.DisplayName = strings.Split(who.Email, "@")[0]
 		}
 	}
-	if usage, _, uErr := s.Engine.FetchUsageAndSessions(context.Background(), acc); uErr == nil && usage != nil && tier == core.TierColabPro {
-		acc.Tier = core.SuggestedTier(usage.Balance)
-		acc.PreferredAccelerator = acc.Tier.DefaultAccelerator()
+	var initUsage *colab.UsageSnapshot
+	var initSessions []core.ColabSessionItem
+	if usage, sessions, uErr := s.Engine.FetchUsageAndSessions(context.Background(), acc); uErr == nil && usage != nil {
+		initUsage = usage
+		initSessions = sessions
+		if usage.EligibleKnown {
+			acc.EligibleAccelerators = slices.Clone(usage.EligibleAccelerators)
+			if acc.HasHighTierGPU() {
+				acc.PreferredAccelerator = core.AccAutoBest
+			} else if acc.IsFreeOnly() {
+				acc.PreferredAccelerator = core.AccT4
+			} else {
+				acc.PreferredAccelerator = core.AccAutoPro
+			}
+			acc.HighMem = acc.SupportsHighMem()
+		}
+		if !userPickedTier {
+			acc.Tier = inferInitialTierNote(usage)
+		}
 		acc.Sanitize()
 	}
 
@@ -271,7 +349,7 @@ func (s *Service) CompleteOAuthFlow(displayName string, tier core.SubscriptionTi
 	s.pendingOAuth = nil
 	s.Settings.Accounts = append(s.Settings.Accounts, acc)
 	s.Settings.SelectedAccountID = acc.ID
-	s.Runtime[acc.ID] = core.NewAccountRuntimeState()
+	s.Runtime[acc.ID] = seedInitialRuntimeFromUsage(initUsage, initSessions, time.Now())
 	snap := s.cloneSettingsLocked()
 	s.mu.Unlock()
 	s.saveSettingsSnapshot(snap)
@@ -333,10 +411,27 @@ func (s *Service) refreshAccount(accountID string, settleBusy bool) bool {
 		return false
 	}
 	s.refreshing[accountID] = true
+	firstFetch := false
+	rtInit := s.Runtime[accountID]
+	if rtInit.ContextLimit == 0 {
+		rtInit = core.NewAccountRuntimeState()
+	}
+	if rtInit.LastUsageFetchAt == nil {
+		firstFetch = true
+	}
+	rtInit.UsageFetching = true
+	s.Runtime[accountID] = rtInit
 	s.mu.Unlock()
+	if firstFetch {
+		s.notifyUI()
+	}
 	defer func() {
 		s.mu.Lock()
 		delete(s.refreshing, accountID)
+		if cur, ok := s.Runtime[accountID]; ok {
+			cur.UsageFetching = false
+			s.Runtime[accountID] = cur
+		}
 		s.mu.Unlock()
 		s.notifyUI()
 	}()
@@ -352,19 +447,40 @@ func (s *Service) refreshAccount(accountID string, settleBusy bool) bool {
 		}
 	}
 
+	var updatedSnap *core.AppSettings
 	s.mu.Lock()
 	if err != nil {
 		rt := s.Runtime[accountID]
 		if rt.ContextLimit == 0 {
 			rt = core.NewAccountRuntimeState()
 		}
+		rt.UsageFetching = false
 		rt.LastError = err.Error()
 		s.Runtime[accountID] = rt
 		s.mu.Unlock()
 		return false
 	}
+	if usage != nil && usage.EligibleKnown {
+		for i := range s.Settings.Accounts {
+			if s.Settings.Accounts[i].ID == accountID {
+				if !slices.Equal(s.Settings.Accounts[i].EligibleAccelerators, usage.EligibleAccelerators) {
+					s.Settings.Accounts[i].EligibleAccelerators = slices.Clone(usage.EligibleAccelerators)
+					// Preserve user's explicit HighMem and legacy/confirmed Tier preferences;
+					// only refresh hardware eligibility and re-sanitize legal targets.
+					s.Settings.Accounts[i].Sanitize()
+					acc = s.Settings.Accounts[i]
+					snap := s.cloneSettingsLocked()
+					updatedSnap = &snap
+				}
+				break
+			}
+		}
+	}
 	primaryEndpoint, isRunning, closedRec, nextInFlight := s.applyServerSnapshotLocked(accountID, acc, usage, sessions, inFlight, now, settleBusy, "")
 	s.mu.Unlock()
+	if updatedSnap != nil {
+		s.saveSettingsSnapshot(*updatedSnap)
+	}
 
 	if closedRec != nil {
 		s.recordHistory(*closedRec)

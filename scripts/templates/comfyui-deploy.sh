@@ -35,6 +35,20 @@ DRIVE_EXTRA_MODELS_DIR="${DRIVE_WORKSPACE_ROOT}/models"
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
+if [ ! -f /tmp/colab-tools-session-start.ts ]; then
+  date +%s > /tmp/colab-tools-session-start.ts 2>/dev/null || true
+fi
+
+# Gently release VRAM from any previously running LLM proxy if switching modes in-place (verify /proc/<pid>/cmdline)
+if [ -f /tmp/colab-tools-llama.pid ]; then
+  old_llm_pid="$(cat /tmp/colab-tools-llama.pid 2>/dev/null || true)"
+  if [ -n "$old_llm_pid" ] && [ -r "/proc/${old_llm_pid}/cmdline" ] && tr '\0' ' ' < "/proc/${old_llm_pid}/cmdline" | grep -q "llama-server"; then
+    kill "$old_llm_pid" 2>/dev/null || true
+  fi
+  rm -f /tmp/colab-tools-llama.pid
+fi
+pkill -TERM -f '/content/bin/llama-server' 2>/dev/null || true
+
 if [ "$COMFY_RECIPE" != "h3" ] || [ "$H3_VARIANT" != "custom" ]; then
   H3_DRIVE_ONLY="0"
 fi
@@ -479,14 +493,20 @@ PY
   sync_or_download "vae" "minimax_h3_audio_vae_fp32.safetensors" "Comfy-Org/MiniMax-H3" "vae/minimax_h3_audio_vae_fp32.safetensors" "1"
 
   write_status "拉取主模型" "65%" "$WORKLOAD_NAME" "0.65" "true" "高速写入本地 NVMe 盘…"
+  ACTUAL_FL2VA_MODEL=""
+  ACTUAL_REF2VA_MODEL=""
   case "$H3_VARIANT" in
     original)
-      sync_or_download "diffusion_models" "minimax_h3_fl2va_pruned_fp8_scaled.safetensors" "Comfy-Org/MiniMax-H3" "diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors" "0"
-      sync_or_download "diffusion_models" "minimax_h3_ref2va_pruned_fp8_scaled.safetensors" "Comfy-Org/MiniMax-H3" "diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors" "0"
+      ACTUAL_FL2VA_MODEL="minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
+      ACTUAL_REF2VA_MODEL="minimax_h3_ref2va_pruned_fp8_scaled.safetensors"
+      sync_or_download "diffusion_models" "$ACTUAL_FL2VA_MODEL" "Comfy-Org/MiniMax-H3" "diffusion_models/${ACTUAL_FL2VA_MODEL}" "0"
+      sync_or_download "diffusion_models" "$ACTUAL_REF2VA_MODEL" "Comfy-Org/MiniMax-H3" "diffusion_models/${ACTUAL_REF2VA_MODEL}" "0"
       ;;
     flash_gguf)
-      sync_or_download "diffusion_models" "minimax_h3_fl2va_hyperflow_flash_14b-${H3_GGUF_QUANT}.gguf" "VideoRebirthAI/hyperflow-h3-flash" "fl2va_gguf/minimax_h3_fl2va_hyperflow_flash_14b-${H3_GGUF_QUANT}.gguf" "0"
-      sync_or_download "diffusion_models" "minimax_h3_ref2va_hyperflow_flash_14b-${H3_GGUF_QUANT}.gguf" "VideoRebirthAI/hyperflow-h3-flash" "ref2va_gguf/minimax_h3_ref2va_hyperflow_flash_14b-${H3_GGUF_QUANT}.gguf" "0"
+      ACTUAL_FL2VA_MODEL="minimax_h3_fl2va_hyperflow_flash_14b-${H3_GGUF_QUANT}.gguf"
+      ACTUAL_REF2VA_MODEL="minimax_h3_ref2va_hyperflow_flash_14b-${H3_GGUF_QUANT}.gguf"
+      sync_or_download "diffusion_models" "$ACTUAL_FL2VA_MODEL" "VideoRebirthAI/hyperflow-h3-flash" "fl2va_gguf/${ACTUAL_FL2VA_MODEL}" "0"
+      sync_or_download "diffusion_models" "$ACTUAL_REF2VA_MODEL" "VideoRebirthAI/hyperflow-h3-flash" "ref2va_gguf/${ACTUAL_REF2VA_MODEL}" "0"
       ;;
     custom)
       if [ "$H3_DRIVE_ONLY" = "1" ]; then
@@ -498,6 +518,7 @@ PY
         if [ -z "$found_weights" ]; then
           fail_deploy "Drive 的 diffusion_models 目录为空，未找到任何 .safetensors 或 .gguf 模型"
         fi
+        ACTUAL_FL2VA_MODEL="$(basename "$found_weights")"
       elif [ -n "$H3_CUSTOM_HF_REPO" ] && [ -n "$H3_CUSTOM_HF_FILES" ]; then
         IFS=',' read -ra FILES <<< "$H3_CUSTOM_HF_FILES"
         for raw_f in "${FILES[@]}"; do
@@ -511,6 +532,14 @@ PY
               vae/*)           target_sub="vae" ;;
             esac
             sync_or_download "$target_sub" "$base_name" "$H3_CUSTOM_HF_REPO" "$f" "0"
+            if [ "$target_sub" = "diffusion_models" ]; then
+              if [ -z "$ACTUAL_FL2VA_MODEL" ] || echo "$base_name" | grep -qi "fl2va"; then
+                ACTUAL_FL2VA_MODEL="$base_name"
+              fi
+              if echo "$base_name" | grep -qi "ref2va"; then
+                ACTUAL_REF2VA_MODEL="$base_name"
+              fi
+            fi
           fi
         done
       else
@@ -518,8 +547,10 @@ PY
       fi
       ;;
     *)
-      sync_or_download "diffusion_models" "minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors" "BennyDaBall/HyperFlow-H3-Flash-INT8-ComfyUI" "minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors" "0"
-      sync_or_download "diffusion_models" "minimax_h3_ref2va_hyperflow_flash_int8_convrot.safetensors" "BennyDaBall/HyperFlow-H3-Flash-INT8-ComfyUI" "minimax_h3_ref2va_hyperflow_flash_int8_convrot.safetensors" "0"
+      ACTUAL_FL2VA_MODEL="minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors"
+      ACTUAL_REF2VA_MODEL="minimax_h3_ref2va_hyperflow_flash_int8_convrot.safetensors"
+      sync_or_download "diffusion_models" "$ACTUAL_FL2VA_MODEL" "BennyDaBall/HyperFlow-H3-Flash-INT8-ComfyUI" "$ACTUAL_FL2VA_MODEL" "0"
+      sync_or_download "diffusion_models" "$ACTUAL_REF2VA_MODEL" "BennyDaBall/HyperFlow-H3-Flash-INT8-ComfyUI" "$ACTUAL_REF2VA_MODEL" "0"
       ;;
   esac
 fi
@@ -887,21 +918,198 @@ if [ "$DRIVE_AVAILABLE" = "1" ]; then
   COMFY_DIR="$COMFY_DIR" COMFY_RECIPE="$COMFY_RECIPE" python3 /tmp/colab-tools-flush.py --bootstrap || true
 fi
 
-# Import read-only example workflows from installed custom nodes
-python3 - "$COMFY_DIR/custom_nodes" "$LOCAL_WF_DIR/examples" <<'PY' || true
-import pathlib, shutil, sys
-nodes_root = pathlib.Path(sys.argv[1])
-ex_dst = pathlib.Path(sys.argv[2])
-ex_dst.mkdir(parents=True, exist_ok=True)
-for ex_dir in nodes_root.glob("*/example_workflows"):
-    if not ex_dir.is_dir():
-        continue
-    for wf in ex_dir.glob("*.json"):
-        if not wf.is_file():
-            continue
-        dst = ex_dst / wf.name
-        if not dst.exists():
-            shutil.copy2(wf, dst)
+# Prepare a single verified starter workflow matching this deployment's exact model filenames
+# without overwriting user-edited workflows, and ensure input/first_frame.png exists.
+COMFY_RECIPE="$COMFY_RECIPE" H3_VARIANT="$H3_VARIANT" H3_GGUF_QUANT="$H3_GGUF_QUANT" \
+  ACTUAL_FL2VA_MODEL="${ACTUAL_FL2VA_MODEL:-}" ACTUAL_REF2VA_MODEL="${ACTUAL_REF2VA_MODEL:-}" \
+  python3 - "$COMFY_DIR" "$LOCAL_WF_DIR" <<'PY' || true
+import json
+import os
+import pathlib
+import struct
+import sys
+import zlib
+
+comfy_dir = pathlib.Path(sys.argv[1])
+wf_dir = pathlib.Path(sys.argv[2])
+nodes_root = comfy_dir / "custom_nodes"
+input_dir = comfy_dir / "input"
+input_dir.mkdir(parents=True, exist_ok=True)
+wf_dir.mkdir(parents=True, exist_ok=True)
+
+# 1. Ensure input/first_frame.png exists without overwriting user-provided input images.
+first_frame = input_dir / "first_frame.png"
+if not (first_frame.is_file() and first_frame.stat().st_size > 100):
+    created = False
+    try:
+        from PIL import Image
+        for pat in ("*/assets/*.png", "*/assets/*.jpg", "*/example_workflows/*.png", "*/example_workflows/*.jpg"):
+            for cand in sorted(nodes_root.glob(pat)):
+                if cand.is_file() and cand.stat().st_size > 1024:
+                    with Image.open(cand) as img:
+                        img.convert("RGB").save(first_frame, format="PNG")
+                    created = True
+                    break
+            if created:
+                break
+    except Exception:
+        created = False
+
+    if not created:
+        # Fallback: pure-stdlib 768x512 smooth twilight gradient PNG (zero external deps/network).
+        w, h = 768, 512
+        rows = []
+        for y in range(h):
+            t = y / max(1, h - 1)
+            r = int(28 + 190 * (t ** 1.4))
+            g = int(42 + 120 * (t ** 1.2))
+            b = int(84 + 90 * (1.0 - abs(t - 0.45)))
+            row = bytearray(1 + w * 3)
+            row[0] = 0
+            for x in range(w):
+                dx = (x / max(1, w - 1)) - 0.5
+                glow = max(0.0, 1.0 - (dx * dx * 3.2 + (t - 0.62) ** 2 * 6.0))
+                idx = 1 + x * 3
+                row[idx] = min(255, int(r + 48 * glow))
+                row[idx + 1] = min(255, int(g + 38 * glow))
+                row[idx + 2] = min(255, int(b + 20 * glow))
+            rows.append(bytes(row))
+        raw_img = b"".join(rows)
+
+        def _chunk(tag: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+        ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw_img, level=6))
+            + _chunk(b"IEND", b"")
+        )
+        tmp_png = first_frame.with_suffix(".png.tmp")
+        tmp_png.write_bytes(png_bytes)
+        tmp_png.replace(first_frame)
+
+recipe = os.environ.get("COMFY_RECIPE", "h3").strip().lower()
+variant = os.environ.get("H3_VARIANT", "flash").strip().lower()
+gguf_quant = os.environ.get("H3_GGUF_QUANT", "Q4_K_M").strip()
+
+if recipe != "h3":
+    sys.exit(0)
+
+def list_models(sub: str):
+    d = comfy_dir / "models" / sub
+    if not d.is_dir():
+        return []
+    return sorted([p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")])
+
+diff_models = list_models("diffusion_models")
+text_encoders = list_models("text_encoders")
+vaes = list_models("vae")
+
+def pick_model(cands, includes, exts=(".safetensors", ".gguf")):
+    for name in cands:
+        low = name.lower()
+        if any(low.endswith(e) for e in exts) and all(tok in low for tok in includes):
+            return name
+    return ""
+
+# Prefer the exact filenames chosen by this deployment run instead of guessing alphabetically.
+fl2va_model = os.environ.get("ACTUAL_FL2VA_MODEL", "").strip()
+ref2va_model = os.environ.get("ACTUAL_REF2VA_MODEL", "").strip()
+if not fl2va_model:
+    fl2va_model = pick_model(diff_models, ["fl2va"]) or (diff_models[0] if diff_models else "")
+if not ref2va_model:
+    ref2va_model = pick_model(diff_models, ["ref2va"]) or fl2va_model
+text_enc = pick_model(text_encoders, ["qwen"]) or (text_encoders[0] if text_encoders else "")
+video_vae = pick_model(vaes, ["video"]) or (vaes[0] if vaes else "")
+audio_vae = pick_model(vaes, ["audio"]) or ""
+
+src_wf = None
+if variant == "flash":
+    preferred = [
+        nodes_root / "comfyui_hyperflow_int8_nodes" / "example_workflows" / "hyperflow_int8_i2v.json",
+        nodes_root / "ComfyUI-HyperFlow-Flash" / "example_workflows" / "hyperflow_i2v_int8.json",
+    ]
+    starter_name = "01_H3_Flash_起步模板.json"
+elif variant == "flash_gguf":
+    # Strictly use GGUF-compatible loader workflows; never fall back to INT8 loader nodes.
+    preferred = [
+        nodes_root / "ComfyUI-HyperFlow-Flash" / "example_workflows" / "hyperflow_i2v_gguf.json",
+    ]
+    starter_name = f"01_H3_GGUF_{gguf_quant}_起步模板.json"
+elif variant == "original":
+    preferred = [
+        comfy_dir / "templates" / "video_minimax_h3_i2v.json",
+    ]
+    starter_name = "01_H3_原版31B_起步模板.json"
+else:
+    if fl2va_model.lower().endswith(".gguf"):
+        preferred = [nodes_root / "ComfyUI-HyperFlow-Flash" / "example_workflows" / "hyperflow_i2v_gguf.json"]
+    else:
+        preferred = [
+            nodes_root / "comfyui_hyperflow_int8_nodes" / "example_workflows" / "hyperflow_int8_i2v.json",
+            nodes_root / "ComfyUI-HyperFlow-Flash" / "example_workflows" / "hyperflow_i2v_int8.json",
+        ]
+    starter_name = "01_H3_自定义_起步模板.json"
+
+for cand in preferred:
+    if cand.is_file():
+        src_wf = cand
+        break
+
+if src_wf is None:
+    print(f"[workflow] No matching starter workflow found for variant={variant}; skipping auto-generation.", flush=True)
+    sys.exit(0)
+
+dst_wf = wf_dir / starter_name
+if dst_wf.exists():
+    # Never overwrite an existing starter workflow (the user may have customized it and synced it via Drive).
+    sys.exit(0)
+
+try:
+    data = json.loads(src_wf.read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+
+def rewrite_value(v):
+    if not isinstance(v, str):
+        return v
+    low = v.lower()
+    if low.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        if "first_frame" in low or "example" in low or "input" in low or "/" not in v:
+            return "first_frame.png"
+    if low.endswith((".safetensors", ".gguf")):
+        if "fl2va" in low and fl2va_model:
+            return fl2va_model
+        if "ref2va" in low and ref2va_model:
+            return ref2va_model
+        if ("qwen" in low or "text_encoder" in low) and text_enc:
+            return text_enc
+        if "audio" in low and "vae" in low and audio_vae:
+            return audio_vae
+        if "vae" in low and video_vae:
+            return video_vae
+        if "h3" in low and fl2va_model:
+            return fl2va_model
+    return v
+
+def walk(obj):
+    if isinstance(obj, dict):
+        for k, val in list(obj.items()):
+            if k == "widgets_values" and isinstance(val, list):
+                obj[k] = [rewrite_value(x) for x in val]
+            else:
+                walk(val)
+    elif isinstance(obj, list):
+        for item in obj:
+            walk(item)
+
+walk(data)
+
+tmp_wf = dst_wf.with_suffix(".json.tmp")
+tmp_wf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+tmp_wf.replace(dst_wf)
 PY
 
 # Restart background workflow backup + idle unload guard daemon
@@ -939,6 +1147,8 @@ for _ in $(seq 1 10); do
   fi
   sleep 1
 done
+
+printf '%s\n' "$OUTPUT_DIR" > /tmp/colab-tools-output-dir.txt 2>/dev/null || true
 
 COMFY_ARGS=(
   "$COMFY_DIR/main.py"

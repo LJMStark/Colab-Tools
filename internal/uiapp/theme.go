@@ -236,7 +236,8 @@ func AccountDisplayStatus(acc core.AccountProfile, rt core.AccountRuntimeState, 
 		if rt.DeployFailed {
 			return "部署中断", pal.Coral
 		}
-		if !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy() && !rt.ServerHealthy {
+		sessRecipe, _, _, sessLLM := rt.EffectiveSessionState(acc)
+		if !sessLLM && sessRecipe.IsVideoComfy() && !rt.ServerHealthy {
 			return "未部署", pal.Amber
 		}
 		return "运行良好", pal.Emerald

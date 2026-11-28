@@ -439,8 +439,8 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 	if p := svc.CurrentActionPrompt(); p == nil || p.Kind != core.PromptConfirmStop {
 		t.Fatalf("expected PromptConfirmStop modal after clicking 点此关机, got %+v", p)
 	}
-	if !tt.HasText("确认关机止损") || !tt.HasText("继续运行") {
-		t.Fatalf("missing confirm-stop modal buttons: %q", tt.Texts())
+	if !tt.HasText("放弃并立刻关机") || !tt.HasText("先打开画布保存") || !tt.HasText("继续运行") {
+		t.Fatalf("missing confirm-stop risk modal buttons: %q", tt.Texts())
 	}
 	if err := tt.Click("继续运行"); err != nil {
 		t.Fatalf("click 继续运行 failed: %v", err)
@@ -1078,5 +1078,86 @@ func TestV0323RunningMachinesCardAndWebStopGuideModal(t *testing.T) {
 	}
 	if svc.CurrentActionPrompt() != nil || openedURL != "https://colab.research.google.com/?authuser=demo-user%40example.com" {
 		t.Fatalf("expected prompt dismissed and Colab web home opened, prompt=%+v url=%q", svc.CurrentActionPrompt(), openedURL)
+	}
+}
+
+func TestV0325PendingBalancePrelaunchOverviewNoForcedTierAndSessionOutputActions(t *testing.T) {
+	// 1. First-time pending balance must NOT show misleading "0.0 CU" or "当前未扣点"
+	svc := app.NewService(true)
+	defer svc.Shutdown()
+	acc := core.NewDefaultAccountProfile("FreshAIPro", "fresh@example.com", core.TierAIPro, core.AuthIsolatedVaultADC)
+	acc.EligibleAccelerators = []core.AcceleratorOption{core.AccA100, core.AccL4, core.AccT4}
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	svc.Settings.SelectedAccountID = acc.ID
+	svc.Runtime[acc.ID] = core.NewAccountRuntimeState() // LastUsageFetchAt == nil
+
+	m := uiapp.NewMainUI(svc)
+	m.PreviewMode = true
+	m.ForceTheme = "dark"
+	tPending := ui.NewTester(m.View, 1160, 820)
+	if !tPending.HasText("读取中…") || !tPending.HasText("正在读取点数与运行状态") {
+		t.Fatalf("expected loading state before first usage fetch, got %q", tPending.Texts())
+	}
+	if tPending.HasText("当前未扣点 · 0.00 CU/h") {
+		t.Fatalf("must NOT show 当前未扣点 before first usage fetch: %q", tPending.Texts())
+	}
+	if !tPending.HasText("优先抢 A100 → L4") || !tPending.HasText("CU/h") || !tPending.HasText("成片存 Google Drive") {
+		t.Fatalf("expected prelaunch overview next to power button, got %q", tPending.Texts())
+	}
+
+	// 2. OAuth binding panel must NOT force choosing among 6 subscription tier buttons
+	svc.SetSection(app.SectionAccounts)
+	m.ShowAddAccPanel = true
+	tAcc := ui.NewTester(m.View, 1160, 820)
+	for _, unwanted := range []string{"AI Ultra", "Pro+", "PAYG", "Free"} {
+		if tAcc.HasText(unwanted) {
+			t.Fatalf("OAuth binder should remove forced tier button %q, got %q", unwanted, tAcc.Texts())
+		}
+	}
+	if !tAcc.HasText("无需手选订阅档位") || !tAcc.HasText("可用显卡：A100 / L4 / T4") {
+		t.Fatalf("expected auto-detect copy and eligible GPUs in accounts page, got %q", tAcc.Texts())
+	}
+
+	// 3. Running video session with Drive disabled + new output: red temp badge, Preview & Download buttons, and mode-switch modal
+	svc.SetSection(app.SectionHome)
+	acc.UseGoogleDrive = false
+	svc.Settings.Accounts = []core.AccountProfile{acc}
+	now := time.Now()
+	rt := core.NewAccountRuntimeState()
+	rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
+	rt.ActiveEndpoint = "ep-run-1"
+	rt.ActiveHardware = "L4"
+	rt.ServerHealthy = true
+	rt.CUBalance = 200.0
+	rt.CURatePerHour = 2.33
+	rt.LastUsageFetchAt = &now
+	rt.SessionLocked = true
+	rt.SessionRecipe = core.RecipeH3Video
+	rt.SessionH3Variant = core.H3VariantFlash
+	rt.SessionWorkloadKind = core.WorkloadVideo
+	rt.SessionEnableLLM = false
+	rt.SessionIdleTimeoutMin = 10
+	rt.SessionIsVideoComfy = true
+	rt.EffectiveOutputDir = "/content/output"
+	rt.SessionNewVideoCount = 1
+	rt.SessionOutputs = []core.SessionVideoOutput{{Filename: "first_clip.mp4", Type: "output", SavedToDrive: false}}
+	svc.Runtime[acc.ID] = rt
+
+	tRun := ui.NewTester(m.View, 1160, 820)
+	for _, want := range []string{"临时盘·1条(关机清)", "最新：first_clip.mp4", "预览", "下载"} {
+		if !tRun.HasText(want) {
+			t.Fatalf("missing %q on running video output card: %q", want, tRun.Texts())
+		}
+	}
+	// Clicking 大模型代理 while running video opens mode-switch prompt instead of clobbering Card 4
+	if err := tRun.Click("大模型代理"); err != nil {
+		t.Fatalf("click 大模型代理 failed: %v", err)
+	}
+	if p := svc.CurrentActionPrompt(); p == nil || p.Kind != core.PromptSwitchModeWhileRunning {
+		t.Fatalf("expected PromptSwitchModeWhileRunning modal, got %+v", p)
+	}
+	tModal := ui.NewTester(m.View, 980, 660)
+	if !tModal.HasText("只改下次开机") || !tModal.HasText("立刻重装切过去") {
+		t.Fatalf("missing mode-switch modal options: %q", tModal.Texts())
 	}
 }

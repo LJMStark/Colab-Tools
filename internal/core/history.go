@@ -154,9 +154,15 @@ type HistoryRecord struct {
 	Adopted            bool       `json:"adopted,omitempty"`
 	MaxAssignments     int        `json:"maxAssignments,omitempty"`
 	MeasuredSingleRate float64    `json:"measuredSingleRate,omitempty"`
-	LastSampleAt       *time.Time `json:"lastSampleAt,omitempty"`
-	LastUptimeSec      int        `json:"lastUptimeSec,omitempty"`
-	UsedStandardRAM    bool       `json:"usedStandardRAM,omitempty"`
+	LastSampleAt          *time.Time   `json:"lastSampleAt,omitempty"`
+	LastUptimeSec         int          `json:"lastUptimeSec,omitempty"`
+	UsedStandardRAM       bool         `json:"usedStandardRAM,omitempty"`
+	SessionRecipe         DeployRecipe `json:"sessionRecipe,omitempty"`
+	SessionH3Variant      H3Variant    `json:"sessionH3Variant,omitempty"`
+	SessionWorkloadKind   WorkloadKind `json:"sessionWorkloadKind,omitempty"`
+	SessionEnableLLM      bool         `json:"sessionEnableLLM,omitempty"`
+	SessionIdleTimeoutMin int          `json:"sessionIdleTimeoutMin,omitempty"`
+	TempGuardGraceUntil   *time.Time   `json:"tempGuardGraceUntil,omitempty"`
 }
 
 type HistoryFilter struct {

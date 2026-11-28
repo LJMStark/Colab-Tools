@@ -23,7 +23,7 @@ import (
 	"github.com/egoist/mygo"
 )
 
-const AppVersion = "0.3.24"
+const AppVersion = "0.3.25"
 
 var errSSHTunnelStarting = errors.New("本机加密通道正在建立中，请稍候")
 
@@ -119,10 +119,13 @@ type Service struct {
 	actionPrompt           *core.UserActionPrompt
 	pendingQuitCallback    func()
 	driveAuthResultCh      chan bool
-	comfyTunnelWaitTimeout time.Duration
-	comfyRetryPause        time.Duration
-	sshStarter             func(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error)
-	terminalOpener         func(shellCmd string) error
+	comfyTunnelWaitTimeout  time.Duration
+	comfyRetryPause         time.Duration
+	tempOutputGraceDuration time.Duration
+	sshStarter              func(r *runner.OSRunner, profile core.AccountProfile, localPort, remotePort int, adcPath string) (*exec.Cmd, *tunnelStderrBuffer, error)
+	terminalOpener          func(shellCmd string) error
+	revealFileFn            func(localPath string)
+	downloadBaseDir         string
 
 	OSRunner *runner.OSRunner
 	Engine   *colab.Engine
@@ -173,6 +176,11 @@ func NewService(skipBootstrap bool) *Service {
 		skipNextDriveMount: map[string]bool{},
 		sshStarter:         startSSHTunnelProcess,
 		terminalOpener:     openTerminalCommand,
+		revealFileFn: func(localPath string) {
+			if !skipBootstrap && runtime.GOOS == "darwin" && strings.TrimSpace(localPath) != "" {
+				_ = exec.Command("open", "-R", localPath).Start()
+			}
+		},
 		OSRunner:           r,
 		Engine:             colab.NewEngine(r, v),
 		Vault:              v,
@@ -253,6 +261,7 @@ func (s *Service) cloneSettingsLocked() core.AppSettings {
 	cp.Accounts = make([]core.AccountProfile, len(s.Settings.Accounts))
 	for i, acc := range s.Settings.Accounts {
 		acc.QueueTargets = slices.Clone(acc.QueueTargets)
+		acc.EligibleAccelerators = slices.Clone(acc.EligibleAccelerators)
 		cp.Accounts[i] = acc
 	}
 	if s.Settings.QueueCooldownsByAccount != nil {
@@ -264,12 +273,17 @@ func (s *Service) cloneSettingsLocked() core.AppSettings {
 	return cp
 }
 
-func (s *Service) saveSettingsSnapshot(snap core.AppSettings) {
+func (s *Service) saveSettingsSnapshot(_ core.AppSettings) {
 	if !s.persistChanges {
 		return
 	}
+	// Serialize disk writes and always persist the latest in-memory snapshot under saveMu
+	// so slower background goroutines can never overwrite newer user edits with stale state.
 	s.saveMu.Lock()
-	err := snap.Save(s.configPath)
+	s.mu.RLock()
+	latest := s.cloneSettingsLocked()
+	s.mu.RUnlock()
+	err := latest.Save(s.configPath)
 	s.saveMu.Unlock()
 	if err != nil {
 		log.Printf("[colab-tools] save config failed: %v", err)
@@ -593,7 +607,11 @@ func (s *Service) AccountsSnapshot() []core.AccountProfile {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]core.AccountProfile, len(s.Settings.Accounts))
-	copy(out, s.Settings.Accounts)
+	for i, acc := range s.Settings.Accounts {
+		acc.QueueTargets = slices.Clone(acc.QueueTargets)
+		acc.EligibleAccelerators = slices.Clone(acc.EligibleAccelerators)
+		out[i] = acc
+	}
 	return out
 }
 
@@ -602,11 +620,16 @@ func (s *Service) SelectedAccount() (core.AccountProfile, bool) {
 	defer s.mu.RUnlock()
 	for _, acc := range s.Settings.Accounts {
 		if acc.ID == s.Settings.SelectedAccountID {
+			acc.QueueTargets = slices.Clone(acc.QueueTargets)
+			acc.EligibleAccelerators = slices.Clone(acc.EligibleAccelerators)
 			return acc, true
 		}
 	}
 	if len(s.Settings.Accounts) > 0 {
-		return s.Settings.Accounts[0], true
+		acc := s.Settings.Accounts[0]
+		acc.QueueTargets = slices.Clone(acc.QueueTargets)
+		acc.EligibleAccelerators = slices.Clone(acc.EligibleAccelerators)
+		return acc, true
 	}
 	return core.AccountProfile{}, false
 }
@@ -615,6 +638,10 @@ func (s *Service) StateFor(accountID string) core.AccountRuntimeState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if rt, ok := s.Runtime[accountID]; ok {
+		rt.Sessions = slices.Clone(rt.Sessions)
+		rt.SessionOutputs = slices.Clone(rt.SessionOutputs)
+		rt.GPUUtilHistory = slices.Clone(rt.GPUUtilHistory)
+		rt.VRAMHistory = slices.Clone(rt.VRAMHistory)
 		return rt
 	}
 	return core.NewAccountRuntimeState()
@@ -660,26 +687,39 @@ func (s *Service) SelectAccount(accountID string) {
 }
 
 func (s *Service) UpdateAccount(updated core.AccountProfile) {
+	s.updateAccountProfile(updated, true)
+}
+
+func (s *Service) updateAccountProfile(updated core.AccountProfile, syncRunningIdleTimeout bool) {
 	updated.Sanitize()
 	if updated.QueuePersistentMode && !updated.AutoShutdownEnabled {
 		updated.AutoShutdownEnabled = true
 	}
 	s.mu.Lock()
+	var prev core.AccountProfile
+	foundPrev := false
 	for i := range s.Settings.Accounts {
 		if s.Settings.Accounts[i].ID == updated.ID {
+			prev = s.Settings.Accounts[i]
+			foundPrev = true
 			s.Settings.Accounts[i] = updated
 			break
 		}
 	}
-	if rt, ok := s.Runtime[updated.ID]; ok && rt.Phase.IsQueuing() {
-		rt.Phase.QueuePersistent = updated.QueuePersistentMode
-		rt.Phase.QueueMaxHours = core.EffectivePersistentHours(updated)
-		if updated.QueuePersistentMode {
-			rt.Phase.QueueMax = 0
-		} else if rt.Phase.QueueMax <= 0 {
-			rt.Phase.QueueMax = core.QueueMaxAttempts
+	if rt, ok := s.Runtime[updated.ID]; ok {
+		if rt.Phase.IsQueuing() {
+			rt.Phase.QueuePersistent = updated.QueuePersistentMode
+			rt.Phase.QueueMaxHours = core.EffectivePersistentHours(updated)
+			if updated.QueuePersistentMode {
+				rt.Phase.QueueMax = 0
+			} else if rt.Phase.QueueMax <= 0 {
+				rt.Phase.QueueMax = core.QueueMaxAttempts
+			}
+			s.Runtime[updated.ID] = rt
+		} else if syncRunningIdleTimeout && rt.Phase.IsRunning() && rt.SessionLocked && foundPrev && updated.IdleTimeoutMinutes != prev.IdleTimeoutMinutes {
+			rt.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(updated)
+			s.Runtime[updated.ID] = rt
 		}
-		s.Runtime[updated.ID] = rt
 	}
 	snap := s.cloneSettingsLocked()
 	s.mu.Unlock()

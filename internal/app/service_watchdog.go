@@ -52,7 +52,7 @@ func (s *Service) flushInFlightSessions() {
 
 func mapShutdownReason(reason string) core.ShutdownReason {
 	switch strings.TrimSpace(reason) {
-	case "空闲自动关机":
+	case "空闲自动关机", "临时盘宽限到期自动关机":
 		return core.ShutdownAutoIdle
 	case "全部关机止损":
 		return core.ShutdownBatchStop
@@ -89,7 +89,9 @@ func computeSessionBilling(
 	allowMeasured bool,
 	usage *colab.UsageSnapshot,
 ) (core.BillingBasis, float64) {
-	if tier == core.TierFree {
+	// Never zero out billing purely from an optional Free note when measured CU burn actually occurred.
+	hasMeasuredDelta := allowMeasured && usage != nil && maxAssignments <= 1 && !adopted && startBalanceValid && (startBalance-usage.Balance) > 0.01
+	if tier == core.TierFree && measuredRate <= 0 && estCU <= 0 && !hasMeasuredDelta {
 		return core.BillingFree, 0
 	}
 	est := estCU
@@ -137,30 +139,42 @@ func buildInFlightRecordLocked(acc core.AccountProfile, rt core.AccountRuntimeSt
 		estCU += rate * now.Sub(lastSample).Seconds() / 3600.0
 	}
 	sampleAt := now
+	effAcc := core.SessionEffectiveProfile(acc, rt)
+	var gracePtr *time.Time
+	if rt.WatchdogDeferredForTempOutputs && !rt.TempGuardGraceUntil.IsZero() {
+		g := rt.TempGuardGraceUntil
+		gracePtr = &g
+	}
 	return &core.HistoryRecord{
-		ID:                 deterministicSessionRecordID(acc.ID, rt.ActiveEndpoint, startedAt),
-		Kind:               core.HistoryKindSession,
-		InFlight:           true,
-		AccountID:          acc.ID,
-		AccountName:        acc.DisplayName,
-		AccountColor:       acc.ColorTag,
-		SessionName:        acc.SessionName,
-		Endpoint:           rt.ActiveEndpoint,
-		StartedAt:          startedAt,
-		Hardware:           hw,
-		HighMem:            core.EffectiveUseHighMem(acc) && !rt.SessionUsedStandardRAM,
-		RecipeLabel:        recipeLabelForSession(acc, rt.SessionModelDowngraded),
-		ConsumedCU:         estCU,
-		FallbackUsed:       rt.SessionFallbackUsed,
-		ModelDowngraded:    rt.SessionModelDowngraded,
-		StartBalance:       rt.SessionStartBalance,
-		StartBalanceValid:  rt.SessionStartBalanceValid,
-		Adopted:            rt.SessionAdopted,
-		MaxAssignments:     rt.SessionMaxAssignments,
-		MeasuredSingleRate: rt.SessionMeasuredSingleRate,
-		LastSampleAt:       &sampleAt,
-		LastUptimeSec:      rt.SessionUptimeSec,
-		UsedStandardRAM:    rt.SessionUsedStandardRAM,
+		ID:                    deterministicSessionRecordID(acc.ID, rt.ActiveEndpoint, startedAt),
+		Kind:                  core.HistoryKindSession,
+		InFlight:              true,
+		AccountID:             acc.ID,
+		AccountName:           acc.DisplayName,
+		AccountColor:          acc.ColorTag,
+		SessionName:           acc.SessionName,
+		Endpoint:              rt.ActiveEndpoint,
+		StartedAt:             startedAt,
+		Hardware:              hw,
+		HighMem:               core.EffectiveUseHighMem(effAcc) && !rt.SessionUsedStandardRAM,
+		RecipeLabel:           recipeLabelForSession(effAcc, rt.SessionModelDowngraded),
+		ConsumedCU:            estCU,
+		FallbackUsed:          rt.SessionFallbackUsed,
+		ModelDowngraded:       rt.SessionModelDowngraded,
+		StartBalance:          rt.SessionStartBalance,
+		StartBalanceValid:     rt.SessionStartBalanceValid,
+		Adopted:               rt.SessionAdopted,
+		MaxAssignments:        rt.SessionMaxAssignments,
+		MeasuredSingleRate:    rt.SessionMeasuredSingleRate,
+		LastSampleAt:          &sampleAt,
+		LastUptimeSec:         rt.SessionUptimeSec,
+		UsedStandardRAM:       rt.SessionUsedStandardRAM,
+		SessionRecipe:         effAcc.DeployRecipe,
+		SessionH3Variant:      effAcc.H3Variant,
+		SessionWorkloadKind:   effAcc.WorkloadKind,
+		SessionEnableLLM:      effAcc.EnableLLMModule,
+		SessionIdleTimeoutMin: rt.EffectiveSessionIdleTimeout(acc),
+		TempGuardGraceUntil:   gracePtr,
 	}
 }
 
@@ -207,15 +221,20 @@ func buildClosedSessionRecordLocked(
 	}
 
 	if reason == "" {
-		if durSec >= acc.Tier.MaxSessionHours()*3600-300 {
+		if durSec >= acc.MaxSessionHours()*3600-300 {
 			reason = core.ShutdownCapReached
 		} else {
 			reason = core.ShutdownExternalOrLost
 		}
 	}
 
+	effAcc := core.SessionEffectiveProfile(acc, *rt)
+	billingTier := effAcc.Tier
+	if !effAcc.IsFreeOnly() && billingTier == core.TierFree {
+		billingTier = core.TierAIPro
+	}
 	basis, consumed := computeSessionBilling(
-		acc.Tier, hw, durSec,
+		billingTier, hw, durSec,
 		rt.SessionEstimatedCU, rt.SessionMeasuredSingleRate,
 		rt.SessionStartBalance, rt.SessionStartBalanceValid,
 		rt.SessionAdopted, rt.SessionMaxAssignments,
@@ -235,8 +254,8 @@ func buildClosedSessionRecordLocked(
 		EndedAt:         &endedAt,
 		DurationSec:     durSec,
 		Hardware:        hw,
-		HighMem:         core.EffectiveUseHighMem(acc) && !rt.SessionUsedStandardRAM,
-		RecipeLabel:     recipeLabelForSession(acc, rt.SessionModelDowngraded),
+		HighMem:         core.EffectiveUseHighMem(effAcc) && !rt.SessionUsedStandardRAM,
+		RecipeLabel:     recipeLabelForSession(effAcc, rt.SessionModelDowngraded),
 		ConsumedCU:      consumed,
 		BillingBasis:    basis,
 		ShutdownReason:  reason,
@@ -457,6 +476,7 @@ func (s *Service) applyServerSnapshotLocked(
 			}
 
 			s.cancelDeployFlowLocked(accountID)
+			s.clearStaleEndpointPromptsLocked(accountID, primary.Endpoint)
 			rt.PublicURL = ""
 			rt.LLMURLBoundEndpoint = ""
 			rt.DisplayUIURL = ""
@@ -470,14 +490,43 @@ func (s *Service) applyServerSnapshotLocked(
 			rt.DeployLogTail = ""
 			rt.DeployLogLoading = false
 			rt.RenderedVideoCount = 0
-			rt.SessionIsVideoComfy = !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy()
+			rt.SessionNewVideoCount = 0
+			rt.SessionOutputs = nil
+			rt.DownloadingOutput = false
+			rt.SessionLocked = true
+			if inFlight != nil && inFlight.Endpoint == primary.Endpoint && inFlight.SessionRecipe != "" {
+				rt.SessionRecipe = inFlight.SessionRecipe
+				rt.SessionH3Variant = inFlight.SessionH3Variant
+				rt.SessionWorkloadKind = inFlight.SessionWorkloadKind
+				rt.SessionEnableLLM = inFlight.SessionEnableLLM
+				rt.SessionIdleTimeoutMin = inFlight.SessionIdleTimeoutMin
+				if rt.SessionIdleTimeoutMin < 5 {
+					rt.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(acc)
+				}
+				rt.SessionIsVideoComfy = !rt.SessionEnableLLM && rt.SessionRecipe.IsVideoComfy()
+				if inFlight.TempGuardGraceUntil != nil && !inFlight.TempGuardGraceUntil.IsZero() {
+					rt.WatchdogDeferredForTempOutputs = true
+					rt.TempGuardGraceUntil = *inFlight.TempGuardGraceUntil
+				} else {
+					rt.WatchdogDeferredForTempOutputs = false
+					rt.TempGuardGraceUntil = time.Time{}
+				}
+			} else {
+				rt.SessionIsVideoComfy = !acc.EnableLLMModule && acc.DeployRecipe.IsVideoComfy()
+				rt.SessionRecipe = acc.DeployRecipe
+				rt.SessionH3Variant = acc.H3Variant
+				rt.SessionWorkloadKind = acc.WorkloadKind
+				rt.SessionEnableLLM = acc.EnableLLMModule
+				rt.SessionIdleTimeoutMin = core.EffectiveIdleTimeoutMinutes(acc)
+				rt.WatchdogDeferredForTempOutputs = false
+				rt.TempGuardGraceUntil = time.Time{}
+			}
 			rt.AutoOpenedEndpoint = ""
 			rt.DriveMountedKnown = false
 			rt.DriveActuallyMounted = false
 			rt.EffectiveOutputDir = ""
 			rt.TempOutputVideos = 0
 			rt.TempOutputScanKnown = false
-			rt.WatchdogDeferredForTempOutputs = false
 		}
 		if settleBusy || !rt.Phase.IsBusy() {
 			rt.Phase = core.InstancePhase{Kind: core.PhaseRunning}
@@ -525,6 +574,7 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.GPUUtilPercent = 0
 	rt.SessionUptimeSec = 0
 	s.cancelDeployFlowLocked(accountID)
+	s.clearStaleEndpointPromptsLocked(accountID, "")
 	rt.PublicURL = ""
 	rt.LLMURLBoundEndpoint = ""
 	rt.DisplayUIURL = ""
@@ -538,7 +588,16 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.DeployLogTail = ""
 	rt.DeployLogLoading = false
 	rt.RenderedVideoCount = 0
+	rt.SessionNewVideoCount = 0
+	rt.SessionOutputs = nil
+	rt.DownloadingOutput = false
 	rt.SessionIsVideoComfy = false
+	rt.SessionLocked = false
+	rt.SessionRecipe = ""
+	rt.SessionH3Variant = ""
+	rt.SessionWorkloadKind = ""
+	rt.SessionEnableLLM = false
+	rt.SessionIdleTimeoutMin = 0
 	rt.AutoOpenedEndpoint = ""
 	rt.DriveMountedKnown = false
 	rt.DriveActuallyMounted = false
@@ -546,6 +605,7 @@ func (s *Service) applyServerSnapshotLocked(
 	rt.TempOutputVideos = 0
 	rt.TempOutputScanKnown = false
 	rt.WatchdogDeferredForTempOutputs = false
+	rt.TempGuardGraceUntil = time.Time{}
 	rt.QueueRunning = 0
 	rt.QueuePending = 0
 	rt.IdleSeconds = 0
@@ -556,8 +616,22 @@ func (s *Service) applyServerSnapshotLocked(
 	return "", false, closedRec, nil
 }
 
+func (s *Service) clearStaleEndpointPromptsLocked(accountID, currentEndpoint string) {
+	if s.actionPrompt == nil || s.actionPrompt.AccountID != accountID {
+		return
+	}
+	switch s.actionPrompt.Kind {
+	case core.PromptConfirmStop, core.PromptTempOutputGuard, core.PromptSwitchModeWhileRunning:
+		if currentEndpoint == "" || (s.actionPrompt.ExpectedEndpoint != "" && s.actionPrompt.ExpectedEndpoint != currentEndpoint) {
+			s.actionPrompt = nil
+		}
+	}
+}
+
 func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoint string) {
-	tel := s.Engine.FetchRemoteTelemetry(context.Background(), acc)
+	liveRT := s.StateFor(acc.ID)
+	probeProfile := core.SessionEffectiveProfile(acc, liveRT)
+	tel := s.Engine.FetchRemoteTelemetry(context.Background(), probeProfile)
 	if tel == nil {
 		return
 	}
@@ -634,6 +708,10 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		rt.DeployRunning = false
 	}
 	rt.RenderedVideoCount = tel.RenderedVideoCount
+	if tel.SessionNewVideos != nil {
+		rt.SessionNewVideoCount = *tel.SessionNewVideos
+		rt.SessionOutputs = tel.SessionOutputs
+	}
 	if tel.TempOutputVideos != nil {
 		rt.TempOutputScanKnown = true
 		rt.TempOutputVideos = *tel.TempOutputVideos
@@ -641,6 +719,7 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 			rt.SessionIsVideoComfy = true
 		} else if *tel.TempOutputVideos == 0 {
 			rt.WatchdogDeferredForTempOutputs = false
+			rt.TempGuardGraceUntil = time.Time{}
 		}
 	}
 	if tel.DriveMounted != nil {
@@ -692,7 +771,8 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 		rt.SessionIsVideoComfy = true
 	}
 
-	if !acc.EnableLLMModule {
+	sessionRecipe, sessionVariant, _, sessionEnableLLM := rt.EffectiveSessionState(acc)
+	if !sessionEnableLLM {
 		handled := false
 		if rt.DeployRunning {
 			handled = true
@@ -700,6 +780,8 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 			rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
 			rt.IdleSeconds = 0
 			rt.WarnedForCurrentIdle = false
+			rt.WatchdogDeferredForTempOutputs = false
+			rt.TempGuardGraceUntil = time.Time{}
 		}
 		if !handled && statusFresh {
 			if busy, ok := tel.StatusPayload.IsWorkloadBusy(); ok {
@@ -709,6 +791,8 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 					rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
 					rt.IdleSeconds = 0
 					rt.WarnedForCurrentIdle = false
+					rt.WatchdogDeferredForTempOutputs = false
+					rt.TempGuardGraceUntil = time.Time{}
 				} else {
 					rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
 				}
@@ -721,6 +805,8 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 				rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
 				rt.IdleSeconds = 0
 				rt.WarnedForCurrentIdle = false
+				rt.WatchdogDeferredForTempOutputs = false
+				rt.TempGuardGraceUntil = time.Time{}
 			} else {
 				rt.ActivitySignal = core.ActivitySignal{Kind: core.SignalIdle, ObservedAt: now}
 			}
@@ -733,17 +819,20 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 				if sig.IsBusy() {
 					rt.IdleSeconds = 0
 					rt.WarnedForCurrentIdle = false
+					rt.WatchdogDeferredForTempOutputs = false
+					rt.TempGuardGraceUntil = time.Time{}
 				}
 			}
 		}
 	}
 
-	shouldAutoOpenComfy := acc.DeployRecipe.IsVideoComfy() &&
+	shouldAutoOpenComfy := sessionRecipe.IsVideoComfy() &&
+		!sessionEnableLLM &&
 		tel.ComfyQueue != nil &&
 		!rt.DeployRunning &&
 		!rt.DeployPreLaunch &&
 		rt.AutoOpenedEndpoint != expectedEndpoint
-	shouldSyncLLMReady := acc.EnableLLMModule &&
+	shouldSyncLLMReady := sessionEnableLLM &&
 		tel.Healthy &&
 		rt.PublicURL != "" &&
 		!rt.DeployRunning &&
@@ -764,9 +853,9 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 	if shouldAutoOpenComfy {
 		s.cancelDeployWatcher(acc.ID)
 		go func() {
-			variantLabel := acc.H3Variant.DisplayName()
-			if acc.DeployRecipe == core.RecipeComfyUIGeneral {
-				variantLabel = acc.DeployRecipe.DisplayName()
+			variantLabel := sessionVariant.DisplayName()
+			if sessionRecipe == core.RecipeComfyUIGeneral {
+				variantLabel = sessionRecipe.DisplayName()
 			}
 			s.SendNotification("ComfyUI 已装好，正在打开", fmt.Sprintf("%s 的 %s 已启动，正在通过本机加密通道打开画布", acc.DisplayName, variantLabel), true)
 			s.OpenComfyUI(acc.ID)
@@ -787,10 +876,10 @@ func (s *Service) fetchAndApplyTelemetry(acc core.AccountProfile, expectedEndpoi
 func (s *Service) pollRunningLLMSlots() {
 	accounts := s.AccountsSnapshot()
 	for _, acc := range accounts {
-		if !acc.EnableLLMModule {
+		rt := s.StateFor(acc.ID)
+		if !rt.EffectiveSessionEnableLLM(acc) {
 			continue
 		}
-		rt := s.StateFor(acc.ID)
 		if !rt.Phase.IsRunning() || rt.PublicURL == "" || rt.LLMURLBoundEndpoint != rt.ActiveEndpoint {
 			continue
 		}
@@ -1076,15 +1165,22 @@ func (s *Service) StopAllManagedSessions() bool {
 
 // Idle Watchdog & 1s Tick
 
+func (s *Service) tempOutputGrace() time.Duration {
+	if s.tempOutputGraceDuration > 0 {
+		return s.tempOutputGraceDuration
+	}
+	return 15 * time.Minute
+}
+
 func (s *Service) WatchdogStatusFor(acc core.AccountProfile) core.WatchdogAction {
 	rt := s.StateFor(acc.ID)
 	return core.EvaluateWatchdog(core.WatchdogInput{
 		IsRunning:             rt.Phase.IsRunning(),
-		EnableLLMModule:       acc.EnableLLMModule,
+		EnableLLMModule:       rt.EffectiveSessionEnableLLM(acc),
 		ActivitySignal:        rt.ActivitySignal,
 		AutoShutdownEnabled:   acc.AutoShutdownEnabled,
 		IdleSeconds:           rt.IdleSeconds,
-		TimeoutMinutes:        core.EffectiveIdleTimeoutMinutes(acc),
+		TimeoutMinutes:        rt.EffectiveSessionIdleTimeout(acc),
 		WarnBeforeMinutes:     acc.WarnBeforeMinutes,
 		AlreadyWarned:         rt.WarnedForCurrentIdle,
 		Now:                   time.Now(),
@@ -1099,6 +1195,7 @@ func (s *Service) ResetIdleTimer(accountID string) {
 		rt.LastActiveAt = time.Now()
 		rt.WarnedForCurrentIdle = false
 		rt.WatchdogDeferredForTempOutputs = false
+		rt.TempGuardGraceUntil = time.Time{}
 		s.Runtime[accountID] = rt
 	}
 	s.mu.Unlock()
@@ -1107,16 +1204,28 @@ func (s *Service) ResetIdleTimer(accountID string) {
 
 func (s *Service) handleOneSecondTick(now time.Time) {
 	var toShutdown []string
+	var toGraceExpiredShutdown []struct {
+		id       string
+		name     string
+		endpoint string
+	}
 	var toTempGuard []struct {
-		id     string
-		name   string
-		videos int
+		id              string
+		name            string
+		endpoint        string
+		videos          int
+		rate            float64
+		driveDisabled   bool
+		graceMinutes    int
+		hasDownloadable bool
 	}
 	var toWarn []struct {
 		name string
 		rem  int
 	}
 	needsRepaint := false
+	grace := s.tempOutputGrace()
+	graceMins := max(1, int((grace+time.Second*59)/time.Minute))
 
 	s.mu.Lock()
 	for i := range s.Settings.Accounts {
@@ -1129,8 +1238,9 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 
 		if rt.Phase.IsRunning() {
 			rt.SessionUptimeSec++
+			sessionEnableLLM := rt.EffectiveSessionEnableLLM(*acc)
 			maxAge := core.DefaultSignalMaxAge
-			if !acc.EnableLLMModule {
+			if !sessionEnableLLM {
 				maxAge = core.HardwareSignalMaxAge
 			}
 			freshIdle := rt.ActivitySignal.Kind == core.SignalIdle &&
@@ -1139,10 +1249,10 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 			if acc.AutoShutdownEnabled && freshIdle {
 				rt.IdleSeconds++
 			}
-			effectiveTimeout := core.EffectiveIdleTimeoutMinutes(*acc)
+			effectiveTimeout := rt.EffectiveSessionIdleTimeout(*acc)
 			act := core.EvaluateWatchdog(core.WatchdogInput{
 				IsRunning:             true,
-				EnableLLMModule:       acc.EnableLLMModule,
+				EnableLLMModule:       sessionEnableLLM,
 				ActivitySignal:        rt.ActivitySignal,
 				AutoShutdownEnabled:   acc.AutoShutdownEnabled,
 				IdleSeconds:           rt.IdleSeconds,
@@ -1160,21 +1270,49 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 					rem  int
 				}{acc.DisplayName, act.RemainingMinutes})
 			case core.WatchdogShutdown:
-				isVideoSession := rt.SessionIsVideoComfy || !acc.EnableLLMModule
-				tempOutputsAtRisk := acc.UseGoogleDrive && ((rt.TempOutputScanKnown && rt.TempOutputVideos > 0) ||
-					(isVideoSession && rt.DriveMountedKnown && !rt.DriveActuallyMounted && (rt.RenderedVideoCount > 0 || (rt.TempOutputScanKnown && rt.TempOutputVideos < 0))))
+				isVideoSession := rt.SessionIsVideoComfy || !sessionEnableLLM
+				var tempOutputsAtRisk bool
+				if rt.TempOutputScanKnown {
+					// Authoritative three-state decision: >0 (files exist) or <0 (scan unknown/truncated) protect; ==0 (verified empty) allows stop.
+					tempOutputsAtRisk = rt.TempOutputVideos != 0
+				} else {
+					tempOutputsAtRisk = isVideoSession && rt.IsTempOutputActive(*acc) && (rt.SessionNewVideoCount > 0 || rt.RenderedVideoCount > 0)
+				}
 				if tempOutputsAtRisk {
 					if !rt.WatchdogDeferredForTempOutputs {
 						rt.WatchdogDeferredForTempOutputs = true
+						rt.TempGuardGraceUntil = now.Add(grace)
 						vidCount := rt.TempOutputVideos
-						if vidCount <= 0 {
+						if vidCount <= 0 && rt.IsTempOutputActive(*acc) && rt.SessionNewVideoCount > 0 {
+							vidCount = rt.SessionNewVideoCount
+						}
+						if vidCount <= 0 && rt.TempOutputVideos >= 0 {
 							vidCount = rt.RenderedVideoCount
 						}
+						hasDL := len(rt.SessionOutputs) > 0 || rt.TempOutputVideos != 0
 						toTempGuard = append(toTempGuard, struct {
-							id     string
-							name   string
-							videos int
-						}{acc.ID, acc.DisplayName, vidCount})
+							id              string
+							name            string
+							endpoint        string
+							videos          int
+							rate            float64
+							driveDisabled   bool
+							graceMinutes    int
+							hasDownloadable bool
+						}{acc.ID, acc.DisplayName, rt.ActiveEndpoint, vidCount, rt.CURatePerHour, !acc.UseGoogleDrive, graceMins, hasDL})
+					} else if !rt.TempGuardGraceUntil.IsZero() && !now.Before(rt.TempGuardGraceUntil) {
+						if rt.DownloadingOutput {
+							// Keep the machine alive while user is actively downloading the temporary video.
+							rt.TempGuardGraceUntil = now.Add(60 * time.Second)
+						} else {
+							// Grace period exhausted: enforce shutdown to protect user's compute units.
+							rt.TempGuardGraceUntil = now.Add(60 * time.Second)
+							toGraceExpiredShutdown = append(toGraceExpiredShutdown, struct {
+								id       string
+								name     string
+								endpoint string
+							}{acc.ID, acc.DisplayName, rt.ActiveEndpoint})
+						}
 					}
 				} else {
 					toShutdown = append(toShutdown, acc.ID)
@@ -1189,18 +1327,52 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 		s.SendNotification("即将空闲关机", fmt.Sprintf("%s 将在约 %d 分钟后自动关机止损，可在主控台点击「续命」", w.name, w.rem), true)
 	}
 	for _, tg := range toTempGuard {
-		msg := fmt.Sprintf("检测到 %s 的云端临时盘（未挂载 Drive）有 %d 条新成片，已暂缓自动关机以防清空视频，请先打开画布下载或确认关机。", tg.name, tg.videos)
-		s.SendNotification("暂缓自动关机：临时盘有未保存成片", msg, true)
+		cause := "未挂载 Google Drive"
+		if tg.driveDisabled {
+			cause = "当前已关闭自动存网盘"
+		}
+		vidDesc := fmt.Sprintf("%d 条视频", tg.videos)
+		if tg.videos <= 0 {
+			vidDesc = "未确认数量的临时视频"
+		}
+		msg := fmt.Sprintf(
+			"检测到 %s 的云电脑临时盘（%s）还有 %s，关机后会永久清空。\n当前机器仍在计费（约 %.2f CU/h），已为你宽限 %d 分钟。请尽快下回本机，超时无人处理将自动关机止损。",
+			tg.name, cause, vidDesc, tg.rate, tg.graceMinutes,
+		)
+		s.SendNotification("暂缓自动关机：临时盘有未保存视频", msg, true)
+		primaryLbl := "一键下回本机（重置计时）"
+		if !tg.hasDownloadable {
+			primaryLbl = "打开画布保存（重置计时）"
+		}
 		s.PresentActionPrompt(&core.UserActionPrompt{
-			ID:             uuid.New().String(),
-			Kind:           core.PromptTempOutputGuard,
-			AccountID:      tg.id,
-			Title:          "已暂缓自动关机：临时盘有新成片",
-			Message:        msg,
-			PrimaryLabel:   "打开画布保存（重置计时）",
-			SecondaryLabel: "已保存/放弃成片，立刻关机",
-			CancelLabel:    "稍后处理",
+			ID:                  uuid.New().String(),
+			Kind:                core.PromptTempOutputGuard,
+			AccountID:           tg.id,
+			ExpectedEndpoint:    tg.endpoint,
+			Title:               fmt.Sprintf("已宽限 %d 分钟：临时盘有未保存视频", tg.graceMinutes),
+			Message:             msg,
+			PrimaryLabel:        primaryLbl,
+			SecondaryLabel:      "放弃视频，立刻关机",
+			CancelLabel:         fmt.Sprintf("稍后处理（%d 分钟后关机）", tg.graceMinutes),
+			HasDownloadableTemp: tg.hasDownloadable,
 		})
+	}
+	for _, ge := range toGraceExpiredShutdown {
+		item := ge
+		go func() {
+			rtNow := s.StateFor(item.id)
+			if !rtNow.Phase.IsRunning() || (item.endpoint != "" && rtNow.ActiveEndpoint != "" && rtNow.ActiveEndpoint != item.endpoint) {
+				return
+			}
+			if rtNow.DownloadingOutput {
+				return
+			}
+			if s.stopAccountSessionVerified(item.id, "", "临时盘宽限到期自动关机") {
+				s.SendNotification("宽限期已到，已自动关机止损", fmt.Sprintf("%s 的 %d 分钟临时盘宽限期已结束，已确认停机停止扣点", item.name, graceMins), true)
+			} else {
+				s.SendNotification("自动关机未能确认，请立即核查", fmt.Sprintf("%s 的临时盘宽限期已到，但未能确认云端停机，请打开软件检查", item.name), true)
+			}
+		}()
 	}
 	for _, id := range toShutdown {
 		go s.StopAccountSession(id, "", "空闲自动关机")
@@ -1334,19 +1506,32 @@ func (s *Service) ResolveActionPromptByID(promptID, action string) {
 		}
 	case core.PromptConfirmStop:
 		expectedEP := promptCopy.ExpectedEndpoint
-		curEP := ""
-		if rt, ok := s.Runtime[promptCopy.AccountID]; ok {
-			curEP = rt.ActiveEndpoint
-		}
+		curRT := s.Runtime[promptCopy.AccountID]
+		curEP := curRT.ActiveEndpoint
+		isRunning := curRT.Phase.IsRunning()
 		s.actionPrompt = nil
 		s.mu.Unlock()
 		s.notifyUI()
-		if action == "primary" && promptCopy.AccountID != "" {
-			if promptCopy.SessionName == "" && expectedEP != "" && curEP != "" && curEP != expectedEP {
-				s.ShowToast("云端机器已切换为新实例，已取消本次过期停机确认")
-				return
+		if promptCopy.AccountID != "" {
+			stale := promptCopy.SessionName == "" && (!isRunning || (expectedEP != "" && curEP != "" && curEP != expectedEP))
+			switch action {
+			case "primary":
+				if stale {
+					s.ShowToast("云端机器已切换或已关机，已取消本次过期停机确认")
+					return
+				}
+				go s.StopAccountSession(promptCopy.AccountID, promptCopy.SessionName, "")
+			case "secondary":
+				if stale {
+					s.ShowToast("云端机器已停机或已切换，无法执行过期保存操作")
+					return
+				}
+				if promptCopy.HasDownloadableTemp {
+					go s.DownloadAllTempVideos(promptCopy.AccountID)
+				} else {
+					go s.OpenComfyUI(promptCopy.AccountID)
+				}
 			}
-			go s.StopAccountSession(promptCopy.AccountID, promptCopy.SessionName, "")
 		}
 	case core.PromptConfirmStopAll:
 		s.actionPrompt = nil
@@ -1397,16 +1582,44 @@ func (s *Service) ResolveActionPromptByID(promptID, action string) {
 			}
 		}
 	case core.PromptTempOutputGuard:
+		curRT := s.Runtime[promptCopy.AccountID]
+		stale := !curRT.Phase.IsRunning() || (promptCopy.ExpectedEndpoint != "" && curRT.ActiveEndpoint != "" && curRT.ActiveEndpoint != promptCopy.ExpectedEndpoint)
+		s.actionPrompt = nil
+		s.mu.Unlock()
+		s.notifyUI()
+		if promptCopy.AccountID != "" && (action == "primary" || action == "secondary") {
+			if stale {
+				s.ShowToast("原云端机器已停机或已切换，已忽略过期护片操作")
+				return
+			}
+			switch action {
+			case "primary":
+				s.ResetIdleTimer(promptCopy.AccountID)
+				if promptCopy.HasDownloadableTemp {
+					go s.DownloadAllTempVideos(promptCopy.AccountID)
+				} else {
+					go s.OpenComfyUI(promptCopy.AccountID)
+				}
+			case "secondary":
+				go s.StopAccountSession(promptCopy.AccountID, "", "用户确认跳过临时盘护片关机")
+			}
+		}
+	case core.PromptSwitchModeWhileRunning:
+		curRT := s.Runtime[promptCopy.AccountID]
+		stale := !curRT.Phase.IsRunning() || (promptCopy.ExpectedEndpoint != "" && curRT.ActiveEndpoint != "" && curRT.ActiveEndpoint != promptCopy.ExpectedEndpoint)
 		s.actionPrompt = nil
 		s.mu.Unlock()
 		s.notifyUI()
 		if promptCopy.AccountID != "" {
 			switch action {
 			case "primary":
-				s.ResetIdleTimer(promptCopy.AccountID)
-				go s.OpenComfyUI(promptCopy.AccountID)
+				s.applyNextBootPresetOnly(promptCopy.AccountID, promptCopy.TargetRecipe, promptCopy.TargetH3Variant, true)
 			case "secondary":
-				go s.StopAccountSession(promptCopy.AccountID, "", "用户确认跳过临时盘护片关机")
+				if stale {
+					s.ShowToast("云端机器已停机或已切换，已取消过期原地重装")
+					return
+				}
+				go s.redeploySwitchedMode(promptCopy.AccountID, promptCopy.TargetRecipe, promptCopy.TargetH3Variant, promptCopy.ExpectedEndpoint)
 			}
 		}
 	case core.PromptWebStopGuide:
@@ -1427,6 +1640,66 @@ func (s *Service) RequestConfirmStop(accountID string) {
 	s.RequestConfirmStopSession(accountID, "")
 }
 
+func sessionStopRiskSummary(acc core.AccountProfile, rt core.AccountRuntimeState) (riskLine string, hasRisk bool, hasDownloadable bool) {
+	var parts []string
+	if rt.QueueRunning > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条正在生成", rt.QueueRunning))
+	}
+	if rt.QueuePending > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条排队等待", rt.QueuePending))
+	}
+	tempCnt := rt.TempOutputVideos
+	if tempCnt <= 0 && rt.IsTempOutputActive(acc) && rt.SessionNewVideoCount > 0 {
+		tempCnt = rt.SessionNewVideoCount
+	}
+	if tempCnt > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条视频仅存在云电脑上（关机后永久清空）", tempCnt))
+	} else if rt.TempOutputScanKnown && rt.TempOutputVideos < 0 {
+		parts = append(parts, "云电脑临时盘存在未确认成片（关机后永久清空）")
+	}
+	if len(parts) == 0 {
+		return "", false, false
+	}
+	return "⚠ " + strings.Join(parts, "，") + "。", true, len(rt.SessionOutputs) > 0
+}
+
+func (s *Service) aggregateManagedStopRisks() string {
+	accounts := s.AccountsSnapshot()
+	totalRun, totalPend, totalTemp := 0, 0, 0
+	unknownTemp := false
+	for _, acc := range accounts {
+		rt := s.StateFor(acc.ID)
+		if !rt.Phase.IsRunning() {
+			continue
+		}
+		totalRun += rt.QueueRunning
+		totalPend += rt.QueuePending
+		if rt.TempOutputVideos > 0 {
+			totalTemp += rt.TempOutputVideos
+		} else if rt.IsTempOutputActive(acc) && rt.SessionNewVideoCount > 0 {
+			totalTemp += rt.SessionNewVideoCount
+		} else if rt.TempOutputScanKnown && rt.TempOutputVideos < 0 {
+			unknownTemp = true
+		}
+	}
+	var parts []string
+	if totalRun > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条正在生成", totalRun))
+	}
+	if totalPend > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条排队中", totalPend))
+	}
+	if totalTemp > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条视频仅存在云电脑临时盘（关机将清空）", totalTemp))
+	} else if unknownTemp {
+		parts = append(parts, "云电脑临时盘存在未确认视频（关机将清空）")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\n\n⚠ 当前活跃风险：" + strings.Join(parts, "，") + "。"
+}
+
 func (s *Service) RequestConfirmStopSession(accountID, specificSession string) {
 	acc, ok := s.accountByID(accountID)
 	if !ok {
@@ -1438,16 +1711,31 @@ func (s *Service) RequestConfirmStopSession(accountID, specificSession string) {
 		if !rt.Phase.IsRunning() {
 			return
 		}
+		msg := fmt.Sprintf("账号「%s」本次已运行 %s（当前约 %.2f CU/h）。确认关机后会立即释放云端显卡并停止计费。", acc.DisplayName, core.FormatStopwatch(rt.SessionUptimeSec), rt.CURatePerHour)
+		primaryLbl := "确认关机止损"
+		secondaryLbl := ""
+		riskLine, hasRisk, hasDownloadable := sessionStopRiskSummary(acc, rt)
+		if hasRisk {
+			msg = riskLine + "\n\n" + msg
+			primaryLbl = "放弃并立刻关机"
+			if hasDownloadable {
+				secondaryLbl = "先下回本机"
+			} else if !rt.EffectiveSessionEnableLLM(acc) {
+				secondaryLbl = "先打开画布保存"
+			}
+		}
 		s.PresentActionPrompt(&core.UserActionPrompt{
-			ID:               uuid.New().String(),
-			Kind:             core.PromptConfirmStop,
-			AccountID:        accountID,
-			SessionName:      "",
-			ExpectedEndpoint: rt.ActiveEndpoint,
-			Title:            fmt.Sprintf("确认关闭当前 %s 云端机器？", rt.ShortGPUName()),
-			Message:          fmt.Sprintf("账号「%s」本次已运行 %s（当前约 %.2f CU/h）。确认关机后会立即释放云端显卡并停止计费。", acc.DisplayName, core.FormatStopwatch(rt.SessionUptimeSec), rt.CURatePerHour),
-			PrimaryLabel:     "确认关机止损",
-			CancelLabel:      "继续运行",
+			ID:                  uuid.New().String(),
+			Kind:                core.PromptConfirmStop,
+			AccountID:           accountID,
+			SessionName:         "",
+			ExpectedEndpoint:    rt.ActiveEndpoint,
+			Title:               fmt.Sprintf("确认关闭当前 %s 云端机器？", rt.ShortGPUName()),
+			Message:             msg,
+			PrimaryLabel:        primaryLbl,
+			SecondaryLabel:      secondaryLbl,
+			CancelLabel:         "继续运行",
+			HasDownloadableTemp: hasDownloadable,
 		})
 		return
 	}
@@ -1513,11 +1801,12 @@ func (s *Service) RequestConfirmStopAll() {
 		return
 	}
 	_, totalRate := s.TotalBalanceAndRate()
+	riskSuffix := s.aggregateManagedStopRisks()
 	s.PresentActionPrompt(&core.UserActionPrompt{
 		ID:           uuid.New().String(),
 		Kind:         core.PromptConfirmStopAll,
 		Title:        fmt.Sprintf("确认关闭全部 %d 台运行中的云端机器？", n),
-		Message:      fmt.Sprintf("当前所有账号合计消耗约 %.2f CU/h。确认后会先保存工作流，再逐一关闭云端机器。", totalRate),
+		Message:      fmt.Sprintf("当前所有账号合计消耗约 %.2f CU/h。确认后会先保存工作流，再逐一关闭云端机器。", totalRate) + riskSuffix,
 		PrimaryLabel: "全部关机止损",
 		CancelLabel:  "先不关",
 	})
@@ -1578,13 +1867,14 @@ func (s *Service) RequestConfirmQuit(onConfirmedQuit func()) {
 		return
 	}
 	_, totalRate := s.TotalBalanceAndRate()
+	riskSuffix := s.aggregateManagedStopRisks()
 	s.mu.Lock()
 	s.pendingQuitCallback = onConfirmedQuit
 	s.actionPrompt = &core.UserActionPrompt{
 		ID:             uuid.New().String(),
 		Kind:           core.PromptConfirmQuit,
 		Title:          fmt.Sprintf("还有 %d 台云端显卡正在计费，确定退出？", n),
-		Message:        fmt.Sprintf("当前消耗约 %.2f CU/h。退出桌面端后，本地空闲自动关机监控将停止（云端将依赖 Colab 官方闲置超时回收）。", totalRate),
+		Message:        fmt.Sprintf("当前消耗约 %.2f CU/h。退出桌面端后，本地空闲自动关机监控将停止（云端将依赖 Colab 官方闲置超时回收）。", totalRate) + riskSuffix,
 		PrimaryLabel:   "先全部关机再退出",
 		SecondaryLabel: "保持云端运行，仅退出",
 		CancelLabel:    "留在后台继续监控",

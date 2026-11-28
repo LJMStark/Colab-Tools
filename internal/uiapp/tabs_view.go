@@ -61,7 +61,8 @@ func (m *MainUI) renderSmartStrategyDetails(c *ui.Context, pal Palette, acc core
 }
 
 func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc core.AccountProfile) {
-	targets := core.SanitizedQueueTargets(acc.QueueTargets, acc.Tier)
+	queueables := acc.EffectiveQueueableAccelerators()
+	targets := core.SanitizedQueueTargetsWithAllowed(acc.QueueTargets, queueables)
 	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 		ui.Text(c, "点击卡片勾选目标显卡，用 ↑ ↓ 调整尝试顺位").FontSize(12).TextColor(pal.TextMuted)
 		ui.Spacer(c)
@@ -69,7 +70,6 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 		Badge(c, pal, "顺位 "+core.QueueTargetsSummary(targets), &aTint)
 	})
 
-	queueables := acc.Tier.QueueableAccelerators()
 	ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1)).Gap(10).Children(func() {
 		for _, hw := range queueables {
 			hwOpt := hw
@@ -83,7 +83,7 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 			}
 			ui.Row(c).FillWidth().Padding(10, 12).Radius(11).Background(bg).Border(1, border).AlignItems(ui.Center).Gap(10).OnClick(func() {
 				cp := acc
-				cur := core.SanitizedQueueTargets(cp.QueueTargets, cp.Tier)
+				cur := core.SanitizedQueueTargetsWithAllowed(cp.QueueTargets, cp.EffectiveQueueableAccelerators())
 				if idx := slices.Index(cur, hwOpt); idx >= 0 {
 					if len(cur) > 1 {
 						cur = append(cur[:idx], cur[idx+1:]...)
@@ -140,7 +140,7 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 		}
 	})
 
-	if acc.Tier.SupportsHighMem() {
+	if acc.SupportsHighMem() {
 		hm := acc.HighMem
 		if ui.Checkbox(c, &hm, "申请时同时请求高内存形态 (High-RAM)").Clicked() || hm != acc.HighMem {
 			cp := acc
@@ -182,7 +182,7 @@ func (m *MainUI) renderCustomGPUStrategyDetails(c *ui.Context, pal Palette, acc 
 				})
 			}
 			ui.Text(c, "后加入保底：").FontSize(12.5).TextColor(pal.TextMuted)
-			for _, cand := range core.EligibleFallbackTargets(acc.QueueTargets, acc.Tier) {
+			for _, cand := range core.EligibleFallbackTargetsWithAllowed(acc.QueueTargets, queueables) {
 				cOpt := cand
 				var tint *ui.Color
 				if acc.QueueFallbackTarget == cOpt {
@@ -467,7 +467,7 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 					ui.Column(c).Grow(1).Gap(2).Children(func() {
 						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 							ui.Text(c, accCopy.DisplayName).FontSize(14).FontWeight(600).TextColor(pal.TextPrimary)
-							StatusPill(c, pal, nil, accCopy.Tier.DisplayName())
+							StatusPill(c, pal, nil, accCopy.DisplayTierBadge())
 							if isSel {
 								e := pal.Emerald
 								StatusPill(c, pal, &e, "当前使用")
@@ -475,16 +475,22 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 						})
 						email := accCopy.Email
 						if email == "" {
-							email = "默认官方 CLI 账号"
+							email = "本机已登录的 Google 账号"
 						}
-						ui.Textf(c, "%s · 余额 %s CU · %s", email, core.FormatCU(rt.CUBalance), core.EffectiveGPUPlanSummary(accCopy)).FontSize(12).TextColor(pal.TextMuted)
+						balPart := "点数读取中…"
+						if rt.LastUsageFetchAt != nil {
+							balPart = fmt.Sprintf("余额 %s CU", core.FormatCU(rt.CUBalance))
+						} else if rt.LastError != "" {
+							balPart = "点数待刷新"
+						}
+						ui.Textf(c, "%s · %s · 可用显卡：%s", email, balPart, accCopy.EligibleCardsSummary()).FontSize(12).TextColor(pal.TextMuted)
 					})
 					if !isSel {
 						SmallActionButton(c, pal, "切换使用", nil, false, func() {
 							m.Svc.SelectAccount(accCopy.ID)
 						})
 					}
-					tierBtn := "改订阅"
+					tierBtn := "会员备注"
 					if editingTier {
 						tierBtn = "收起"
 					}
@@ -500,27 +506,32 @@ func (m *MainUI) renderAccountsPage(c *ui.Context, pal Palette) {
 					})
 				})
 
-				// Direct tier picker (replaces blind cycling)
+				// Optional subscription note picker (hardware pool follows Google server-reported eligible cards)
 				if editingTier {
-					ui.Row(c).FillWidth().Padding(8, 10).Radius(9).Background(pal.SubtleBg).Gap(6).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "选择订阅档位：").FontSize(12).TextColor(pal.TextMuted)
-						for _, tOpt := range core.AllSubscriptionTiers {
-							tierVal := tOpt
-							var tint *ui.Color
-							if accCopy.Tier == tierVal {
-								a := pal.Amber
-								tint = &a
+					ui.Column(c).FillWidth().Padding(8, 10).Radius(9).Background(pal.SubtleBg).Gap(6).Children(func() {
+						ui.Text(c, "会员备注（仅用于展示区分，实际可抢显卡以 Google 返回清单为准）：").FontSize(11.5).TextColor(pal.TextMuted)
+						ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
+							for _, tOpt := range core.AllSubscriptionTiers {
+								tierVal := tOpt
+								var tint *ui.Color
+								if accCopy.TierUserConfirmed && accCopy.Tier == tierVal {
+									a := pal.Amber
+									tint = &a
+								}
+								SmallActionButton(c, pal, tierVal.ShortBadge(), tint, false, func() {
+									cp := accCopy
+									cp.Tier = tierVal
+									cp.TierUserConfirmed = true
+									if len(cp.EligibleAccelerators) == 0 {
+										cp.PreferredAccelerator = tierVal.DefaultAccelerator()
+									}
+									cp.Sanitize()
+									m.Svc.UpdateAccount(cp)
+									m.EditingTierAccountID = ""
+									m.Svc.ShowToast("已更新会员备注为：" + tierVal.DisplayName())
+								})
 							}
-							SmallActionButton(c, pal, tierVal.ShortBadge(), tint, false, func() {
-								cp := accCopy
-								cp.Tier = tierVal
-								cp.PreferredAccelerator = tierVal.DefaultAccelerator()
-								cp.Sanitize()
-								m.Svc.UpdateAccount(cp)
-								m.EditingTierAccountID = ""
-								m.Svc.ShowToast("已切换订阅档位为：" + tierVal.DisplayName())
-							})
-						}
+						})
 					})
 				}
 			})
@@ -541,30 +552,15 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 			Background(pal.RecessedBg).
 			Border(1, pal.RecessedBorder).
 			Gap(5).Children(func() {
-			ui.Text(c, "Google 官方账号授权（3 步完成）").FontSize(12.5).FontWeight(600).TextColor(pal.TextPrimary)
+			ui.Text(c, "Google 官方账号授权（3 步完成，绑定后自动识别点数与可用显卡）").FontSize(12.5).FontWeight(600).TextColor(pal.TextPrimary)
 			ui.Text(c, "第 1 步：点击下方「打开浏览器完成 Google 官方授权」，将自动拉起浏览器登录页。").FontSize(12).TextColor(pal.TextMuted)
 			ui.Text(c, "第 2 步：选择要绑定的 Google Colab 账号并点击「允许」，复制网页最终给出的授权码。").FontSize(12).TextColor(pal.TextMuted)
-			ui.Text(c, "第 3 步：把授权码粘贴到下方输入框，点击「完成绑定」即可。").FontSize(12).TextColor(pal.TextMuted)
+			ui.Text(c, "第 3 步：把授权码粘贴到下方输入框，点击「完成绑定」即可，无需手选订阅档位。").FontSize(12).TextColor(pal.TextMuted)
 		})
 
 		ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "账号备注名").FontSize(13).TextColor(pal.TextMuted).Width(90)
-			ui.TextInput(c, &m.NewAccName).Placeholder("例如：主号 / AI Ultra（可留空自动用邮箱前缀）").Grow(1)
-		})
-
-		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "订阅档位").FontSize(13).TextColor(pal.TextMuted).Width(90)
-			for idx, tier := range core.AllSubscriptionTiers {
-				tIdx := idx
-				var tint *ui.Color
-				if m.NewAccTierIdx == tIdx {
-					t := pal.Amber
-					tint = &t
-				}
-				SmallActionButton(c, pal, tier.ShortBadge(), tint, false, func() {
-					m.NewAccTierIdx = tIdx
-				})
-			}
+			ui.TextInput(c, &m.NewAccName).Placeholder("例如：主号 / AI Pro（可留空自动用邮箱前缀）").Grow(1)
 		})
 
 		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
@@ -604,11 +600,10 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 				m.NewAccWorking = true
 				m.NewAccError = ""
 				m.formMu.Unlock()
-				tier := core.AllSubscriptionTiers[m.NewAccTierIdx%len(core.AllSubscriptionTiers)]
 				name := m.NewAccName
 				code := m.NewAccAuthCode
 				go func() {
-					err := m.Svc.CompleteOAuthFlow(name, tier, code)
+					err := m.Svc.CompleteOAuthFlow(name, "", code)
 					m.formMu.Lock()
 					m.NewAccWorking = false
 					if err != nil {

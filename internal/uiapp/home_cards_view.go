@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/LJMStark/Colab-Tools/internal/app"
 	"github.com/LJMStark/Colab-Tools/internal/core"
@@ -13,24 +14,13 @@ import (
 const homeBentoCardHeight float32 = 196
 
 func (m *MainUI) selectH3Preset(acc core.AccountProfile, variant core.H3Variant) {
-	cp := acc
-	cp.DeployRecipe = core.RecipeH3Video
-	cp.H3Variant = variant
-	cp.WorkloadKind = core.WorkloadVideo
-	cp.EnableLLMModule = false
-	cp.RemoteServicePort = 8188
-	cp.LocalSSHTunnelPort = 8188
-	if cp.IdleTimeoutMinutes == 40 {
-		cp.IdleTimeoutMinutes = 10
-	}
 	m.DraftAccountID = ""
-	m.Svc.UpdateAccount(cp)
-	m.Svc.ClearAccountError(acc.ID)
+	m.Svc.RequestSelectTaskPreset(acc.ID, core.RecipeH3Video, variant)
 }
 
 // Card 1: CU 余额与速率（纯财务视角，无开关机按钮）
 func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
-	webBilling := !rt.Phase.IsRunning() && len(rt.Sessions) > 0 && rt.CURatePerHour > 0
+	webBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
 	led := pal.Emerald
 	if webBilling {
 		led = pal.Amber
@@ -38,10 +28,10 @@ func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProf
 		led = pal.TextFaint
 	}
 
+	pendingBalance := !rt.Phase.IsRunning() && rt.LastUsageFetchAt == nil && rt.CURatePerHour == 0
+	balanceFetchFailed := pendingBalance && rt.LastError != ""
+
 	rateText := "0.00 CU/h · 未扣点"
-	if !rt.Phase.IsRunning() && rt.LastUsageFetchAt == nil && rt.CURatePerHour == 0 {
-		rateText = "扣点状态待核验"
-	}
 	rateCol := pal.TextMuted
 	rateWeight := 500
 	footLeft := "账单自动记录"
@@ -55,7 +45,7 @@ func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProf
 				rateCol = pal.Amber
 			}
 			rateWeight = 600
-		} else if acc.Tier == core.TierFree {
+		} else if acc.IsFreeOnly() {
 			rateText = "免费池 · 0.00 CU/h"
 		} else {
 			rateText = "速率同步中…"
@@ -66,15 +56,26 @@ func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProf
 		rateWeight = 600
 		footLeft = "请到 Colab 网页检查是否忘关"
 		footCol = pal.Amber
+	} else if balanceFetchFailed {
+		rateText = "点数读取失败 · 点右上角刷新"
+		rateCol = pal.Amber
+	} else if pendingBalance {
+		rateText = "正在读取点数与运行状态"
 	}
 
 	card := PrecisionCard(c, pal, 16, 16, func() {
-		TileHeader(c, pal, led, "CU 余额与速率", acc.Tier.ShortBadge(), nil)
+		TileHeader(c, pal, led, "CU 余额与速率", acc.DisplayTierBadge(), nil)
 
 		ui.Column(c).FillWidth().Gap(4).Children(func() {
 			ui.Row(c).AlignItems(ui.End).Gap(5).Children(func() {
-				ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
-				ui.Text(c, "CU").FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+				if balanceFetchFailed {
+					ui.Text(c, "—").FontSize(28).Bold().TextColor(pal.TextMuted).MaxLines(1)
+				} else if pendingBalance {
+					ui.Text(c, "读取中…").FontSize(24).Bold().TextColor(pal.TextMuted).MaxLines(1)
+				} else {
+					ui.Text(c, core.FormatCU(rt.CUBalance)).FontSize(28).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
+					ui.Text(c, "CU").FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 4, 0)
+				}
 			})
 			ui.Text(c, rateText).FontSize(13).FontWeight(rateWeight).FontFeatures("tnum").TextColor(rateCol).MaxLines(1).Ellipsis("…")
 		})
@@ -156,7 +157,7 @@ func (m *MainUI) bentoLiveLoad(c *ui.Context, pal Palette, acc core.AccountProfi
 }
 
 // Card 3: 当前任务（主任务 2×2 + 进阶玩法紧凑行，全任务单入口直达）
-func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountProfile) {
+func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	taskBadge := "H3 Flash"
 	taskFoot := "6 步快出片 · 自动装 ComfyUI"
 	badgeTint := pal.Amber
@@ -191,6 +192,15 @@ func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountPr
 		badgeTint = pal.TextMuted
 	}
 
+	pendingSwitch := rt.HasPendingModeSwitch(acc)
+	footCol := pal.TextMuted
+	if pendingSwitch {
+		taskBadge = "下次开机"
+		badgeTint = pal.Amber
+		taskFoot = fmt.Sprintf("当前运行：%s · 下次开机生效", rt.EffectiveSessionTaskLabel(acc))
+		footCol = pal.Amber
+	}
+
 	flashSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlash
 	origSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantOriginal
 	ggufSel := acc.DeployRecipe == core.RecipeH3Video && acc.H3Variant == core.H3VariantFlashGGUF
@@ -213,7 +223,7 @@ func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountPr
 			})
 			ChipToggle(c, pal, "大模型代理", llmSel, true, func() {
 				m.DraftAccountID = ""
-				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeLLMProxy)
+				m.Svc.RequestSelectTaskPreset(acc.ID, core.RecipeLLMProxy, "")
 			})
 		})
 		ui.Grid(c).FillWidth().ColumnTracks(ui.Fr(1), ui.Fr(1), ui.Fr(1)).Gap(5).Children(func() {
@@ -222,16 +232,16 @@ func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountPr
 			})
 			ChipToggle(c, pal, "通用 ComfyUI", generalSel, true, func() {
 				m.DraftAccountID = ""
-				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeComfyUIGeneral)
+				m.Svc.RequestSelectTaskPreset(acc.ID, core.RecipeComfyUIGeneral, "")
 			})
 			ChipToggle(c, pal, "纯开机", noneSel, true, func() {
 				m.DraftAccountID = ""
-				m.Svc.ApplyDeployRecipe(acc.ID, core.RecipeNone)
+				m.Svc.RequestSelectTaskPreset(acc.ID, core.RecipeNone, "")
 			})
 		})
 		ui.Spacer(c)
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
-			ui.Text(c, taskFoot).FontSize(11.5).TextColor(pal.TextMuted).Grow(1).MaxLines(1).Ellipsis("…")
+			ui.Text(c, taskFoot).FontSize(11.5).TextColor(footCol).Grow(1).MaxLines(1).Ellipsis("…")
 			if showDetailBtn {
 				SmallActionButton(c, pal, "配置 ›", nil, false, func() {
 					m.ShowHomeOptions = true
@@ -241,15 +251,15 @@ func (m *MainUI) bentoCurrentTask(c *ui.Context, pal Palette, acc core.AccountPr
 	})
 }
 
-// Card 4: 运行与产出（合并部署/队列与高频快捷动作，零 SSH 隧道按钮、零更多玩法）
+// Card 4: 运行与产出（始终锚定当前运行会话，绝不随下次开机偏好串台）
 func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
-	kind := acc.WorkloadKind
+	sessionRecipe, _, kind, sessionEnableLLM := rt.EffectiveSessionState(acc)
 	if kind == core.WorkloadGeneral && rt.DetectedWorkloadKind != nil {
 		kind = *rt.DetectedWorkloadKind
 	}
 	tint := WorkloadColor(pal, kind)
-	isLLM := acc.DeployRecipe == core.RecipeLLMProxy || kind == core.WorkloadLLM
-	isVideo := !acc.EnableLLMModule && (acc.DeployRecipe.IsVideoComfy() || kind == core.WorkloadVideo)
+	isLLM := sessionEnableLLM || sessionRecipe == core.RecipeLLMProxy || kind == core.WorkloadLLM
+	isVideo := !sessionEnableLLM && (sessionRecipe.IsVideoComfy() || kind == core.WorkloadVideo || (rt.Phase.IsRunning() && rt.SessionIsVideoComfy))
 
 	BentoCard(c, pal, homeBentoCardHeight, func() {
 		if isLLM {
@@ -304,13 +314,23 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 
 		if isVideo {
 			title := "视频画布与产出"
-			badge := "纯云端"
+			badge := "仅存云电脑"
 			var bTint *ui.Color
+			outputOnTemp := rt.IsTempOutputActive(acc)
 			driveFallbackTemp := rt.Phase.IsRunning() && acc.UseGoogleDrive && rt.DriveMountedKnown && !rt.DriveActuallyMounted
+			newCount := rt.SessionNewVideoCount
+			if newCount == 0 && len(rt.SessionOutputs) > 0 {
+				newCount = len(rt.SessionOutputs)
+			}
+			hasOutputs := len(rt.SessionOutputs) > 0
+
 			if acc.UseGoogleDrive {
 				badge = "Drive 存片"
 				e := pal.Emerald
 				bTint = &e
+			} else {
+				a := pal.Amber
+				bTint = &a
 			}
 			if rt.Phase.IsRunning() {
 				bTint = nil
@@ -324,26 +344,26 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 					badge = "失败"
 					rCol := pal.Coral
 					bTint = &rCol
-				} else if driveFallbackTemp {
+				} else if outputOnTemp {
 					rCol := pal.Coral
 					bTint = &rCol
-					if rt.RenderedVideoCount > 0 {
-						badge = fmt.Sprintf("临时盘·%d条", rt.RenderedVideoCount)
-					} else {
-						badge = "临时盘(关机清)"
+					tempDisp := newCount
+					if tempDisp <= 0 && rt.TempOutputVideos > 0 {
+						tempDisp = rt.TempOutputVideos
 					}
-				} else if rt.RenderedVideoCount > 0 {
-					badge = fmt.Sprintf("已出 %d 条", rt.RenderedVideoCount)
+					if tempDisp > 0 {
+						badge = fmt.Sprintf("临时盘·%d条(关机清)", tempDisp)
+					} else {
+						badge = "仅存云电脑(关机清)"
+					}
+				} else if newCount > 0 {
+					badge = fmt.Sprintf("本次已出 %d 条", newCount)
 					e := pal.Emerald
 					bTint = &e
 				} else if rt.ServerHealthy {
 					e := pal.Emerald
 					bTint = &e
-					if acc.UseGoogleDrive && (!rt.DriveMountedKnown || rt.DriveActuallyMounted) {
-						badge = "Drive 存片"
-					} else {
-						badge = "已就绪"
-					}
+					badge = "Drive 存片"
 				} else {
 					badge = "未部署"
 					a := pal.Amber
@@ -369,6 +389,15 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 					} else if rt.QueueRunning > 0 || rt.QueuePending > 0 {
 						ui.Textf(c, "渲染 %d", rt.QueueRunning).FontSize(24).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
 						ui.Textf(c, "排队 %d", rt.QueuePending).FontSize(13).FontWeight(500).TextColor(pal.Amber).Padding(0, 0, 3, 0).MaxLines(1)
+					} else if hasOutputs {
+						ui.Textf(c, "新出 %d 条", max(1, newCount)).FontSize(22).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary).MaxLines(1)
+						locNote := "已存网盘"
+						locCol := pal.Emerald
+						if !rt.SessionOutputs[0].SavedToDrive || outputOnTemp {
+							locNote = "仅存临时盘"
+							locCol = pal.Coral
+						}
+						ui.Text(c, locNote).FontSize(12).FontWeight(600).TextColor(locCol).Padding(0, 0, 3, 0).MaxLines(1)
 					} else if rt.ServerHealthy {
 						ui.Text(c, "已就绪").FontSize(23).Bold().TextColor(pal.Emerald).MaxLines(1)
 						ui.Text(c, ":8188").FontSize(13).FontFeatures("tnum").TextColor(pal.TextMuted).Padding(0, 0, 3, 0).MaxLines(1)
@@ -377,7 +406,7 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 						ui.Text(c, "裸机").FontSize(12.5).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 3, 0).MaxLines(1)
 					}
 				} else {
-					subNote := "纯云端暂存"
+					subNote := "仅存云电脑（关机清）"
 					if acc.UseGoogleDrive {
 						subNote = "成片直存 Drive"
 					}
@@ -386,30 +415,34 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 				}
 			})
 
-			prog := 0.0
-			barCol := WithAlpha(pal.Violet, 0.85)
-			if rt.Phase.IsRunning() {
-				barCol = pal.Violet
-				if rt.DeployRunning {
-					barCol = pal.Amber
-					if rt.WorkloadMetricRatio != nil {
+			if rt.Phase.IsRunning() && rt.ServerHealthy && !rt.DeployRunning && hasOutputs {
+				ui.Text(c, "最新："+rt.SessionOutputs[0].Filename).FontSize(11.5).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+			} else {
+				prog := 0.0
+				barCol := WithAlpha(pal.Violet, 0.85)
+				if rt.Phase.IsRunning() {
+					barCol = pal.Violet
+					if rt.DeployRunning {
+						barCol = pal.Amber
+						if rt.WorkloadMetricRatio != nil {
+							prog = *rt.WorkloadMetricRatio
+						} else {
+							prog = 0.08
+						}
+					} else if rt.DeployFailed {
+						barCol = pal.Coral
+						prog = 0.0
+					} else if rt.WorkloadMetricRatio != nil && rt.ServerHealthy {
 						prog = *rt.WorkloadMetricRatio
-					} else {
-						prog = 0.08
+					} else if rt.QueueRunning > 0 {
+						prog = 0.72
+					} else if rt.ServerHealthy {
+						barCol = pal.Emerald
+						prog = 1.0
 					}
-				} else if rt.DeployFailed {
-					barCol = pal.Coral
-					prog = 0.0
-				} else if rt.WorkloadMetricRatio != nil && rt.ServerHealthy {
-					prog = *rt.WorkloadMetricRatio
-				} else if rt.QueueRunning > 0 {
-					prog = 0.72
-				} else if rt.ServerHealthy {
-					barCol = pal.Emerald
-					prog = 1.0
 				}
+				DrawHorizonBar(c, pal, prog, barCol, 7)
 			}
-			DrawHorizonBar(c, pal, prog, barCol, 7)
 
 			ui.Spacer(c)
 
@@ -423,25 +456,50 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 					} else {
 						comfyTint = &amber
 					}
-					ActionBtn(c, pal, comfyLabel, comfyTint, "", true, rt.ComfyOpening, func() {
-						go m.Svc.OpenComfyUI(acc.ID)
-					})
-					if driveFallbackTemp {
-						ActionBtn(c, pal, "重挂 Drive", &amber, "", true, false, func() {
-							go m.Svc.RemountDriveNow(acc.ID)
+					if hasOutputs {
+						ActionBtn(c, pal, "画布", comfyTint, "", false, rt.ComfyOpening, func() {
+							go m.Svc.OpenComfyUI(acc.ID)
 						})
+						ActionBtn(c, pal, "预览", nil, "", true, false, func() {
+							go m.Svc.PreviewLatestSessionVideo(acc.ID)
+						})
+						dlLbl := "下载"
+						if rt.DownloadingOutput {
+							dlLbl = "下载中…"
+						}
+						ActionBtn(c, pal, dlLbl, &amber, "", true, rt.DownloadingOutput, func() {
+							go m.Svc.DownloadLatestSessionVideo(acc.ID)
+						})
+						if driveFallbackTemp {
+							ActionBtn(c, pal, "重挂", nil, "", false, false, func() {
+								go m.Svc.RemountDriveNow(acc.ID)
+							})
+						} else if rt.SessionOutputs[0].SavedToDrive {
+							ActionBtn(c, pal, "网盘", nil, "", false, false, func() {
+								m.Svc.OpenDriveOutputs(acc.ID)
+							})
+						}
 					} else {
-						ActionBtn(c, pal, "Drive 成片", nil, "", true, false, func() {
-							m.Svc.OpenDriveOutputs(acc.ID)
+						ActionBtn(c, pal, comfyLabel, comfyTint, "", true, rt.ComfyOpening, func() {
+							go m.Svc.OpenComfyUI(acc.ID)
+						})
+						if driveFallbackTemp {
+							ActionBtn(c, pal, "重挂 Drive", &amber, "", true, false, func() {
+								go m.Svc.RemountDriveNow(acc.ID)
+							})
+						} else {
+							ActionBtn(c, pal, "Drive 成片", nil, "", true, false, func() {
+								m.Svc.OpenDriveOutputs(acc.ID)
+							})
+						}
+						var logTint *ui.Color
+						if m.ShowDeployLog {
+							logTint = &amber
+						}
+						ActionBtn(c, pal, "后台", logTint, "", false, false, func() {
+							m.openDeployLogOverlay(acc.ID)
 						})
 					}
-					var logTint *ui.Color
-					if m.ShowDeployLog {
-						logTint = &amber
-					}
-					ActionBtn(c, pal, "后台", logTint, "", false, false, func() {
-						m.openDeployLogOverlay(acc.ID)
-					})
 				} else if rt.Phase.IsRunning() && rt.DeployRunning {
 					ActionBtn(c, pal, "查看日志", &amber, "", true, false, func() {
 						m.openDeployLogOverlay(acc.ID)
@@ -528,14 +586,19 @@ func (m *MainUI) bentoWorkloadOutput(c *ui.Context, pal Palette, acc core.Accoun
 // Card 5: 空闲自动关机（全站唯一空闲关机控制点，统一 10m / 15m / 40m）
 func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
 	wd := m.Svc.WatchdogStatusFor(acc)
-	effectiveMins := core.EffectiveIdleTimeoutMinutes(acc)
+	effectiveMins := rt.EffectiveSessionIdleTimeout(acc)
 	remMin := max(0, (rt.RemainingIdleSeconds(effectiveMins)+59)/60)
+	remGraceSec := rt.RemainingTempGuardGraceSeconds(time.Now())
+	remGraceMin := max(1, (remGraceSec+59)/60)
+	inTempGrace := rt.Phase.IsRunning() && rt.WatchdogDeferredForTempOutputs && remGraceSec > 0
 	enabled := acc.AutoShutdownEnabled
 
 	BentoCard(c, pal, homeBentoCardHeight, func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(7).Children(func() {
 			dot := pal.TextFaint
-			if enabled {
+			if inTempGrace {
+				dot = pal.Amber
+			} else if enabled {
 				dot = pal.Cyan
 			}
 			DrawPrecisionLED(c, dot, 12)
@@ -556,6 +619,11 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 					ui.Textf(c, "%d", acc.IdleTimeoutMinutes).FontSize(26).Bold().FontFeatures("tnum").TextColor(pal.TextPrimary)
 					ui.Text(c, "min").FontSize(13).FontWeight(500).TextColor(pal.TextMuted).Padding(0, 0, 3, 0)
 				})
+			} else if inTempGrace {
+				ui.Row(c).AlignItems(ui.End).Gap(4).Children(func() {
+					ui.Textf(c, "宽限 %d", remGraceMin).FontSize(22).Bold().FontFeatures("tnum").TextColor(pal.Amber)
+					ui.Text(c, "min").FontSize(12.5).FontWeight(500).TextColor(pal.Amber).Padding(0, 0, 3, 0)
+				})
 			} else if wd.Kind == core.WatchdogPausedNoSignal {
 				ui.Text(c, "暂停").FontSize(24).Bold().TextColor(pal.Amber)
 			} else if rt.ActivitySignal.IsBusy() {
@@ -575,7 +643,7 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 		})
 
 		presets := []int{10, 15, 40}
-		activeMins := acc.IdleTimeoutMinutes
+		activeMins := effectiveMins
 		ui.Row(c).FillWidth().Gap(6).Children(func() {
 			for _, mins := range presets {
 				sel := activeMins == mins && acc.AutoShutdownEnabled
@@ -593,14 +661,18 @@ func (m *MainUI) bentoIdleWatchdog(c *ui.Context, pal Palette, acc core.AccountP
 
 		ui.Spacer(c)
 		foot := "已关软件停卡 · Google 仍回收久闲机"
+		footCol := pal.TextMuted
 		if acc.AutoShutdownEnabled {
-			if rt.Phase.IsRunning() {
+			if inTempGrace {
+				foot = fmt.Sprintf("护片宽限中 · 仍在计费 %.2f CU/h", rt.CURatePerHour)
+				footCol = pal.Amber
+			} else if rt.Phase.IsRunning() {
 				foot = fmt.Sprintf("当前空闲已计时 %s", core.FormatDuration(rt.IdleSeconds))
 			} else {
 				foot = "闲下来自动关机，不怕忘关烧点"
 			}
 		}
-		ui.Text(c, foot).FontSize(12).TextColor(pal.TextMuted).MaxLines(1).Ellipsis("…")
+		ui.Text(c, foot).FontSize(12).TextColor(footCol).MaxLines(1).Ellipsis("…")
 	})
 }
 
@@ -820,7 +892,7 @@ func formatSessionRateEstimate(acc core.AccountProfile, rt core.AccountRuntimeSt
 	if singleConfirmed {
 		return fmt.Sprintf("%.2f CU/h", rt.CURatePerHour)
 	}
-	if acc.Tier == core.TierFree && rt.CURatePerHour == 0 {
+	if acc.IsFreeOnly() && rt.CURatePerHour == 0 {
 		return "免费池"
 	}
 	if core.NormalizeHardwareKey(sess.Hardware) != "" {
@@ -1260,9 +1332,8 @@ func (m *MainUI) renderSingleAccountMachinesTable(c *ui.Context, pal Palette, ro
 					badgeTint := pal.Emerald
 					label := rowCopy.account.DeployRecipe.DisplayName()
 					if rowCopy.isPrimary {
-						if rowCopy.account.DeployRecipe == core.RecipeH3Video {
-							label = rowCopy.account.H3Variant.DisplayName()
-						}
+						rowRT := m.Svc.StateFor(rowCopy.account.ID)
+						label = rowRT.EffectiveSessionTaskLabel(rowCopy.account)
 					} else if !rowCopy.isWebManual {
 						label = rowCopy.session.Name
 					} else {
