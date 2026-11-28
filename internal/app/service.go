@@ -31,7 +31,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.20"
+const AppVersion = "0.3.21"
 
 var errSSHTunnelStarting = errors.New("本机加密通道正在建立中，请稍候")
 
@@ -156,6 +156,8 @@ type Service struct {
 	sshStderrs             map[string]*tunnelStderrBuffer
 	deployFlowCancels      map[string]deployWatchHandle
 	deployWatchCancels     map[string]deployWatchHandle
+	driveMountCancels      map[string]deployWatchHandle
+	skipNextDriveMount     map[string]bool
 	pendingOAuth           *colab.OAuthSessionTicket
 	actionPrompt           *core.UserActionPrompt
 	pendingQuitCallback    func()
@@ -213,6 +215,8 @@ func NewService(skipBootstrap bool) *Service {
 		sshStderrs:         map[string]*tunnelStderrBuffer{},
 		deployFlowCancels:  map[string]deployWatchHandle{},
 		deployWatchCancels: map[string]deployWatchHandle{},
+		driveMountCancels:  map[string]deployWatchHandle{},
+		skipNextDriveMount: map[string]bool{},
 		sshStarter:         startSSHTunnelProcess,
 		terminalOpener:     openTerminalCommand,
 		OSRunner:           r,
@@ -2091,6 +2095,10 @@ func (s *Service) pollRunningLLMSlots() {
 // Start / Polite Queue / Stop
 
 func (s *Service) StartAccountSession(accountID string) {
+	s.startAccountSession(accountID, true)
+}
+
+func (s *Service) startAccountSession(accountID string, interactive bool) {
 	s.mu.Lock()
 	var acc core.AccountProfile
 	accIdx := -1
@@ -2116,6 +2124,7 @@ func (s *Service) StartAccountSession(accountID string) {
 		s.ShowToast(fmt.Sprintf("正在冷静等待中（约 %d 分钟），如已切换显卡可点横幅右侧「解除等待」", remMin))
 		return
 	}
+	delete(s.skipNextDriveMount, accountID)
 	// 开启持续守候时自动补开空闲自动关机，防止半夜抢到后无人看管烧光点数
 	if acc.QueuePersistentMode && !acc.AutoShutdownEnabled {
 		acc.AutoShutdownEnabled = true
@@ -2131,6 +2140,8 @@ func (s *Service) StartAccountSession(accountID string) {
 	rt.LastErrorAction = ""
 	rt.LastErrorRaw = ""
 	rt.LastAllocHadShortage = false
+
+	showPreDrivePrompt := interactive && s.needsInteractiveDriveOnStart(acc) && !acc.QueuePersistentMode
 
 	if core.EffectiveAutoQueue(acc) {
 		if s.ActiveQueueAccountID != "" && s.ActiveQueueAccountID != accountID {
@@ -2168,6 +2179,9 @@ func (s *Service) StartAccountSession(accountID string) {
 		s.Runtime[accountID] = rt
 		s.mu.Unlock()
 		s.notifyUI()
+		if showPreDrivePrompt {
+			s.presentDriveAuthPreparingPrompt(acc, true)
+		}
 		go s.runPoliteQueue(ctx, acc, token)
 		return
 	}
@@ -2176,6 +2190,9 @@ func (s *Service) StartAccountSession(accountID string) {
 	s.Runtime[accountID] = rt
 	s.mu.Unlock()
 	s.notifyUI()
+	if showPreDrivePrompt {
+		s.presentDriveAuthPreparingPrompt(acc, true)
+	}
 
 	go func() {
 		startedAt := time.Now()
@@ -2617,6 +2634,8 @@ func (s *Service) CancelQueue(accountID string) {
 		rt.Phase = core.InstancePhase{Kind: core.PhaseOffline}
 		s.Runtime[accountID] = rt
 	}
+	delete(s.skipNextDriveMount, accountID)
+	s.clearDriveAuthPromptLocked(accountID)
 	s.mu.Unlock()
 
 	if cancelRec != nil {
@@ -2698,6 +2717,8 @@ func (s *Service) handleProvisionFailure(acc core.AccountProfile, outcome core.P
 		s.saveSettingsLocked()
 	}
 	s.Runtime[acc.ID] = rt
+	delete(s.skipNextDriveMount, acc.ID)
+	s.clearDriveAuthPromptLocked(acc.ID)
 	s.mu.Unlock()
 	s.notifyUI()
 
@@ -2803,14 +2824,27 @@ func (s *Service) ResolveActionPromptByID(promptID, action string) {
 		ch := s.driveAuthResultCh
 		s.actionPrompt = nil
 		s.driveAuthResultCh = nil
+		var prepCancel context.CancelFunc
+		if ch == nil && action == "secondary" && promptCopy.AccountID != "" {
+			s.skipNextDriveMount[promptCopy.AccountID] = true
+			if mh, ok := s.driveMountCancels[promptCopy.AccountID]; ok && mh.cancel != nil {
+				prepCancel = mh.cancel
+				delete(s.driveMountCancels, promptCopy.AccountID)
+			}
+		}
 		s.mu.Unlock()
 		s.notifyUI()
+		if prepCancel != nil {
+			prepCancel()
+		}
 		if ch != nil {
 			proceed := action == "primary"
 			select {
 			case ch <- proceed:
 			default:
 			}
+		} else if action == "secondary" {
+			s.ShowToast("已切换为纯云端运行，本次不再等待 Google Drive 授权")
 		}
 	case core.PromptComfyHelp:
 		if action == "open_url" {
@@ -3173,7 +3207,10 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string,
 	}
 
 	if acc.EnableLLMModule || (acc.WorkloadKind != core.WorkloadGeneral && strings.TrimSpace(acc.DriveScriptPath) != "") {
-		if s.Engine.EnsureDriveMounted(context.Background(), acc) {
+		svcCtx, cancelSvcCtx := s.serviceContext()
+		mounted, reason := s.runInteractiveDriveMountWithPrompt(svcCtx, acc, "", "", false)
+		cancelSvcCtx()
+		if mounted {
 			ok, _, errMsg := s.Engine.RunDriveStartScript(context.Background(), acc)
 			if ok {
 				if acc.EnableLLMModule {
@@ -3188,6 +3225,8 @@ func (s *Service) handlePostAllocation(acc core.AccountProfile, hardware string,
 			} else if errMsg != "" {
 				s.ShowToast("远端启动脚本提示：" + errMsg)
 			}
+		} else if reason != "" {
+			s.ShowToast(reason)
 		}
 	}
 }
@@ -3252,12 +3291,44 @@ func (s *Service) DeployNow(accountID string) {
 	}
 }
 
-func (s *Service) cancelDeployFlowLocked(accountID string) {
-	if fh, ok := s.deployFlowCancels[accountID]; ok {
-		if fh.cancel != nil {
-			fh.cancel()
+func (s *Service) bringMainWindowToFront() {
+	s.mu.RLock()
+	openFn := s.OnOpenMainWin
+	onboarding := s.ShowingOnboarding
+	s.mu.RUnlock()
+	if openFn != nil && !onboarding {
+		openFn(SectionHome, false)
+	}
+}
+
+func driveAuthAccountLabel(acc core.AccountProfile) string {
+	name := strings.TrimSpace(acc.DisplayName)
+	email := strings.TrimSpace(acc.Email)
+	switch {
+	case name != "" && email != "":
+		return fmt.Sprintf("%s（%s）", name, email)
+	case email != "":
+		return email
+	case name != "":
+		return name
+	default:
+		return "当前 Google 账号"
+	}
+}
+
+func (s *Service) needsInteractiveDriveOnStart(acc core.AccountProfile) bool {
+	if acc.DeployRecipe.IsVideoComfy() {
+		return acc.UseGoogleDrive
+	}
+	return acc.EnableLLMModule || (acc.WorkloadKind != core.WorkloadGeneral && strings.TrimSpace(acc.DriveScriptPath) != "")
+}
+
+func (s *Service) clearDriveAuthPromptLocked(accountID string) {
+	if mh, ok := s.driveMountCancels[accountID]; ok {
+		if mh.cancel != nil {
+			mh.cancel()
 		}
-		delete(s.deployFlowCancels, accountID)
+		delete(s.driveMountCancels, accountID)
 	}
 	if s.actionPrompt != nil && s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == accountID {
 		s.actionPrompt = nil
@@ -3269,6 +3340,247 @@ func (s *Service) cancelDeployFlowLocked(accountID string) {
 			}
 		}
 	}
+}
+
+func (s *Service) clearDriveAuthPrompt(accountID string) {
+	s.mu.Lock()
+	s.clearDriveAuthPromptLocked(accountID)
+	s.mu.Unlock()
+	s.notifyUI()
+}
+
+func (s *Service) driveAuthSecondaryLabel(acc core.AccountProfile, isRemount bool) string {
+	if isRemount {
+		return "取消挂载"
+	}
+	if !acc.DeployRecipe.IsVideoComfy() {
+		return "跳过挂载（不跑 Drive 脚本）"
+	}
+	return "先不挂，纯云端跑"
+}
+
+func (s *Service) buildDriveAuthPreparingPrompt(acc core.AccountProfile, startingMachine, isRemount bool) *core.UserActionPrompt {
+	step1 := "第 1 步（进行中）：正在连接云端机器获取授权链接，就绪后会自动拉起浏览器…"
+	if startingMachine {
+		step1 = "第 1 步（进行中）：正在申请云端机器并准备授权链接（约 15 秒），就绪后会自动拉起浏览器…"
+	}
+	intro := "Google 每次新开机挂载云盘都需确认一次授权，请先别离开电脑："
+	if isRemount {
+		intro = "重新挂载 Google Drive 需确认一次授权，请先别离开电脑："
+	} else if !acc.DeployRecipe.IsVideoComfy() {
+		intro = "挂载 Google Drive 后才会自动执行云盘上的启动脚本，请先别离开电脑："
+	}
+	msg := fmt.Sprintf(
+		"授权账号：%s\n%s\n%s\n第 2 步：在自动弹出的浏览器页面核对上方账号并点击「允许 / Allow」。\n第 3 步：网页提示授权完成后，回到这里点击「我已点完允许，继续」。",
+		driveAuthAccountLabel(acc),
+		intro,
+		step1,
+	)
+	return &core.UserActionPrompt{
+		ID:             uuid.New().String(),
+		Kind:           core.PromptDriveAuth,
+		AccountID:      acc.ID,
+		Title:          "请稍留片刻：即将自动打开浏览器授权 Google Drive",
+		Message:        msg,
+		SecondaryLabel: s.driveAuthSecondaryLabel(acc, isRemount),
+		CancelLabel:    "收起提醒",
+	}
+}
+
+// presentDriveAuthPreparingPrompt 在用户刚点击开机/部署/重挂的最一开始立刻弹出明确步骤提示，提醒用户稍留片刻等待自动拉起浏览器授权。
+func (s *Service) presentDriveAuthPreparingPrompt(acc core.AccountProfile, startingMachine bool) {
+	prompt := s.buildDriveAuthPreparingPrompt(acc, startingMachine, false)
+	s.mu.Lock()
+	if s.actionPrompt != nil && !(s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == acc.ID && s.driveAuthResultCh == nil) {
+		s.mu.Unlock()
+		return
+	}
+	s.actionPrompt = prompt
+	s.mu.Unlock()
+	s.bringMainWindowToFront()
+	s.notifyUI()
+}
+
+func (s *Service) canOccupyDriveAuthPromptLocked(accountID string) bool {
+	if s.actionPrompt == nil {
+		return true
+	}
+	// Never overwrite higher-priority stop/quit/remove/temp-guard prompts or another account's active Drive prompt.
+	return s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == accountID
+}
+
+func (s *Service) runInteractiveDriveMountWithPrompt(
+	parentCtx context.Context,
+	acc core.AccountProfile,
+	flowToken string,
+	expectedEndpoint string,
+	isRemount bool,
+) (bool, string) {
+	mountCtx, cancelMount := context.WithCancel(parentCtx)
+	mountToken := uuid.New().String()
+	prepPrompt := s.buildDriveAuthPreparingPrompt(acc, false, isRemount)
+	var prevCancel context.CancelFunc
+	shownPrep := false
+
+	// Atomically check skip flag, register cancel handle, and show preparing prompt under one lock (no race window).
+	s.mu.Lock()
+	if !isRemount && s.skipNextDriveMount[acc.ID] {
+		delete(s.skipNextDriveMount, acc.ID)
+		if s.actionPrompt != nil && s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == acc.ID && s.driveAuthResultCh == nil {
+			s.actionPrompt = nil
+		}
+		s.mu.Unlock()
+		cancelMount()
+		s.notifyUI()
+		return false, "已跳过 Google Drive，直接纯云端运行"
+	}
+	if prev, ok := s.driveMountCancels[acc.ID]; ok && prev.cancel != nil {
+		prevCancel = prev.cancel
+	}
+	s.driveMountCancels[acc.ID] = deployWatchHandle{token: mountToken, cancel: cancelMount}
+	if s.actionPrompt == nil || (s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == acc.ID && s.driveAuthResultCh == nil) {
+		s.actionPrompt = prepPrompt
+		shownPrep = true
+	}
+	s.mu.Unlock()
+
+	if prevCancel != nil {
+		prevCancel()
+	}
+	if shownPrep {
+		s.bringMainWindowToFront()
+		s.notifyUI()
+	}
+
+	defer func() {
+		cancelMount()
+		cleared := false
+		s.mu.Lock()
+		if cur, ok := s.driveMountCancels[acc.ID]; ok && cur.token == mountToken {
+			delete(s.driveMountCancels, acc.ID)
+			if s.actionPrompt != nil && s.actionPrompt.Kind == core.PromptDriveAuth && s.actionPrompt.AccountID == acc.ID {
+				s.actionPrompt = nil
+				cleared = true
+				if ch := s.driveAuthResultCh; ch != nil {
+					s.driveAuthResultCh = nil
+					select {
+					case ch <- false:
+					default:
+					}
+				}
+			}
+		}
+		s.mu.Unlock()
+		if cleared {
+			s.notifyUI()
+		}
+	}()
+
+	title := "需要你授权 Google Drive（已自动打开浏览器）"
+	secondaryLabel := s.driveAuthSecondaryLabel(acc, isRemount)
+	cancelLabel := "取消"
+	intro := "请按以下 3 步完成授权，完成后模型、工作流与新成片将自动连接 Google Drive："
+	if isRemount {
+		title = "重新授权 Google Drive（已自动打开浏览器）"
+		cancelLabel = "关闭"
+		intro = "请按以下 3 步重新挂载 Google Drive（挂载成功后如需让运行中的 ComfyUI 切换输出目录，请再点「重新部署」）："
+	} else if !acc.DeployRecipe.IsVideoComfy() {
+		intro = "请按以下 3 步完成授权，完成后将继续运行云盘上的启动脚本（若跳过将不执行该脚本）："
+	}
+
+	mounted, reason := s.Engine.EnsureDriveMountedInteractive(mountCtx, acc, func(authURL string) bool {
+		if strings.TrimSpace(authURL) == "" {
+			return false
+		}
+		ch := make(chan bool, 1)
+		var opener func(string)
+		for {
+			s.mu.Lock()
+			if flowToken != "" && (!s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) || parentCtx.Err() != nil) {
+				s.mu.Unlock()
+				return false
+			}
+			curHandle, ownsMount := s.driveMountCancels[acc.ID]
+			if !ownsMount || curHandle.token != mountToken || mountCtx.Err() != nil {
+				s.mu.Unlock()
+				return false
+			}
+			if !s.canOccupyDriveAuthPromptLocked(acc.ID) {
+				s.mu.Unlock()
+				select {
+				case <-time.After(200 * time.Millisecond):
+					continue
+				case <-mountCtx.Done():
+					return false
+				case <-s.stopLoops:
+					return false
+				}
+			}
+			if oldCh := s.driveAuthResultCh; oldCh != nil {
+				select {
+				case oldCh <- false:
+				default:
+				}
+			}
+			s.driveAuthResultCh = ch
+			msg := fmt.Sprintf(
+				"授权账号：%s\n%s\n第 1 步：切换到刚自动打开的浏览器页面（如未弹出请点下方蓝色按钮）。\n第 2 步：确认页面登录的是上方 Google 账号，点击「允许 / Allow」。\n第 3 步：网页提示授权成功后，切回这里点击「我已点完允许，继续」。",
+				driveAuthAccountLabel(acc),
+				intro,
+			)
+			s.actionPrompt = &core.UserActionPrompt{
+				ID:             uuid.New().String(),
+				Kind:           core.PromptDriveAuth,
+				AccountID:      acc.ID,
+				Title:          title,
+				Message:        msg,
+				URL:            authURL,
+				PrimaryLabel:   "我已点完允许，继续",
+				SecondaryLabel: secondaryLabel,
+				CancelLabel:    cancelLabel,
+			}
+			opener = s.URLOpener
+			s.mu.Unlock()
+			break
+		}
+
+		// 先把主窗口带到前台展示清晰步骤，再拉起浏览器让用户直接点「允许」
+		s.bringMainWindowToFront()
+		s.notifyUI()
+		if opener != nil {
+			opener(authURL)
+		}
+		s.SendNotification("请到浏览器点击「允许」挂载 Google Drive", fmt.Sprintf("授权账号：%s。点完允许后回到 Colab Tools 点「我已点完允许，继续」", driveAuthAccountLabel(acc)), true)
+
+		select {
+		case proceed := <-ch:
+			return proceed
+		case <-mountCtx.Done():
+			return false
+		case <-s.stopLoops:
+			return false
+		}
+	})
+	if !mounted {
+		s.mu.Lock()
+		skippedDuringPrep := s.skipNextDriveMount[acc.ID]
+		delete(s.skipNextDriveMount, acc.ID)
+		s.mu.Unlock()
+		if skippedDuringPrep {
+			return false, "已跳过 Google Drive，直接纯云端运行"
+		}
+	}
+	return mounted, reason
+}
+
+func (s *Service) cancelDeployFlowLocked(accountID string) {
+	if fh, ok := s.deployFlowCancels[accountID]; ok {
+		if fh.cancel != nil {
+			fh.cancel()
+		}
+		delete(s.deployFlowCancels, accountID)
+	}
+	s.clearDriveAuthPromptLocked(accountID)
 }
 
 func (s *Service) cancelDeployFlow(accountID string) {
@@ -3382,48 +3694,7 @@ func (s *Service) launchVideoDeployFlow(acc core.AccountProfile) {
 
 	if acc.UseGoogleDrive {
 		s.ShowToast("正在挂载 Google Drive（复用模型并自动存成片）…")
-		mounted, reason := s.Engine.EnsureDriveMountedInteractive(flowCtx, acc, func(authURL string) bool {
-			ch := make(chan bool, 1)
-			s.mu.Lock()
-			if !s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) || flowCtx.Err() != nil {
-				s.mu.Unlock()
-				return false
-			}
-			if oldCh := s.driveAuthResultCh; oldCh != nil {
-				select {
-				case oldCh <- false:
-				default:
-				}
-			}
-			s.driveAuthResultCh = ch
-			s.actionPrompt = &core.UserActionPrompt{
-				ID:             uuid.New().String(),
-				Kind:           core.PromptDriveAuth,
-				AccountID:      acc.ID,
-				Title:          "需要你点一下『允许』连接 Google Drive",
-				Message:        "已为你打开 Google Drive 授权网页，请在网页里点击「允许」，把云端模型和成片目录挂上。点完后回到这里点击下方绿色按钮继续。",
-				URL:            authURL,
-				PrimaryLabel:   "我已点完允许，继续",
-				SecondaryLabel: "先不挂，纯云端跑",
-				CancelLabel:    "取消",
-			}
-			opener := s.URLOpener
-			s.mu.Unlock()
-			s.notifyUI()
-			if authURL != "" && opener != nil {
-				opener(authURL)
-			}
-			s.SendNotification("需要你点一下「允许」", "请到浏览器点击允许挂载 Google Drive，点完后回来点「我已点完允许，继续」", true)
-
-			select {
-			case proceed := <-ch:
-				return proceed
-			case <-flowCtx.Done():
-				return false
-			case <-s.stopLoops:
-				return false
-			}
-		})
+		mounted, reason := s.runInteractiveDriveMountWithPrompt(flowCtx, acc, flowToken, expectedEndpoint, false)
 		s.mu.Lock()
 		stillValid := s.isDeployFlowOwnerLocked(acc.ID, flowToken, expectedEndpoint) && flowCtx.Err() == nil
 		if !stillValid {
@@ -4427,42 +4698,7 @@ func (s *Service) RemountDriveNow(accountID string) {
 	s.ShowToast("正在重新挂载 Google Drive…")
 	svcCtx, cancelSvcCtx := s.serviceContext()
 	defer cancelSvcCtx()
-	mounted, reason := s.Engine.EnsureDriveMountedInteractive(svcCtx, acc, func(authURL string) bool {
-		ch := make(chan bool, 1)
-		s.mu.Lock()
-		if oldCh := s.driveAuthResultCh; oldCh != nil {
-			select {
-			case oldCh <- false:
-			default:
-			}
-		}
-		s.driveAuthResultCh = ch
-		s.actionPrompt = &core.UserActionPrompt{
-			ID:             uuid.New().String(),
-			Kind:           core.PromptDriveAuth,
-			AccountID:      acc.ID,
-			Title:          "重新授权挂载 Google Drive",
-			Message:        "已在浏览器打开 Google Drive 授权页面，请点「允许」后回到这里点击下方按钮继续挂载。",
-			URL:            authURL,
-			PrimaryLabel:   "我已点完允许，继续",
-			SecondaryLabel: "取消挂载",
-			CancelLabel:    "关闭",
-		}
-		opener := s.URLOpener
-		s.mu.Unlock()
-		s.notifyUI()
-		if authURL != "" && opener != nil {
-			opener(authURL)
-		}
-		select {
-		case proceed := <-ch:
-			return proceed
-		case <-svcCtx.Done():
-			return false
-		case <-s.stopLoops:
-			return false
-		}
-	})
+	mounted, reason := s.runInteractiveDriveMountWithPrompt(svcCtx, acc, "", "", true)
 	s.mu.Lock()
 	hasTempVideos := false
 	if cur, exists := s.Runtime[accountID]; exists && cur.ActiveEndpoint == expectedEndpoint {
@@ -4901,7 +5137,7 @@ func (s *Service) handleOneSecondTick(now time.Time) {
 	}
 	for _, id := range toScheduleStart {
 		s.SendNotification("定时错峰预约触发", "已按预约时间自动发起算力申请", false)
-		go s.StartAccountSession(id)
+		go s.startAccountSession(id, false)
 	}
 	if needsRepaint {
 		s.notifyUI()

@@ -981,6 +981,13 @@ exit 0
 	rt.ActiveEndpoint = "ep-drive"
 	svc.Runtime[acc.ID] = rt
 
+	var openedWinCount int
+	svc.OnOpenMainWin = func(_ MainSection, _ bool) {
+		openedMu.Lock()
+		openedWinCount++
+		openedMu.Unlock()
+	}
+
 	doneDeploy := make(chan struct{})
 	go func() {
 		defer close(doneDeploy)
@@ -990,13 +997,26 @@ exit 0
 	var prompt *core.UserActionPrompt
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if prompt = svc.CurrentActionPrompt(); prompt != nil {
+		if p := svc.CurrentActionPrompt(); p != nil && p.URL != "" {
+			prompt = p
 			break
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
 	if prompt == nil || prompt.Kind != core.PromptDriveAuth || !strings.Contains(prompt.URL, "accounts.google.com") {
-		t.Fatalf("expected PromptDriveAuth to pop up, got %+v", prompt)
+		t.Fatalf("expected PromptDriveAuth with URL to pop up, got %+v", prompt)
+	}
+	if !strings.Contains(prompt.Message, "第 1 步") || !strings.Contains(prompt.Message, "第 2 步") || !strings.Contains(prompt.Message, "第 3 步") {
+		t.Fatalf("expected clear 3-step instructions in PromptDriveAuth, got %q", prompt.Message)
+	}
+	if !strings.Contains(prompt.Message, acc.Email) {
+		t.Fatalf("expected account email in PromptDriveAuth, got %q", prompt.Message)
+	}
+	openedMu.Lock()
+	winCount := openedWinCount
+	openedMu.Unlock()
+	if winCount == 0 {
+		t.Fatal("expected main window brought to front for Drive auth prompt")
 	}
 
 	// open_url re-opens URL without dismissing modal
@@ -1021,7 +1041,7 @@ exit 0
 	<-doneDeploy
 	svc.cancelDeployWatcher(acc.ID)
 
-	// Skip branch ("secondary")
+	// Skip branch ("secondary") after auth URL appears
 	fr.mu.Lock()
 	fr.mounted = false
 	fr.mu.Unlock()
@@ -1037,15 +1057,82 @@ exit 0
 		svc.launchVideoDeployFlow(acc)
 	}()
 	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && svc.CurrentActionPrompt() == nil {
+	for time.Now().Before(deadline) {
+		if p := svc.CurrentActionPrompt(); p != nil && p.URL != "" {
+			break
+		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	if svc.CurrentActionPrompt() == nil {
-		t.Fatal("expected second PromptDriveAuth before skip")
+	if p := svc.CurrentActionPrompt(); p == nil || p.URL == "" {
+		t.Fatalf("expected second ready PromptDriveAuth before skip, got %+v", p)
 	}
 	svc.ResolveActionPrompt("secondary")
 	<-doneSkip
 	svc.cancelDeployWatcher(acc.ID)
+
+	// StartAccountSession immediately pops preparing Drive auth reminder upfront while user is still present,
+	// and clicking "secondary" ("先不挂，纯云端跑") MUST survive launchVideoDeployFlow initialization without re-prompting.
+	svcPre := NewService(true)
+	defer svcPre.Shutdown()
+	svcPre.NotifySender = func(_, _ string) {}
+	var preWinBrought int
+	svcPre.OnOpenMainWin = func(_ MainSection, _ bool) { preWinBrought++ }
+	preBlock := make(chan struct{})
+	preScriptPushed := make(chan struct{}, 1)
+	preRunner := &fakeRunner{
+		onShell: func(cmd string) runner.Result {
+			switch {
+			case strings.Contains(cmd, "new"):
+				<-preBlock
+				return runner.Result{ExitCode: 0, Stdout: "allocated\n"}
+			case strings.Contains(cmd, "usage"):
+				return runner.Result{ExitCode: 0, Stdout: "Current balance: 100.00 compute units\nUsage rate: 1.87/hr\nActive assignments: 1\n"}
+			case strings.Contains(cmd, "sessions"):
+				return runner.Result{ExitCode: 0, Stdout: "[colab-tools] ep-pre-skip | Hardware: T4 | Shape: High-RAM | Variant: GPU\n"}
+			case strings.Contains(cmd, "exec"):
+				select {
+				case preScriptPushed <- struct{}{}:
+				default:
+				}
+				return runner.Result{ExitCode: 0, Stdout: "DEPLOY_LAUNCHED=1\n"}
+			default:
+				return runner.Result{ExitCode: 0}
+			}
+		},
+	}
+	svcPre.Engine = colab.NewEngine(preRunner, svcPre.Vault)
+	preAcc := core.NewDefaultAccountProfile("EarlyDrive", "early@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)
+	preAcc.SessionName = "colab-tools"
+	preAcc.UseGoogleDrive = true
+	preAcc.EnablePoliteQueue = false
+	svcPre.Settings.Accounts = []core.AccountProfile{preAcc}
+	svcPre.Runtime[preAcc.ID] = core.NewAccountRuntimeState()
+	svcPre.StartAccountSession(preAcc.ID)
+	prePrompt := svcPre.CurrentActionPrompt()
+	if prePrompt == nil || prePrompt.Kind != core.PromptDriveAuth || prePrompt.URL != "" || !strings.Contains(prePrompt.Message, "第 1 步") || !strings.Contains(prePrompt.Message, "early@example.com") {
+		close(preBlock)
+		t.Fatalf("expected immediate upfront preparing PromptDriveAuth on StartAccountSession, got %+v", prePrompt)
+	}
+	if preWinBrought == 0 {
+		close(preBlock)
+		t.Fatal("expected main window brought to front immediately on StartAccountSession")
+	}
+	svcPre.ResolveActionPrompt("secondary")
+	if svcPre.CurrentActionPrompt() != nil {
+		close(preBlock)
+		t.Fatal("expected preparing prompt dismissed after choosing pure-cloud skip")
+	}
+	// Let allocation finish -> handlePostAllocation -> launchVideoDeployFlow must skip Drive mount cleanly!
+	close(preBlock)
+	select {
+	case <-preScriptPushed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected deploy script pushed directly without blocking on Drive auth after upfront skip")
+	}
+	if p := svcPre.CurrentActionPrompt(); p != nil {
+		t.Fatalf("expected no re-prompt after skipping Drive during upfront preparing modal, got %+v", p)
+	}
+	svcPre.cancelDeployWatcher(preAcc.ID)
 
 	// 2. Persistent mode auto-enables AutoShutdownEnabled & populates PhaseQueuing
 	pAcc := core.NewDefaultAccountProfile("NightGuard", "ng@example.com", core.TierAIUltra, core.AuthSystemDefaultOAuth2)

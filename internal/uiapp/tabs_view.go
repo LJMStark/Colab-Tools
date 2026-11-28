@@ -681,6 +681,16 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 	m.formMu.Unlock()
 
 	ui.Column(c).FillWidth().Gap(12).Children(func() {
+		ui.Column(c).FillWidth().Padding(10, 12).Radius(10).
+			Background(pal.RecessedBg).
+			Border(1, pal.RecessedBorder).
+			Gap(5).Children(func() {
+			ui.Text(c, "Google 官方账号授权（3 步完成）").FontSize(12.5).FontWeight(600).TextColor(pal.TextPrimary)
+			ui.Text(c, "第 1 步：点击下方「打开浏览器完成 Google 官方授权」，将自动拉起浏览器登录页。").FontSize(12).TextColor(pal.TextMuted)
+			ui.Text(c, "第 2 步：选择要绑定的 Google Colab 账号并点击「允许」，复制网页最终给出的授权码。").FontSize(12).TextColor(pal.TextMuted)
+			ui.Text(c, "第 3 步：把授权码粘贴到下方输入框，点击「完成绑定」即可。").FontSize(12).TextColor(pal.TextMuted)
+		})
+
 		ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "账号备注名").FontSize(13).TextColor(pal.TextMuted).Width(90)
 			ui.TextInput(c, &m.NewAccName).Placeholder("例如：主号 / AI Ultra（可留空自动用邮箱前缀）").Grow(1)
@@ -702,7 +712,7 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 		})
 
 		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-			PillButton(c, pal, "1. 打开浏览器完成 Google 官方授权", true, working || !cliReady, func() {
+			PillButton(c, pal, "打开浏览器完成 Google 官方授权", true, working || !cliReady, func() {
 				m.formMu.Lock()
 				m.NewAccWorking = true
 				m.NewAccError = ""
@@ -732,7 +742,7 @@ func (m *MainUI) renderEmbeddedOAuthBinder(c *ui.Context, pal Palette, onSuccess
 		})
 
 		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-			ui.TextInput(c, &m.NewAccAuthCode).Placeholder("2. 粘贴浏览器返回的 Google 授权码").Grow(1)
+			ui.TextInput(c, &m.NewAccAuthCode).Placeholder("粘贴第 2 步复制的 Google 授权码").Grow(1)
 			PillButton(c, pal, "完成绑定", true, working || strings.TrimSpace(m.NewAccAuthCode) == "", func() {
 				m.formMu.Lock()
 				m.NewAccWorking = true

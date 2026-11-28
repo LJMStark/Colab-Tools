@@ -389,7 +389,7 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
 					ui.Column(c).FillWidth().Gap(10).Children(func() {
-						ui.Text(c, prompt.Message).FontSize(13.5).TextColor(pal.TextPrimary)
+						renderActionPromptMessage(c, pal, prompt.Message)
 						if prompt.URL != "" && (prompt.Kind == core.PromptDriveAuth || (prompt.Kind == core.PromptComfyHelp && prompt.PrimaryAction != "open_colab")) {
 							urlBtnLabel := "浏览器没弹出？点此重新打开授权页"
 							if prompt.Kind == core.PromptComfyHelp {
@@ -427,6 +427,63 @@ func (m *MainUI) renderActionPromptOverlay(c *ui.Context, pal Palette, prompt *c
 					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.45))
 			})
 	})
+}
+
+func renderActionPromptMessage(c *ui.Context, pal Palette, message string) {
+	if !strings.Contains(message, "第 1 步") {
+		ui.Text(c, message).FontSize(13.5).TextColor(pal.TextPrimary)
+		return
+	}
+	lines := strings.Split(message, "\n")
+	i := 0
+	for i < len(lines) {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(line, "第 ") && strings.Contains(line, "步") {
+			var steps []string
+			for i < len(lines) {
+				s := strings.TrimSpace(lines[i])
+				if s == "" {
+					i++
+					continue
+				}
+				if strings.HasPrefix(s, "第 ") && strings.Contains(s, "步") {
+					steps = append(steps, s)
+					i++
+				} else {
+					break
+				}
+			}
+			ui.Column(c).FillWidth().Padding(12, 14).Radius(10).
+				Background(pal.RecessedBg).
+				Border(1, pal.RecessedBorder).
+				Gap(7).Children(func() {
+				for _, step := range steps {
+					ui.Text(c, step).FontSize(13).FontWeight(500).TextColor(pal.TextPrimary)
+				}
+			})
+			continue
+		}
+		var block []string
+		for i < len(lines) {
+			s := strings.TrimSpace(lines[i])
+			if s == "" {
+				i++
+				continue
+			}
+			if strings.HasPrefix(s, "第 ") && strings.Contains(s, "步") {
+				break
+			}
+			block = append(block, s)
+			i++
+		}
+		if len(block) > 0 {
+			ui.Text(c, strings.Join(block, "\n")).FontSize(13).TextColor(pal.TextMuted)
+		}
+	}
 }
 
 func actionModalPrimaryButton(c *ui.Context, pal Palette, label string, danger bool, onClick func()) {

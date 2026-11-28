@@ -748,21 +748,24 @@ func TestMainConsoleInteractionsAndAllTabs(t *testing.T) {
 		ID:             "drive-auth-test",
 		Kind:           core.PromptDriveAuth,
 		AccountID:      promptSvc.Settings.SelectedAccountID,
-		Title:          "需要你点一下「允许」连接 Google Drive",
-		Message:        "已在浏览器中打开 Google 授权页。请在网页里点「允许」挂载云盘后，回来点击下方绿色/琥珀主按钮继续部署。",
+		Title:          "需要你授权 Google Drive（已自动打开浏览器）",
+		Message:        "授权账号：主账号 AI Ultra（demo-ultra-user@example.com）\n请按以下 3 步完成授权，完成后模型、工作流与新成片将自动连接 Google Drive：\n第 1 步：切换到刚自动打开的浏览器页面（如未弹出请点下方蓝色按钮）。\n第 2 步：确认页面登录的是上方 Google 账号，点击「允许 / Allow」。\n第 3 步：网页提示授权成功后，切回这里点击「我已点完允许，继续」。",
 		URL:            "https://accounts.google.com/o/oauth2/auth?mock=1",
 		PrimaryLabel:   "我已点完允许，继续",
-		SecondaryLabel: "这次先不挂，纯云端跑",
+		SecondaryLabel: "先不挂，纯云端跑",
 		CancelLabel:    "取消",
 	})
 	promptUI := uiapp.NewMainUI(promptSvc)
 	promptUI.ForceTheme = "dark"
-	promptTester := ui.NewTester(promptUI.View, 1160, 760)
+	promptTester := ui.NewTester(promptUI.View, 980, 660)
 	for _, want := range []string{
-		"需要你点一下「允许」连接 Google Drive",
+		"需要你授权 Google Drive（已自动打开浏览器）",
+		"第 1 步：切换到刚自动打开的浏览器页面（如未弹出请点下方蓝色按钮）。",
+		"第 2 步：确认页面登录的是上方 Google 账号，点击「允许 / Allow」。",
+		"第 3 步：网页提示授权成功后，切回这里点击「我已点完允许，继续」。",
 		"浏览器没弹出？点此重新打开授权页",
 		"我已点完允许，继续",
-		"这次先不挂，纯云端跑",
+		"先不挂，纯云端跑",
 		"取消",
 	} {
 		if !promptTester.HasText(want) {
@@ -943,20 +946,31 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 
 		promptSvc := makeDemoService(app.SectionHome, false, false)
 		promptSvc.PresentActionPrompt(&core.UserActionPrompt{
-			ID:             "qa-drive-auth",
+			ID:             "qa-drive-auth-prep",
 			Kind:           core.PromptDriveAuth,
 			AccountID:      promptSvc.Settings.SelectedAccountID,
-			Title:          "需要你点一下「允许」连接 Google Drive",
-			Message:        "已在浏览器中打开 Google 授权页。请在网页里点「允许」把 Google Drive 挂载进云端机器，完成后回来点下方按钮继续安装 ComfyUI。",
-			URL:            "https://accounts.google.com/o/oauth2/auth?demo=1",
-			PrimaryLabel:   "我已点完允许，继续",
-			SecondaryLabel: "这次先不挂，纯云端跑",
-			CancelLabel:    "取消",
+			Title:          "请稍留片刻：即将自动打开浏览器授权 Google Drive",
+			Message:        "授权账号：主账号 AI Ultra（demo-user@example.com）\nGoogle 每次新开机挂载云盘都需确认一次授权，请先别离开电脑：\n第 1 步（进行中）：正在申请云端机器并准备授权链接（约 15 秒），就绪后会自动拉起浏览器…\n第 2 步：在自动弹出的浏览器页面核对上方账号并点击「允许 / Allow」。\n第 3 步：网页提示授权完成后，回到这里点击「我已点完允许，继续」。",
+			SecondaryLabel: "先不挂，纯云端跑",
+			CancelLabel:    "收起提醒",
 		})
 		promptUI := uiapp.NewMainUI(promptSvc)
 		promptUI.PreviewMode = true
 		promptUI.ForceTheme = "dark"
-		renderPNG(t, promptUI.View, 1160, 760, filepath.Join(qaDir, "qa-drive-auth-modal-dark.png"))
+		renderPNG(t, promptUI.View, 980, 660, filepath.Join(qaDir, "qa-drive-auth-preparing-980x660.png"))
+
+		promptSvc.PresentActionPrompt(&core.UserActionPrompt{
+			ID:             "qa-drive-auth",
+			Kind:           core.PromptDriveAuth,
+			AccountID:      promptSvc.Settings.SelectedAccountID,
+			Title:          "需要你授权 Google Drive（已自动打开浏览器）",
+			Message:        "授权账号：主账号 AI Ultra（demo-user@example.com）\n请按以下 3 步完成授权，完成后模型、工作流与新成片将自动连接 Google Drive：\n第 1 步：切换到刚自动打开的浏览器页面（如未弹出请点下方蓝色按钮）。\n第 2 步：确认页面登录的是上方 Google 账号，点击「允许 / Allow」。\n第 3 步：网页提示授权成功后，切回这里点击「我已点完允许，继续」。",
+			URL:            "https://accounts.google.com/o/oauth2/auth?demo=1",
+			PrimaryLabel:   "我已点完允许，继续",
+			SecondaryLabel: "先不挂，纯云端跑",
+			CancelLabel:    "取消",
+		})
+		renderPNG(t, promptUI.View, 980, 660, filepath.Join(qaDir, "qa-drive-auth-modal-dark.png"))
 
 		reclaimSvc := makeDemoService(app.SectionHome, false, true)
 		rAccID := reclaimSvc.Settings.SelectedAccountID

@@ -12,6 +12,17 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// DetachControllingTTY places cmd in a new POSIX session with no controlling TTY
+// so interactive CLIs (e.g. `colab drivemount`) that probe /dev/tty fall back to stdin.
+func DetachControllingTTY(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+}
+
+// KillProcessGroup terminates the POSIX process group headed by cmd.Process.Pid.
+func KillProcessGroup(cmd *exec.Cmd) {
+	killProcessGroup(cmd)
+}
+
 // killProcessGroup sends SIGTERM to the entire POSIX process group, waits briefly,
 // then escalates to SIGKILL and confirms no members remain alive (ESRCH).
 func killProcessGroup(cmd *exec.Cmd) {

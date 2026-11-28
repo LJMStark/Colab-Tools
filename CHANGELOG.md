@@ -3,6 +3,15 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.21] - 2026-11-28
+
+### Fixed
+- **修复 `colab drivemount` 控制终端 `/dev/tty` 阻塞导致 Drive 挂载超时**：`google-colab-cli` 在 Unix/WSL 下会优先读取 `/dev/tty` 而忽略 `stdinPipe` 写入的回车；新增跨平台 `DetachControllingTTY`（Unix `Setsid: true`、WSL `setsid -w`、Windows 独立进程组与 3s `taskkill` 超时）+ `PYTHONUNBUFFERED=1`，授权后挂载超时放宽至 90 秒，并修复用户跳过挂载时尾部输出排空竞态死锁与空 URL 误触发问题。
+- **Google Drive 授权流程全面前置、自动置顶与防双开浏览器**：
+  - 点击开机、部署或重挂 Drive 且开启 Drive 持久化时，第一时间（用户仍在屏幕前）即唤起主窗口并弹出清晰的 3 步准备态提醒弹窗（标明目标账号与邮箱），允许用户在第 1 秒即选择「先不挂，纯云端跑」并持久化生效至本次部署；
+  - 获取到官方授权链接后原地无缝升级为 3 步就绪态弹窗，通过 `BROWSER=true` 抑制 `google-colab-cli` 重复弹窗，统一由本软件精确拉起一次浏览器并置顶窗口，且按 token 隔离旧挂载清理并避让高优先级停机/退出确认弹窗；
+  - 同步升级 LLM / 自定义启动脚本路径走统一的交互式 Drive 授权，并在首次 Google 账号 OAuth 绑定界面补齐 3 步操作指引。
+
 ## [0.3.20] - 2026-11-28
 
 ### Security & Safety

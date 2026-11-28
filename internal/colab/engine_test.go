@@ -308,7 +308,15 @@ func TestEnsureCloudflaredFallbackURLAndDriveMountInteractive(t *testing.T) {
 echo "REQUIRED: Google Drive Authorization needed"
 echo "https://accounts.google.com/o/oauth2/auth?client_id=test123"
 echo "Press Enter to continue"
-read line
+if (exec </dev/tty) 2>/dev/null; then
+  echo "ERR_CONTROLLING_TTY_NOT_DETACHED" >&2
+  exit 99
+fi
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import os, sys; sys.exit(0 if os.getsid(0) == int(sys.argv[1]) else 98)' "$$" || exit 98
+fi
+IFS= read -r line || exit 97
+[ -z "$line" ] || exit 96
 exit 0
 `
 	if err := os.WriteFile(fakeColab, []byte(script), 0o755); err != nil {
@@ -327,13 +335,30 @@ exit 0
 		t.Fatalf("expected interactive drive mount success, got ok=%v reason=%q url=%q", ok, reason, gotURL)
 	}
 
-	// 3. EnsureDriveMountedInteractive skips cleanly when user returns false
+	// 3. EnsureDriveMountedInteractive skips cleanly without deadlocking even if CLI keeps writing output
+	noisyColab := filepath.Join(tmpDir, "colab-noisy")
+	noisyScript := `#!/bin/sh
+echo "REQUIRED: Google Drive Authorization needed"
+echo "https://accounts.google.com/o/oauth2/auth?client_id=noisy"
+echo "Press Enter to continue"
+trap 'i=0; while [ $i -lt 120 ]; do echo "teardown-noise-line-$i-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"; i=$((i+1)); done; exit 1' TERM
+while :; do
+  echo "waiting-noise-line-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  sleep 0.05
+done
+`
+	if err := os.WriteFile(noisyColab, []byte(noisyScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dr.colabExe = noisyColab
 	dr.mounted = false
-	ok2, reason2 := engDrive.EnsureDriveMountedInteractive(context.Background(), acc, func(authURL string) bool {
+	skipCtx, skipCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer skipCancel()
+	ok2, reason2 := engDrive.EnsureDriveMountedInteractive(skipCtx, acc, func(authURL string) bool {
 		return false
 	})
 	if ok2 || !strings.Contains(reason2, "跳过 Google Drive") {
-		t.Fatalf("expected interactive drive mount skip, got ok=%v reason=%q", ok2, reason2)
+		t.Fatalf("expected interactive drive mount skip without deadlock, got ok=%v reason=%q", ok2, reason2)
 	}
 }
 

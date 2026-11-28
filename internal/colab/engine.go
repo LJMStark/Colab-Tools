@@ -1302,7 +1302,13 @@ func (e *Engine) runInteractiveDriveMount(
 	defer cancel()
 
 	var cmd *exec.Cmd
-	extraEnv := map[string]string{}
+	extraEnv := map[string]string{
+		"PYTHONUNBUFFERED": "1",
+	}
+	if onAuthRequired != nil && (runtime.GOOS != "windows" || useWSLPaths) {
+		// Suppress google-colab-cli's internal webbrowser.open() so Colab Tools opens the browser exactly once.
+		extraEnv["BROWSER"] = "true"
+	}
 	if adcPath != "" {
 		extraEnv["GOOGLE_APPLICATION_CREDENTIALS"] = adcPath
 	}
@@ -1313,21 +1319,30 @@ func (e *Engine) runInteractiveDriveMount(
 		for i, a := range allArgs {
 			escaped[i] = runner.ShellEscapePOSIX(a)
 		}
+		joined := strings.Join(escaped, " ")
+		detachedCmd := "if setsid -w true >/dev/null 2>&1; then exec setsid -w " + joined + "; else exec " + joined + "; fi"
 		distro := ""
 		if osr, ok := e.Runner.(*runner.OSRunner); ok {
 			distro = osr.WSLDistro
 		}
-		exe, wslArgs := runner.BuildWSLCommand(distro, strings.Join(escaped, " "), extraEnv)
+		exe, wslArgs := runner.BuildWSLCommand(distro, detachedCmd, extraEnv)
 		cmd = exec.CommandContext(mountCtx, exe, wslArgs...)
 	} else {
 		cmd = exec.CommandContext(mountCtx, colabExe, cliArgs...)
 		cmd.Env = runner.BaseEnvironment(extraEnv)
 	}
+	runner.DetachControllingTTY(cmd)
+	cmd.Cancel = func() error {
+		runner.KillProcessGroup(cmd)
+		return nil
+	}
+	cmd.WaitDelay = 3 * time.Second
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return false, "Google Drive 挂载启动失败，先直接云端运行（成片请记得保存）"
 	}
+	defer stdinPipe.Close()
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
@@ -1366,9 +1381,10 @@ func (e *Engine) runInteractiveDriveMount(
 		accumulated     strings.Builder
 		accMu           sync.Mutex
 		authTriggered   bool
+		skippedByUser   bool
 		pendingURLFound string
 		pendingURLAt    time.Time
-		needAuthHintAt  time.Time
+		sawAuthHint     bool
 		authDecisionCh  chan bool
 		timedOutMsg     string
 		waitErr         error
@@ -1376,7 +1392,7 @@ func (e *Engine) runInteractiveDriveMount(
 	)
 
 	preAuthTimeout := 35 * time.Second
-	postAuthTimeout := 45 * time.Second
+	postAuthTimeout := 90 * time.Second
 	timeoutTimer := time.NewTimer(preAuthTimeout)
 	defer timeoutTimer.Stop()
 
@@ -1429,50 +1445,52 @@ func (e *Engine) runInteractiveDriveMount(
 
 		lower := strings.ToLower(txt)
 		if strings.Contains(lower, "authorization needed") || strings.Contains(lower, "press enter") {
-			if needAuthHintAt.IsZero() {
-				needAuthHintAt = now
-			} else if now.Sub(needAuthHintAt) >= 1500*time.Millisecond && pendingURLFound == "" {
-				triggerAuth("")
-			}
+			sawAuthHint = true
 		}
 	}
 
-	for !processDone {
+	for !processDone || chunkCh != nil {
 		select {
 		case chunk, ok := <-chunkCh:
-			if ok {
-				accMu.Lock()
-				accumulated.WriteString(chunk)
-				accMu.Unlock()
-				checkAuthPrompt(time.Now())
+			if !ok {
+				chunkCh = nil
+				continue
 			}
+			accMu.Lock()
+			accumulated.WriteString(chunk)
+			accMu.Unlock()
+			checkAuthPrompt(time.Now())
 		case <-flushTicker.C:
 			checkAuthPrompt(time.Now())
 		case proceed := <-authDecisionCh:
 			authDecisionCh = nil
 			if !proceed {
+				skippedByUser = true
 				cancel()
 				_ = stdinPipe.Close()
-				<-waitDone
-				_ = pr.Close()
-				<-readDone
-				return false, "已跳过 Google Drive，直接纯云端运行"
+				continue
 			}
 			_, _ = io.WriteString(stdinPipe, "\n")
 			timeoutTimer.Reset(postAuthTimeout)
 		case <-timeoutTimer.C:
-			timedOutMsg = "Google Drive 挂载等待超时，已自动切纯云端继续部署"
+			if !authTriggered && sawAuthHint {
+				timedOutMsg = "未能获取到 Google Drive 授权链接，请稍后重试或点击「重挂 Drive」"
+			} else {
+				timedOutMsg = "Google Drive 挂载等待超时，已自动切纯云端继续部署"
+			}
 			cancel()
 		case waitErr = <-waitDone:
+			waitDone = nil
 			processDone = true
-		case <-ctx.Done():
-			cancel()
 		}
 	}
 
 	_ = pr.Close()
 	<-readDone
 
+	if skippedByUser {
+		return false, "已跳过 Google Drive，直接纯云端运行"
+	}
 	if timedOutMsg != "" {
 		return false, timedOutMsg
 	}
