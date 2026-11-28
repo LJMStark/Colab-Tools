@@ -969,7 +969,7 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 		m.bentoStrategy(c, pal, acc)
 	})
 
-	// Bottom Live Sessions & Accounts Table (only shown when multi-account or orphan/extra billing risk exists)
+	// Bottom Live Sessions & Accounts Table (only shown when multi-account or extra live machine exists)
 	accounts := m.Svc.AccountsSnapshot()
 	hasExtraOrOrphan := false
 	for _, sess := range rt.Sessions {
@@ -978,8 +978,7 @@ func (m *MainUI) renderStatusPage(c *ui.Context, pal Palette) {
 			break
 		}
 	}
-	offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
-	if len(accounts) >= 2 || hasExtraOrOrphan || offlineBilling {
+	if len(accounts) >= 2 || hasExtraOrOrphan {
 		m.renderLiveAccountsTable(c, pal, acc)
 	}
 }
@@ -989,7 +988,6 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 	isQueuing := rt.Phase.IsQueuing()
 	isStarting := rt.Phase.Kind == core.PhaseStarting
 	isStopping := rt.Phase.Kind == core.PhaseStopping
-	offlineBilling := !isRunning && rt.CURatePerHour > 0
 	isCooling := rt.QueueCircuitBreakTill != nil && rt.QueueCircuitBreakTill.After(time.Now())
 
 	targets := core.EffectiveQueueTargets(acc)
@@ -1233,8 +1231,8 @@ func (m *MainUI) renderPowerHeroStrip(c *ui.Context, pal Palette, acc core.Accou
 						subRight = "当前未扣点 · 0.00 CU/h"
 					}
 					subRightCol := pal.TextFaint
-					if offlineBilling {
-						subRight = fmt.Sprintf("有其他会话计费 · %.2f CU/h", rt.CURatePerHour)
+					if len(rt.Sessions) > 0 && rt.CURatePerHour > 0 {
+						subRight = fmt.Sprintf("Colab 网页端扣点中 · %.2f CU/h", rt.CURatePerHour)
 						subRightCol = pal.Amber
 					}
 					ui.Text(c, subRight).FontSize(12).FontFeatures("tnum").TextColor(subRightCol).MaxLines(1).Ellipsis("…")
@@ -1260,9 +1258,9 @@ const homeBentoCardHeight float32 = 184
 
 // Card 1: CU 余额与速率（纯财务视角，无开关机按钮）
 func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
-	offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
+	webBilling := !rt.Phase.IsRunning() && len(rt.Sessions) > 0 && rt.CURatePerHour > 0
 	led := pal.Emerald
-	if offlineBilling {
+	if webBilling {
 		led = pal.Amber
 	} else if !rt.Phase.IsRunning() {
 		led = pal.TextFaint
@@ -1287,11 +1285,11 @@ func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProf
 		} else {
 			rateText = "速率同步中…"
 		}
-	} else if offlineBilling {
-		rateText = fmt.Sprintf("仍有计费 %.2f CU/h", rt.CURatePerHour)
+	} else if webBilling {
+		rateText = fmt.Sprintf("网页端扣点 %.2f CU/h", rt.CURatePerHour)
 		rateCol = pal.Amber
 		rateWeight = 600
-		footLeft = "检测到其他会话扣费"
+		footLeft = "请到 Colab 网页检查是否忘关"
 		footCol = pal.Amber
 	}
 
@@ -1329,29 +1327,15 @@ func (m *MainUI) bentoBillingCU(c *ui.Context, pal Palette, acc core.AccountProf
 	}
 }
 
-// Card 2: 实时负载（合并 GPU 与显存，严禁复读显卡名/GB容量/CU速率，离线态禁止假波浪线）
+// Card 2: 实时负载（简洁两态：未开机 / 开机实时负载）
 func (m *MainUI) bentoLiveLoad(c *ui.Context, pal Palette, acc core.AccountProfile, rt core.AccountRuntimeState) {
-	offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
 	if !rt.Phase.IsRunning() {
-		led := pal.TextFaint
-		badge := "待机"
-		var bTint *ui.Color
-		if offlineBilling {
-			led = pal.Amber
-			badge = "外部占用中"
-			t := pal.Amber
-			bTint = &t
-		}
 		BentoCard(c, pal, homeBentoCardHeight, func() {
-			TileHeader(c, pal, led, "实时负载", badge, bTint)
+			TileHeader(c, pal, pal.TextFaint, "实时负载", "", nil)
 			ui.Spacer(c)
-			if offlineBilling {
-				ui.Text(c, "外部占用中").FontSize(22).Bold().TextColor(pal.Amber).MaxLines(1)
-			} else {
-				ui.Text(c, "休眠中").FontSize(26).Bold().TextColor(pal.TextMuted).MaxLines(1)
-			}
+			ui.Text(c, "未开机").FontSize(26).Bold().TextColor(pal.TextMuted).MaxLines(1)
 			ui.Spacer(c)
-			ui.Text(c, "开机后实时监测 GPU 负载与显存压力").FontSize(12).TextColor(pal.TextFaint).MaxLines(1).Ellipsis("…")
+			ui.Text(c, "开机后实时显示 GPU 负载与显存占用").FontSize(12).TextColor(pal.TextFaint).MaxLines(1).Ellipsis("…")
 		})
 		return
 	}
@@ -2046,15 +2030,15 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 
 				// Billing-accurate rate display (never hides active extra/orphan session burn)
 				rateText := "0.00/h"
-				if rt.CURatePerHour > 0 {
+				if rt.CURatePerHour > 0 && (rt.Phase.IsRunning() || len(rt.Sessions) > 0) {
 					rateText = fmt.Sprintf("%.2f/h", rt.CURatePerHour)
 				} else if rt.LastUsageFetchAt == nil {
 					rateText = "—"
 				}
-				offlineBilling := !rt.Phase.IsRunning() && rt.CURatePerHour > 0
+				webBilling := !rt.Phase.IsRunning() && len(rt.Sessions) > 0 && rt.CURatePerHour > 0
 				rateCol := pal.TextMuted
 				rateW := 400
-				if offlineBilling {
+				if webBilling {
 					rateCol = pal.Amber
 					rateW = 600
 				}
@@ -2077,16 +2061,16 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 				})
 			})
 
-			// Surface any extra or orphan `[?]` sessions right below the account row
+			// Surface any extra live machine right below the account row
 			for _, sess := range rt.Sessions {
 				if !sess.IsOrphan && sess.Name == accCopy.SessionName {
 					continue
 				}
 				sessCopy := sess
 				ui.Row(c).FillWidth().Gap(10).Padding(5, 6, 5, 24).AlignItems(ui.Center).Children(func() {
-					label := fmt.Sprintf("⚠ 附加会话：%s", sessCopy.Name)
+					label := fmt.Sprintf("⚠ 另一台运行中的机器：%s", sessCopy.Name)
 					if sessCopy.IsOrphan {
-						label = "⚠ 外部孤儿会话 [?] · 请防忘关计费"
+						label = "⚠ Colab 网页端运行中（需去网页关闭）"
 					}
 					ui.Text(c, label).FontSize(12).FontWeight(500).TextColor(pal.Amber).Grow(1).MinWidth(200).MaxLines(1).Ellipsis("…")
 					ui.Textf(c, "%s · %s", sessCopy.Hardware, sessCopy.Shape).FontSize(12).TextColor(pal.TextMuted).Width(colHW).MaxLines(1)
@@ -2095,8 +2079,12 @@ func (m *MainUI) renderLiveAccountsTable(c *ui.Context, pal Palette, selected co
 					ui.Box(c).Width(colRate)
 					ui.Row(c).Width(colAct).Justify(ui.End).Children(func() {
 						if !sessCopy.IsOrphan {
-							SmallActionButton(c, pal, "停止", &pal.Coral, false, func() {
+							SmallActionButton(c, pal, "关机", &pal.Coral, false, func() {
 								m.Svc.RequestConfirmStopSession(accCopy.ID, sessCopy.Name)
+							})
+						} else {
+							SmallActionButton(c, pal, "打开网页", &pal.Sky, false, func() {
+								m.Svc.OpenColabInBrowser(accCopy.ID)
 							})
 						}
 					})

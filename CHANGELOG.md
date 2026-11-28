@@ -3,6 +3,14 @@
 All notable changes to **Colab Tools** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.22] - 2026-11-28
+
+### Improved
+- **极简状态与界面去黑话**：
+  - 彻底移除「实时负载」卡片中令人困惑的「外部占用中」状态与重复徽章，收敛为清晰的「未开机 / 开机实时负载」两态；
+  - 消除停机后 Google 扣费速率短暂归零延迟导致的误报黄灯与底部表格闪现；
+  - 将「外部孤儿会话 [?]」「附加会话」「受管会话」「CLI」等底层技术词统一改写为普通用户一眼看懂的直白中文，并为网页端运行中的机器直接提供「打开网页」入口。
+
 ## [0.3.21] - 2026-11-28
 
 ### Fixed

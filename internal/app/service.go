@@ -31,7 +31,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const AppVersion = "0.3.21"
+const AppVersion = "0.3.22"
 
 var errSSHTunnelStarting = errors.New("本机加密通道正在建立中，请稍候")
 
@@ -3000,9 +3000,9 @@ func (s *Service) RequestConfirmStopSession(accountID, specificSession string) {
 		Kind:         core.PromptConfirmStop,
 		AccountID:    accountID,
 		SessionName:  target,
-		Title:        fmt.Sprintf("确认关闭附加会话「%s」？", target),
-		Message:      fmt.Sprintf("将停止账号「%s」名下的附加云端会话 %s 并释放对应算力。", acc.DisplayName, target),
-		PrimaryLabel: "确认停止会话",
+		Title:        fmt.Sprintf("确认关闭机器「%s」？", target),
+		Message:      fmt.Sprintf("将停止账号「%s」下这台名为 %s 的云端机器并停止扣点。", acc.DisplayName, target),
+		PrimaryLabel: "确认关机",
 		CancelLabel:  "取消",
 	})
 }
@@ -3012,7 +3012,7 @@ func (s *Service) RequestConfirmStopAll() {
 	n := s.TotalManagedRunningSessionCount()
 	if n == 0 {
 		if orphans := s.TotalOrphanSessionCount(); orphans > 0 {
-			s.ShowToast(fmt.Sprintf("存在 %d 个外部孤儿会话 [?] 无法通过 CLI 关闭，请前往 Colab 网页释放", orphans))
+			s.ShowToast(fmt.Sprintf("还有 %d 台在 Colab 网页开的机器无法直接关闭，请去 Colab 网页手动断开", orphans))
 		}
 		return
 	}
@@ -3020,8 +3020,8 @@ func (s *Service) RequestConfirmStopAll() {
 	s.PresentActionPrompt(&core.UserActionPrompt{
 		ID:           uuid.New().String(),
 		Kind:         core.PromptConfirmStopAll,
-		Title:        fmt.Sprintf("确认关闭全部 %d 个运行中的云端机器？", n),
-		Message:      fmt.Sprintf("当前所有账号合计消耗约 %.2f CU/h。确认后会逐一同步工作流并停止全部受管云端会话。", totalRate),
+		Title:        fmt.Sprintf("确认关闭全部 %d 台运行中的云端机器？", n),
+		Message:      fmt.Sprintf("当前所有账号合计消耗约 %.2f CU/h。确认后会先保存工作流，再逐一关闭云端机器。", totalRate),
 		PrimaryLabel: "全部关机止损",
 		CancelLabel:  "先不关",
 	})
@@ -4067,7 +4067,7 @@ func (s *Service) StopAllManagedSessions() bool {
 
 	if len(targets) == 0 {
 		if orphans := s.TotalOrphanSessionCount(); orphans > 0 {
-			s.ShowToast(fmt.Sprintf("存在 %d 个外部孤儿会话 [?] 无法通过 CLI 关闭，请前往 Colab 网页释放", orphans))
+			s.ShowToast(fmt.Sprintf("还有 %d 台在 Colab 网页开的机器无法直接关闭，请去 Colab 网页手动断开", orphans))
 		}
 		return true
 	}
@@ -4082,14 +4082,14 @@ func (s *Service) StopAllManagedSessions() bool {
 	if stillManaged > 0 || orphans > 0 {
 		var parts []string
 		if stillManaged > 0 {
-			parts = append(parts, fmt.Sprintf("%d 个会话未能确认停止", stillManaged))
+			parts = append(parts, fmt.Sprintf("%d 台机器未能确认关机", stillManaged))
 		}
 		if orphans > 0 {
-			parts = append(parts, fmt.Sprintf("%d 个外部孤儿会话 [?] 需前往网页关闭", orphans))
+			parts = append(parts, fmt.Sprintf("%d 台 Colab 网页开的机器需去网页关闭", orphans))
 		}
-		s.ShowToast("止损提示：" + strings.Join(parts, "，"))
+		s.ShowToast("关机提示：" + strings.Join(parts, "，"))
 	} else {
-		s.ShowToast(fmt.Sprintf("已停止全部 %d 个受管会话", len(targets)))
+		s.ShowToast(fmt.Sprintf("已关闭全部 %d 台云端机器", len(targets)))
 	}
 	return allVerified && stillManaged == 0
 }
