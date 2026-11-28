@@ -203,6 +203,12 @@ func (m *MainUI) renderHomeOptionsOverlay(c *ui.Context, pal Palette) {
 			AlignItems(ui.Center).
 			Justify(ui.Center).
 			Children(func() {
+				scrollMaxH := float32(508)
+				cardMaxH := float32(596)
+				if m.PreviewMode {
+					scrollMaxH = 820
+					cardMaxH = 910
+				}
 				card := PrecisionCard(c, pal, 20, 18, func() {
 					ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(12).Children(func() {
 						DrawPrecisionLED(c, pal.Amber, 12)
@@ -215,12 +221,12 @@ func (m *MainUI) renderHomeOptionsOverlay(c *ui.Context, pal Palette) {
 
 					ui.Box(c).FillWidth().Height(1).Background(pal.Divider)
 
-					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(508).Children(func() {
+					ui.Scroll(c).FillWidth().Grow(1).MaxHeight(scrollMaxH).Children(func() {
 						ui.Column(c).FillWidth().Gap(12).Padding(2, 4, 4, 0).Children(func() {
 							m.renderHomeOptionsDrawer(c, pal, acc, rt)
 						})
 					})
-				}).Width(780).MaxHeight(596).Gap(12).
+				}).Width(780).MaxHeight(cardMaxH).Gap(12).
 					Shadow(0, 20, 50, -8, ui.RGBA(0, 0, 0, 0.42))
 				_ = card
 			})

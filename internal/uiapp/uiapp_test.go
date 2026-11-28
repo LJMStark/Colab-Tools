@@ -107,7 +107,6 @@ func makeDemoService(section app.MainSection, onboarding, idleHome bool) *app.Se
 	port := 8188
 	rt1.ActiveSSHTunnelPort = &port
 	rt1.DetectedServicePort = &port
-	rt1.PublicURL = "https://demo-colab-node.trycloudflare.com"
 	rt1.IdleSeconds = 0
 	rt1.ActivitySignal = core.ActivitySignal{Kind: core.SignalBusy, ObservedAt: now}
 	rt1.SignalSource = core.SignalSourceComfyQueue
@@ -821,21 +820,21 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 		t.Skip("set COLABTOOLS_EXPORT_DIR to export official @2x screenshots")
 	}
 
-	// 1. Live running status console (dark 4x2 Bento)
+	// 1. Live running status console (dark Bento + full unified multi-account table)
 	runSvc := makeDemoService(app.SectionHome, false, false)
 	runUI := uiapp.NewMainUI(runSvc)
 	runUI.PreviewMode = true
 	runUI.ForceTheme = "dark"
-	renderPNG(t, runUI.View, 1160, 760, filepath.Join(outDir, "preview-main-status.png"))
+	renderPNG(t, runUI.View, 1160, 940, filepath.Join(outDir, "preview-main-status.png"))
 
-	// 2. Clean standby 4x2 Bento dashboard (dark, standard 1160x760)
+	// 2. Clean standby 3x2 Bento dashboard (dark, standard 1160x760)
 	idleSvc := makeDemoService(app.SectionHome, false, true)
 	idleUI := uiapp.NewMainUI(idleSvc)
 	idleUI.PreviewMode = true
 	idleUI.ForceTheme = "dark"
 	renderPNG(t, idleUI.View, 1160, 760, filepath.Join(outDir, "preview-deploy-h3.png"))
 
-	// 3. Centered Overlay options inspector over 3x2 Bento
+	// 3. Centered Overlay options inspector over 3x2 Bento (unclipped fallback + 8h persistent watch)
 	customSvc := makeDemoService(app.SectionHome, false, true)
 	cAcc := customSvc.Settings.Accounts[0]
 	cAcc.GPUStrategy = core.GPUStrategyCustom
@@ -843,14 +842,16 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	cAcc.QueueFallbackEnabled = true
 	cAcc.QueueFallbackAfterRounds = 2
 	cAcc.QueueFallbackTarget = core.AccL4
+	cAcc.QueuePersistentMode = true
+	cAcc.QueuePersistentMaxHours = 8
 	customSvc.Settings.Accounts[0] = cAcc
 	customUI := uiapp.NewMainUI(customSvc)
 	customUI.PreviewMode = true
 	customUI.ForceTheme = "dark"
 	customUI.ShowHomeOptions = true
-	renderPNG(t, customUI.View, 1160, 760, filepath.Join(outDir, "preview-settings-queue.png"))
+	renderPNG(t, customUI.View, 1160, 940, filepath.Join(outDir, "preview-settings-queue.png"))
 
-	// 4. Onboarding wizard
+	// 4. Onboarding wizard (2-step setup)
 	obSvc := makeDemoService(app.SectionHome, true, false)
 	obUI := uiapp.NewMainUI(obSvc)
 	obUI.PreviewMode = true
@@ -862,7 +863,7 @@ func TestExportOfficialShowcasePreviews(t *testing.T) {
 	singleSvc.Settings.Accounts = singleSvc.Settings.Accounts[:1]
 	popSingle := uiapp.NewPopoverUI(singleSvc)
 	popSingle.ForceTheme = "dark"
-	renderPNG(t, popSingle.View, 420, 620, filepath.Join(outDir, "preview-dashboard.png"))
+	renderPNG(t, popSingle.View, 420, 560, filepath.Join(outDir, "preview-dashboard.png"))
 }
 
 func TestConcurrentBackgroundMutationsAndUIRenderNoRace(t *testing.T) {
